@@ -77,6 +77,23 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
 
+    -- Sentry (the software-security scanner): one row per scan, clean or not.
+    -- The MODEL is the analyst — it judges the scan output itself and flags
+    -- what's wrong; the host only logs the row and relays the flags. No
+    -- baseline, no host-side diff.
+    -- Local tables (store/messages.db), not the satellite log store — these are
+    -- host-computed facts, not camera events.
+    CREATE TABLE IF NOT EXISTS sentry_scans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      verdict TEXT NOT NULL,
+      summary TEXT,
+      raw_json TEXT,
+      findings_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_sentry_scans_ts ON sentry_scans(ts);
+
     CREATE TABLE IF NOT EXISTS router_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -111,6 +128,26 @@ function createSchema(database: Database.Database): void {
       completed_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    -- User-facing board tasks (iris's create_work_task, dashboard Ops view).
+    -- This table survived from the pre-desktop schema — its CREATE was never
+    -- carried into createSchema, so a fresh/migrated desktop DB was missing it
+    -- entirely ("no such table: user_work_tasks" on any board view or iris call).
+    CREATE TABLE IF NOT EXISTS user_work_tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending',
+      priority TEXT DEFAULT 'medium',
+      assigned_to TEXT,
+      created_by TEXT,
+      due_date TEXT,
+      project_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      confirmed INTEGER DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS project_priorities (
@@ -183,6 +220,9 @@ function createSchema(database: Database.Database): void {
       read_only INTEGER DEFAULT 1,
       enabled INTEGER DEFAULT 1,
       oauth_account_id TEXT,
+      outbound_allowlist TEXT,
+      outbound_max_recipients INTEGER DEFAULT 0,
+      outbound_guard INTEGER DEFAULT 0,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS email_drafts (
@@ -194,30 +234,6 @@ function createSchema(database: Database.Database): void {
       created_at TEXT NOT NULL,
       FOREIGN KEY (account_id) REFERENCES email_accounts(id) ON DELETE CASCADE
     );
-    CREATE TABLE IF NOT EXISTS sms_accounts (
-      id TEXT PRIMARY KEY,
-      user_id TEXT,
-      name TEXT NOT NULL,
-      phone_number TEXT NOT NULL,
-      account_sid TEXT NOT NULL,
-      auth_token TEXT NOT NULL,
-      read_only INTEGER DEFAULT 1,
-      enabled INTEGER DEFAULT 1,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS sms_messages (
-      id TEXT PRIMARY KEY,
-      account_id TEXT NOT NULL,
-      direction TEXT NOT NULL,
-      from_number TEXT NOT NULL,
-      to_number TEXT NOT NULL,
-      body TEXT NOT NULL,
-      twilio_sid TEXT,
-      status TEXT,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (account_id) REFERENCES sms_accounts(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_sms_msg_account ON sms_messages(account_id, created_at);
 
     CREATE TABLE IF NOT EXISTS oauth_accounts (
       id               TEXT PRIMARY KEY,
@@ -275,6 +291,11 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_cal_start ON calendar_events(start_time);
     CREATE INDEX IF NOT EXISTS idx_cal_user ON calendar_events(assigned_to);
 
+    CREATE TABLE IF NOT EXISTS calendar_reminders (
+      event_id TEXT PRIMARY KEY,
+      fired_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS user_alarms (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -291,6 +312,19 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_alarm_user ON user_alarms(user_id);
     CREATE INDEX IF NOT EXISTS idx_alarm_enabled ON user_alarms(enabled);
+
+    -- Memory-tree fact index: every durable fact the log classifier files
+    -- into MARM ("memory tree — <path>: <fact>"), stored at file time so the
+    -- eyes_ears galaxy can light every node from ONE API call instead of
+    -- 211 paced semantic recalls. sig is the same near-duplicate signature
+    -- the classifier dedupes on (memory-tree.ts factSig).
+    CREATE TABLE IF NOT EXISTS memory_tree_facts (
+      sig TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      fact TEXT NOT NULL,
+      ts TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mtree_facts_path ON memory_tree_facts(path);
   `);
 
   database.exec(`
@@ -323,6 +357,130 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id, created_at);
   `);
 
+  // Warden "Friends" — a peer mesh of Wardens over Tailscale (2026-10-18).
+  // A friend is addressed by its Tailscale MagicDNS hostname (stable). Per-
+  // friendship HMAC/random token is shared at accept and validated with
+  // timingSafeEqual on every peer call. Tokens are encrypted at rest.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS friends (
+      id TEXT PRIMARY KEY,               -- peer hostname (Tailscale DNSName)
+      name TEXT DEFAULT '',
+      token_enc TEXT,                    -- JSON {encrypted,iv,authTag} of the shared token
+      instance_id TEXT DEFAULT '',
+      status TEXT DEFAULT 'offline',     -- online | offline
+      last_seen TEXT,
+      capabilities TEXT DEFAULT '[]',    -- JSON array
+      specialists TEXT DEFAULT '[]',     -- JSON array: agents this friend can route to (atlas/vulkan/iris/…)
+      profile TEXT DEFAULT '',           -- short self-description the friend's seat set
+      created_at TEXT NOT NULL,
+      updated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id TEXT PRIMARY KEY,               -- one-time invite id
+      from_hostname TEXT NOT NULL,
+      from_instance_id TEXT DEFAULT '',
+      capabilities TEXT DEFAULT '[]',
+      specialists TEXT DEFAULT '[]',
+      profile TEXT DEFAULT '',
+      from_pubkey TEXT DEFAULT '',       -- inviter's X25519 public key (hex) for the handshake
+      created_at TEXT NOT NULL
+    );
+    -- Free-form hello/catch-up messages between friends (inbox), kept apart
+    -- from task turns so a greeting doesn't spin up a full seat turn.
+    CREATE TABLE IF NOT EXISTS friend_messages (
+      id TEXT PRIMARY KEY,
+      from_hostname TEXT NOT NULL,
+      body TEXT NOT NULL,
+      direction TEXT DEFAULT 'inbound',  -- inbound | outbound
+      read INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    -- Group chat: a "room" is just a label. A post fans out P2P to the members
+    -- the sender chose, and each recipient stores the post locally.
+    CREATE TABLE IF NOT EXISTS friend_room_messages (
+      id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      from_hostname TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    -- P2P text-file sharing: a friend hands over a text file (idea / note /
+    -- code). Content is written to data/friends/inbox/<host>/<file> so it is a
+    -- real file the seat can Grep/Read; this row just indexes it.
+    CREATE TABLE IF NOT EXISTS friend_files (
+      id TEXT PRIMARY KEY,
+      from_hostname TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      path TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    -- Block list — a blocked hostname (friend or not) is rejected on every
+    -- friends route, so a malicious bot can be cut off and stays cut off.
+    CREATE TABLE IF NOT EXISTS friend_blocks (
+      hostname TEXT PRIMARY KEY,
+      reason TEXT DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    -- Offense log — the evidence behind a block, surfaced to the user.
+    CREATE TABLE IF NOT EXISTS friend_offenses (
+      id TEXT PRIMARY KEY,
+      hostname TEXT NOT NULL,
+      kind TEXT NOT NULL,               -- auth_failed | invite_spam | spam | blocked_contact
+      detail TEXT DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  // The BBS — each Warden is one BBS "system" (a node), the way a dial-up BBS
+  // was a single machine run by a SysOp. A friend "dials in" to a node, reads
+  // that node's message bases, and posts there; everything is stored on the
+  // NODE's own disk, never replicated to the caller. `host` is the owning node:
+  // my own posts carry my hostname, a friend's reply to my thread is written to
+  // my message base with host = me. Boards are the canonical, same-on-every-node
+  // areas (General/Ideas/Help/…), each node's own copy. A post with thread_id
+  // NULL is a shoutbox line on that node. Offline nodes simply have nothing to
+  // dial into.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS bbs_boards (
+      name TEXT PRIMARY KEY,
+      description TEXT DEFAULT '',
+      position INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS bbs_threads (
+      id TEXT PRIMARY KEY,
+      board TEXT NOT NULL,
+      author_host TEXT NOT NULL,
+      author_kind TEXT DEFAULT 'bot',   -- bot | human
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      host TEXT NOT NULL DEFAULT ''     -- the node that owns/hosts this thread
+    );
+    CREATE INDEX IF NOT EXISTS idx_bbs_threads_board ON bbs_threads(board, created_at);
+    CREATE TABLE IF NOT EXISTS bbs_posts (
+      id TEXT PRIMARY KEY,
+      board TEXT NOT NULL,
+      thread_id TEXT,                   -- NULL = shoutbox (flat chat)
+      reply_to TEXT,
+      author_host TEXT NOT NULL,
+      author_kind TEXT DEFAULT 'bot',   -- bot | human
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      host TEXT NOT NULL DEFAULT ''     -- the node that owns/hosts this post
+    );
+    CREATE INDEX IF NOT EXISTS idx_bbs_posts_board ON bbs_posts(board, created_at);
+    CREATE INDEX IF NOT EXISTS idx_bbs_posts_thread ON bbs_posts(thread_id, created_at);
+
+    -- Callers: third-party agents (non-Warden MCP clients) that dial into this
+    -- node's BBS over /mcp/botnet. Raw tokens are never stored — only the
+    -- sha256. A caller posts as @handle, local node only.
+    CREATE TABLE IF NOT EXISTS bbs_callers (
+      handle TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      last_seen TEXT
+    );
+  `);
+
 }
 
 export function initDatabase(): void {
@@ -352,11 +510,18 @@ export function initDatabase(): void {
 
   createSchema(db);
 
+  // Seed the canonical BBS board list once. INSERT OR IGNORE keeps the standard
+  // set stable; boards are the "standard framework" peers pull from.
+  seedBbsBoards();
+
   // Idempotent column migrations for DBs created before a column was added.
   // CREATE TABLE IF NOT EXISTS won't alter an existing table, so add missing
   // columns here. ALTER fails harmlessly if the column already exists.
   for (const [table, col, def] of [
     ['email_accounts', 'oauth_account_id', 'TEXT'],
+    ['email_accounts', 'outbound_allowlist', 'TEXT'],
+    ['email_accounts', 'outbound_max_recipients', 'INTEGER DEFAULT 0'],
+    ['email_accounts', 'outbound_guard', 'INTEGER DEFAULT 0'],
     ['oauth_accounts', 'hidden_calendars', "TEXT DEFAULT '[]'"],
     // Actionable-scanner items land directly in the real stores now (no queue
     // file). `confirmed` flags scanned rows that the user hasn't green-checked
@@ -365,6 +530,15 @@ export function initDatabase(): void {
     // "needs review".
     ['user_work_tasks', 'confirmed', 'INTEGER DEFAULT 1'],
     ['calendar_events', 'confirmed', 'INTEGER DEFAULT 1'],
+    // Friends BBS columns added 2026-10-18: which specialists a friend can
+    // route to (agent-aware asks) and a short self-description its seat set.
+    ['friends', 'specialists', "TEXT DEFAULT '[]'"],
+    ['friends', 'profile', "TEXT DEFAULT ''"],
+    ['friend_requests', 'specialists', "TEXT DEFAULT '[]'"],
+    ['friend_requests', 'profile', "TEXT DEFAULT ''"],
+    ['friend_requests', 'from_pubkey', "TEXT DEFAULT ''"],
+    ['bbs_threads', 'host', "TEXT NOT NULL DEFAULT ''"],
+    ['bbs_posts', 'host', "TEXT NOT NULL DEFAULT ''"],
   ] as const) {
     try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`); } catch { /* already exists */ }
   }
@@ -397,6 +571,42 @@ export function initDatabase(): void {
       setRouterState('orchestrator:model', legacyDefault);
     }
     db.prepare('DELETE FROM router_state WHERE key = ?').run('global:default_model');
+  }
+
+  // Orchestrator retirement (2026-10-13): the `orch` sub-agent and its
+  // `orchestrator:*` settings namespace are gone — Atlas is the seat. One-shot
+  // value moves, then the old keys are deleted so there is a single source of
+  // truth. Copies only when the new key is empty, so nothing the user already
+  // set is lost.
+  const orchModel = getRouterState('orchestrator:model');
+  if (orchModel !== undefined) {
+    if (!getRouterState('atlas:model')) setRouterState('atlas:model', orchModel);
+    db.prepare('DELETE FROM router_state WHERE key = ?').run('orchestrator:model');
+  }
+  const orchCtx = getRouterState('local:orchestrator_ctx');
+  if (orchCtx !== undefined) {
+    if (!getRouterState('local:atlas_ctx')) setRouterState('local:atlas_ctx', orchCtx);
+    db.prepare('DELETE FROM router_state WHERE key = ?').run('local:orchestrator_ctx');
+  }
+  // Dead knobs: the orch residency knob (orch was never pinned) and a
+  // write-only ollama-server setting no code ever read.
+  db.prepare('DELETE FROM router_state WHERE key = ?').run('local:orch_keep_alive');
+  db.prepare('DELETE FROM router_state WHERE key = ?').run('orchestrator:ollama_server');
+  // Seat-context lifecycle keys renamed to the atlas: namespace (Atlas is the
+  // seat; the orchestrator name is retired). Same shape: copy the value across
+  // only when the new key is empty, then delete the old key.
+  for (const [oldKey, newKey] of [
+    ['orchestrator:driving_force', 'atlas:driving_force'],
+    ['orchestrator:context_idle_clear_minutes', 'atlas:context_idle_clear_minutes'],
+    ['orchestrator:context_clear_at', 'atlas:context_clear_at'],
+    ['orchestrator:last_user_message_at', 'atlas:last_user_message_at'],
+    ['orchestrator:stopped_turn_since', 'atlas:stopped_turn_since'],
+  ] as const) {
+    const v = getRouterState(oldKey);
+    if (v !== undefined) {
+      if (!getRouterState(newKey)) setRouterState(newKey, v);
+      db.prepare('DELETE FROM router_state WHERE key = ?').run(oldKey);
+    }
   }
 }
 
@@ -595,6 +805,15 @@ export function deleteWhatsappChats(): void {
 }
 
 /**
+ * Delete every stored message in one chat — the dashboard "Clear Conversation"
+ * button. The message log is the only thing touched here; the context-clear
+ * marker, the message cursor and the mercury summary are the host's job.
+ */
+export function clearChatMessages(chatJid: string): void {
+  db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid);
+}
+
+/**
  * Store a message with full content.
  * Single-user Warden: chat_jid is always OWNER_JID; the msg.chat_jid field
  * is accepted for interface compatibility but ignored.
@@ -734,20 +953,23 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
+  // Default (no idea arg): include untagged messages AND idea='scheduled'
+  // (injected scheduled-task prompts). Without the 'scheduled' clause the
+  // orchestrator's pickup (processOwnerMessages → getMessagesSince) never saw
+  // fired reminders — they were stored with idea='scheduled' and silently
+  // dropped here, so no reminder ever ran. Other non-empty idea tags (e.g.
+  // body.idea from a channel) stay excluded, matching getMessagesForDashboard.
   const ideaFilter = idea !== undefined && idea !== ''
     ? `AND idea = ?`
-    : `AND (idea = '' OR idea IS NULL)`;
+    : `AND (idea = '' OR idea IS NULL OR idea = 'scheduled')`;
   const jids = [OWNER_JID];
   const placeholders = jids.map(() => '?').join(',');
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, idea
       FROM messages
       WHERE chat_jid IN (${placeholders}) AND timestamp > ?
-        AND (
-          is_bot_message = 0 AND content NOT LIKE ?
-          OR content LIKE 'AWARENESS%'
-        )
+        AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
         ${ideaFilter}
       ORDER BY timestamp DESC
@@ -788,7 +1010,17 @@ export function getMessagesForDashboard(
   const params = idea !== undefined && idea !== ''
     ? [...jids, sinceTimestamp, idea, limit]
     : [...jids, sinceTimestamp, limit];
-  return db.prepare(sql).all(...params) as NewMessage[];
+  const rows = db.prepare(sql).all(...params) as NewMessage[];
+  // Display-only: strip prompt blocks wrapped in <!--hidden--> ... <!--/hidden-->
+  // — per-turn context a channel injects into the message text for the
+  // orchestrator to read (e.g. a voice app's persona+memory block). Stored
+  // content is untouched; every pickup path (getMessagesSince, getNewMessages)
+  // still sees the full text.
+  const hiddenBlock = /<!--hidden-->[\s\S]*?<!--\/hidden-->/g;
+  for (const r of rows) {
+    r.content = String(r.content ?? '').replace(hiddenBlock, '').replace(/^\s+/, '');
+  }
+  return rows;
 }
 
 export function createTask(
@@ -932,6 +1164,38 @@ export function pruneTaskRunLogs(keep = 100): number {
   `,
   ).run(keep);
   return result.changes;
+}
+
+// --- Sentry (software-security scanner) helpers ------------------------------
+// The MODEL is the analyst: it judges the scan output itself (a smart model
+// knows what a normal Linux desktop looks like) and flags what's wrong. The
+// host only logs the row and relays the flags — no baseline, no host-side
+// diff, nothing mechanical to get wrong.
+
+export function logSentryScan(row: {
+  ts: string;
+  mode: string;
+  verdict: string;
+  summary?: string;
+  rawJson?: string;
+  findingsJson?: string;
+}): void {
+  db.prepare(
+    `INSERT INTO sentry_scans (ts, mode, verdict, summary, raw_json, findings_json)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(row.ts, row.mode, row.verdict, row.summary ?? null, row.rawJson ?? null, row.findingsJson ?? null);
+}
+
+export function getRecentSentryScans(limit = 20): Array<{
+  id: number; ts: string; mode: string; verdict: string; summary: string | null;
+}> {
+  return db
+    .prepare(
+      `SELECT id, ts, mode, verdict, summary FROM sentry_scans ORDER BY ts DESC LIMIT ?`,
+    )
+    .all(Math.max(1, limit)) as Array<{
+    id: number; ts: string; mode: string; verdict: string; summary: string | null;
+  }>;
 }
 
 // --- V2 query functions ---
@@ -1708,6 +1972,9 @@ export interface EmailAccount {
   enabled: number;
   created_at: string;
   oauth_account_id?: string | null;
+  outbound_allowlist?: string | null;
+  outbound_max_recipients?: number;
+  outbound_guard?: number;
 }
 
 export function createEmailAccount(account: {
@@ -1723,12 +1990,15 @@ export function createEmailAccount(account: {
   read_only?: boolean;
   enabled?: boolean;
   user_id?: string | null;
+  outbound_guard?: boolean;
+  outbound_allowlist?: string | null;
+  outbound_max_recipients?: number;
 }): EmailAccount {
   const id = `email-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO email_accounts (id, user_id, name, email, imap_host, imap_port, smtp_host, smtp_port, username, password, use_tls, read_only, enabled, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO email_accounts (id, user_id, name, email, imap_host, imap_port, smtp_host, smtp_port, username, password, use_tls, read_only, enabled, outbound_guard, outbound_allowlist, outbound_max_recipients, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     account.user_id ?? null,
@@ -1743,6 +2013,9 @@ export function createEmailAccount(account: {
     account.use_tls === false ? 0 : 1,
     account.read_only === false ? 0 : 1, // DEFAULT READ ONLY
     account.enabled === false ? 0 : 1,
+    account.outbound_guard ? 1 : 0,
+    account.outbound_allowlist ?? null,
+    account.outbound_max_recipients ?? 0,
     now,
   );
   return getEmailAccount(id)!;
@@ -1787,6 +2060,9 @@ export function updateEmailAccount(
   if (updates.enabled !== undefined) { fields.push('enabled = ?'); values.push(updates.enabled); }
   if (updates.user_id !== undefined) { fields.push('user_id = ?'); values.push(updates.user_id); }
   if (updates.oauth_account_id !== undefined) { fields.push('oauth_account_id = ?'); values.push(updates.oauth_account_id); }
+  if (updates.outbound_guard !== undefined) { fields.push('outbound_guard = ?'); values.push(updates.outbound_guard); }
+  if (updates.outbound_allowlist !== undefined) { fields.push('outbound_allowlist = ?'); values.push(updates.outbound_allowlist); }
+  if (updates.outbound_max_recipients !== undefined) { fields.push('outbound_max_recipients = ?'); values.push(updates.outbound_max_recipients); }
 
   if (fields.length === 0) return existing;
 
@@ -1837,130 +2113,6 @@ export function getEmailDraftsByAccount(accountId: string): EmailDraft[] {
 
 export function deleteEmailDraft(id: string): boolean {
   return db.prepare('DELETE FROM email_drafts WHERE id = ?').run(id).changes > 0;
-}
-
-// --- SMS Accounts ---
-
-export interface SmsAccount {
-  id: string;
-  user_id: string | null;
-  name: string;
-  phone_number: string;
-  account_sid: string;
-  auth_token: string;
-  read_only: number;
-  enabled: number;
-  created_at: string;
-}
-
-export interface SmsMessage {
-  id: string;
-  account_id: string;
-  direction: string;
-  from_number: string;
-  to_number: string;
-  body: string;
-  twilio_sid: string | null;
-  status: string | null;
-  created_at: string;
-}
-
-export function createSmsAccount(account: {
-  name: string;
-  phone_number: string;
-  account_sid: string;
-  auth_token: string;
-  read_only?: boolean;
-  enabled?: boolean;
-  user_id?: string | null;
-}): SmsAccount {
-  const id = `sms-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO sms_accounts (id, user_id, name, phone_number, account_sid, auth_token, read_only, enabled, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    account.user_id || null,
-    account.name,
-    account.phone_number,
-    account.account_sid,
-    account.auth_token,
-    account.read_only === false ? 0 : 1,
-    account.enabled === false ? 0 : 1,
-    now,
-  );
-  return getSmsAccount(id)!;
-}
-
-export function getSmsAccounts(userId?: string | null): SmsAccount[] {
-  if (userId === undefined) {
-    // System-level call — only return unowned accounts
-    return db
-      .prepare('SELECT * FROM sms_accounts WHERE user_id IS NULL ORDER BY created_at DESC')
-      .all() as SmsAccount[];
-  }
-  if (userId) {
-    return db
-      .prepare('SELECT * FROM sms_accounts WHERE user_id = ? ORDER BY created_at DESC')
-      .all(userId) as SmsAccount[];
-  }
-  // Explicit null = no accounts. Never leak all accounts.
-  return [];
-}
-
-export function getSmsAccount(id: string): SmsAccount | undefined {
-  return db.prepare('SELECT * FROM sms_accounts WHERE id = ?').get(id) as SmsAccount | undefined;
-}
-
-export function updateSmsAccount(
-  id: string,
-  updates: Partial<Pick<SmsAccount, 'name' | 'phone_number' | 'account_sid' | 'auth_token' | 'read_only' | 'enabled'>>,
-): boolean {
-  const fields: string[] = [];
-  const values: any[] = [];
-  if (updates.name !== undefined) { fields.push('name = ?'); values.push(updates.name); }
-  if (updates.phone_number !== undefined) { fields.push('phone_number = ?'); values.push(updates.phone_number); }
-  if (updates.account_sid !== undefined) { fields.push('account_sid = ?'); values.push(updates.account_sid); }
-  if (updates.auth_token !== undefined) { fields.push('auth_token = ?'); values.push(updates.auth_token); }
-  if (updates.read_only !== undefined) { fields.push('read_only = ?'); values.push(updates.read_only); }
-  if (updates.enabled !== undefined) { fields.push('enabled = ?'); values.push(updates.enabled); }
-  if (fields.length === 0) return false;
-  values.push(id);
-  return db.prepare(`UPDATE sms_accounts SET ${fields.join(', ')} WHERE id = ?`).run(...values).changes > 0;
-}
-
-export function deleteSmsAccount(id: string): boolean {
-  return db.prepare('DELETE FROM sms_accounts WHERE id = ?').run(id).changes > 0;
-}
-
-export function storeSmsMessage(msg: {
-  account_id: string;
-  direction: string;
-  from_number: string;
-  to_number: string;
-  body: string;
-  twilio_sid?: string;
-  status?: string;
-}): SmsMessage {
-  const id = `smsmsg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO sms_messages (id, account_id, direction, from_number, to_number, body, twilio_sid, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, msg.account_id, msg.direction, msg.from_number, msg.to_number, msg.body, msg.twilio_sid || null, msg.status || null, now);
-  return db.prepare('SELECT * FROM sms_messages WHERE id = ?').get(id) as SmsMessage;
-}
-
-export function getSmsMessages(accountId: string, limit: number = 100, fromNumber?: string): SmsMessage[] {
-  if (fromNumber) {
-    return db
-      .prepare('SELECT * FROM sms_messages WHERE account_id = ? AND (from_number = ? OR to_number = ?) ORDER BY created_at DESC LIMIT ?')
-      .all(accountId, fromNumber, fromNumber, limit) as SmsMessage[];
-  }
-  return db
-    .prepare('SELECT * FROM sms_messages WHERE account_id = ? ORDER BY created_at DESC LIMIT ?')
-    .all(accountId, limit) as SmsMessage[];
 }
 
 // --- OAuth accounts ---
@@ -2276,6 +2428,29 @@ export function listCalendarEvents(filter?: {
 
   const where = conditions.length > 0 ? ' WHERE ' + conditions.join(' AND ') : '';
   return db.prepare(`SELECT * FROM calendar_events${where} ORDER BY start_time ASC`).all(...values) as CalendarEvent[];
+}
+
+// --- Calendar Reminders (local at-event-time firing) ---
+// Idempotent dedup: one row per event that has already been reminded, so the
+// reminder loop fires exactly once per event and survives restarts. start_time
+// is stored naive-local for locally-created events and may be UTC for pulled
+// Google events — the loop parses with `new Date()` (local for naive, UTC for
+// Z-suffixed) so both compare correctly against wall-clock now.
+
+export function getFiredCalendarReminderIds(): Set<string> {
+  const rows = db.prepare('SELECT event_id FROM calendar_reminders').all() as { event_id: string }[];
+  return new Set(rows.map((r) => r.event_id));
+}
+
+export function markCalendarReminderFired(eventId: string): void {
+  db.prepare('INSERT OR IGNORE INTO calendar_reminders (event_id, fired_at) VALUES (?, ?)').run(
+    eventId,
+    new Date().toISOString(),
+  );
+}
+
+export function clearCalendarReminder(eventId: string): void {
+  db.prepare('DELETE FROM calendar_reminders WHERE event_id = ?').run(eventId);
 }
 
 export function createCalendarEvent(event: {
@@ -2868,4 +3043,408 @@ export function deleteExpiredResetTokens(): void {
 export function getUserByEmail(_email: string): any {
   // Single-user Warden: no dashboard_users table. Returns undefined.
   return undefined;
+}
+
+// ─── Default apps ───────────────────────────────────────────────────────────
+// A capability is a job some tool does (browsing, fetching, shell). Warden has
+// a built-in provider for each; an installed MCP server can take the job over.
+// Stored one row per capability (`default_app:<capability>`) so adding a
+// capability needs no schema change. Absent/'' means the built-in provides it.
+export const DEFAULT_APP_CAPABILITIES = ['browser', 'web', 'files', 'shell', 'capture'] as const;
+
+// Tools exempt from relevance ranking. Stored as a comma-separated row so a
+// new pin is a settings change, not a code change. Default: youtube — its
+// description loses "change the song" to read_file/list_file/bash.
+export function readPinnedTools(): string[] {
+  const raw = getRouterState('local:pinned_tools');
+  if (raw === null || raw === undefined) return ['youtube'];
+  return String(raw).split(',').map((t) => t.trim()).filter(Boolean);
+}
+
+export function readDefaultApps(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const cap of DEFAULT_APP_CAPABILITIES) {
+    const v = (getRouterState(`default_app:${cap}`) || '').trim();
+    out[cap] = v || 'builtin';
+  }
+  return out;
+}
+
+
+// ─── Friends (peer mesh over Tailscale) ────────────────────────────────────
+
+export interface FriendRow {
+  id: string;
+  name: string;
+  token_enc: string | null;
+  instance_id: string;
+  status: string;
+  last_seen: string | null;
+  capabilities: string;
+  specialists: string;
+  profile: string;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface FriendRequestRow {
+  id: string;
+  from_hostname: string;
+  from_instance_id: string;
+  capabilities: string;
+  specialists: string;
+  profile: string;
+  from_pubkey: string;
+  created_at: string;
+}
+
+export interface FriendMessageRow {
+  id: string;
+  from_hostname: string;
+  body: string;
+  direction: string;
+  read: number;
+  created_at: string;
+}
+
+export interface FriendRoomMessageRow {
+  id: string;
+  room: string;
+  from_hostname: string;
+  body: string;
+  created_at: string;
+}
+
+export interface FriendFileRow {
+  id: string;
+  from_hostname: string;
+  filename: string;
+  path: string;
+  created_at: string;
+}
+
+export function addFriendRoomMessage(room: string, fromHostname: string, body: string): FriendRoomMessageRow {
+  const id = crypto.randomUUID();
+  const created_at = new Date().toISOString();
+  db.prepare('INSERT INTO friend_room_messages (id, room, from_hostname, body, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(id, room, fromHostname, body, created_at);
+  return { id, room, from_hostname: fromHostname, body, created_at };
+}
+
+export function listFriendRoomMessages(limit = 100): FriendRoomMessageRow[] {
+  return db.prepare('SELECT * FROM friend_room_messages ORDER BY created_at DESC LIMIT ?').all(limit) as FriendRoomMessageRow[];
+}
+
+export function addFriendFile(fromHostname: string, filename: string, path: string): FriendFileRow {
+  const id = crypto.randomUUID();
+  const created_at = new Date().toISOString();
+  db.prepare('INSERT INTO friend_files (id, from_hostname, filename, path, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(id, fromHostname, filename, path, created_at);
+  return { id, from_hostname: fromHostname, filename, path, created_at };
+}
+
+export function listFriendFiles(limit = 100): FriendFileRow[] {
+  return db.prepare('SELECT * FROM friend_files ORDER BY created_at DESC LIMIT ?').all(limit) as FriendFileRow[];
+}
+
+export interface FriendBlockRow {
+  hostname: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface FriendOffenseRow {
+  id: string;
+  hostname: string;
+  kind: string;
+  detail: string;
+  created_at: string;
+}
+
+export function blockFriend(hostname: string, reason = ''): void {
+  db.prepare('INSERT OR REPLACE INTO friend_blocks (hostname, reason, created_at) VALUES (?, ?, ?)')
+    .run(hostname, reason, new Date().toISOString());
+}
+
+export function unblockFriend(hostname: string): boolean {
+  const r = db.prepare('DELETE FROM friend_blocks WHERE hostname = ?').run(hostname);
+  return r.changes > 0;
+}
+
+export function isBlocked(hostname: string): boolean {
+  return !!db.prepare('SELECT 1 FROM friend_blocks WHERE hostname = ?').get(hostname);
+}
+
+export function listBlocked(): FriendBlockRow[] {
+  return db.prepare('SELECT * FROM friend_blocks ORDER BY created_at DESC').all() as FriendBlockRow[];
+}
+
+export function logOffense(hostname: string, kind: string, detail = ''): void {
+  db.prepare('INSERT INTO friend_offenses (id, hostname, kind, detail, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(crypto.randomUUID(), hostname, kind, detail, new Date().toISOString());
+}
+
+export function listOffenses(limit = 100): FriendOffenseRow[] {
+  return db.prepare('SELECT * FROM friend_offenses ORDER BY created_at DESC LIMIT ?').all(limit) as FriendOffenseRow[];
+}
+
+export function countOffensesSince(hostname: string, since: string): number {
+  const row = db.prepare('SELECT COUNT(*) AS n FROM friend_offenses WHERE hostname = ? AND created_at > ?')
+    .get(hostname, since) as { n: number };
+  return row?.n || 0;
+}
+
+export function listFriends(): FriendRow[] {
+  return db.prepare('SELECT * FROM friends ORDER BY created_at ASC').all() as FriendRow[];
+}
+
+export function getFriend(hostname: string): FriendRow | undefined {
+  return db.prepare('SELECT * FROM friends WHERE id = ?').get(hostname) as FriendRow | undefined;
+}
+
+export function upsertFriend(row: Partial<FriendRow> & { id: string }): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO friends (id, name, token_enc, instance_id, status, last_seen, capabilities, specialists, profile, created_at, updated_at)
+     VALUES (@id, @name, @token_enc, @instance_id, @status, @last_seen, @capabilities, @specialists, @profile, @created_at, @updated_at)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       token_enc = COALESCE(excluded.token_enc, friends.token_enc),
+       instance_id = COALESCE(excluded.instance_id, friends.instance_id),
+       status = excluded.status,
+       last_seen = excluded.last_seen,
+       capabilities = excluded.capabilities,
+       specialists = excluded.specialists,
+       profile = excluded.profile,
+       updated_at = excluded.updated_at`,
+  ).run({
+    id: row.id,
+    name: row.name ?? '',
+    token_enc: row.token_enc ?? null,
+    instance_id: row.instance_id ?? '',
+    status: row.status ?? 'offline',
+    last_seen: row.last_seen ?? null,
+    capabilities: row.capabilities ?? '[]',
+    specialists: (row as any).specialists ?? '[]',
+    profile: (row as any).profile ?? '',
+    created_at: row.created_at ?? now,
+    updated_at: row.updated_at ?? now,
+  });
+}
+
+export function setFriendStatus(hostname: string, status: string, lastSeen?: string): void {
+  db.prepare('UPDATE friends SET status = ?, last_seen = COALESCE(?, last_seen), updated_at = ? WHERE id = ?')
+    .run(status, lastSeen ?? null, new Date().toISOString(), hostname);
+}
+
+export function deleteFriend(hostname: string): boolean {
+  const r = db.prepare('DELETE FROM friends WHERE id = ?').run(hostname);
+  return r.changes > 0;
+}
+
+export function listFriendRequests(): FriendRequestRow[] {
+  return db.prepare('SELECT * FROM friend_requests ORDER BY created_at ASC').all() as FriendRequestRow[];
+}
+
+export function getFriendRequest(id: string): FriendRequestRow | undefined {
+  return db.prepare('SELECT * FROM friend_requests WHERE id = ?').get(id) as FriendRequestRow | undefined;
+}
+
+export function createFriendRequest(id: string, fromHostname: string, fromInstanceId: string, capabilities: string, specialists = '[]', profile = '', fromPubkey = ''): void {
+  db.prepare('INSERT INTO friend_requests (id, from_hostname, from_instance_id, capabilities, specialists, profile, from_pubkey, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(id, fromHostname, fromInstanceId, capabilities, specialists, profile, fromPubkey, new Date().toISOString());
+}
+
+export function deleteFriendRequest(id: string): boolean {
+  const r = db.prepare('DELETE FROM friend_requests WHERE id = ?').run(id);
+  return r.changes > 0;
+}
+
+export function addFriendMessage(fromHostname: string, body: string, direction: 'inbound' | 'outbound'): FriendMessageRow {
+  const id = crypto.randomUUID();
+  const created_at = new Date().toISOString();
+  db.prepare('INSERT INTO friend_messages (id, from_hostname, body, direction, read, created_at) VALUES (?, ?, ?, ?, 0, ?)')
+    .run(id, fromHostname, body, direction, created_at);
+  return { id, from_hostname: fromHostname, body, direction, read: 0, created_at };
+}
+
+export function listFriendMessages(limit = 50): FriendMessageRow[] {
+  return db.prepare('SELECT * FROM friend_messages ORDER BY created_at DESC LIMIT ?').all(limit) as FriendMessageRow[];
+}
+
+export function markFriendMessagesRead(hostname: string): void {
+  db.prepare('UPDATE friend_messages SET read = 1 WHERE from_hostname = ? AND direction = \'inbound\'').run(hostname);
+}
+
+/** Update the meta a friend advertised at accept (specialists + profile). */
+export function updateFriendMeta(hostname: string, specialists: string, profile: string): void {
+  db.prepare('UPDATE friends SET specialists = ?, profile = ?, updated_at = ? WHERE id = ?')
+    .run(specialists, profile, new Date().toISOString(), hostname);
+}
+
+// ─── BBS (shared bulletin board over the friend mesh) ───────────────────────
+
+export interface BbsBoard {
+  name: string;
+  description: string;
+  position: number;
+}
+
+export interface BbsThread {
+  id: string;
+  board: string;
+  author_host: string;
+  author_kind: string;
+  title: string;
+  created_at: string;
+  host: string;
+  post_count?: number;
+}
+
+export interface BbsPost {
+  id: string;
+  board: string;
+  thread_id: string | null;
+  reply_to: string | null;
+  author_host: string;
+  author_kind: string;
+  body: string;
+  created_at: string;
+  host: string;
+}
+
+export function seedBbsBoards(): void {
+  const boards: [string, string, number][] = [
+    ['shoutbox', 'Flat chat — a place for Wardens to catch up and say hi.', 0],
+    ['general', 'Anything that does not fit another board.', 1],
+    ['ideas', 'Ideas worth sharing and building on.', 2],
+    ['help', 'Ask another Warden for help.', 3],
+    ['show-and-tell', 'Show off what you built.', 4],
+  ];
+  const ins = db.prepare('INSERT OR IGNORE INTO bbs_boards (name, description, position) VALUES (?, ?, ?)');
+  for (const [name, description, position] of boards) ins.run(name, description, position);
+}
+
+export function listBbsBoards(): BbsBoard[] {
+  return db.prepare('SELECT * FROM bbs_boards ORDER BY position ASC').all() as BbsBoard[];
+}
+
+export function getBbsBoard(name: string): BbsBoard | undefined {
+  return db.prepare('SELECT * FROM bbs_boards WHERE name = ?').get(name) as BbsBoard | undefined;
+}
+
+export function listBbsThreads(opts: { board?: string; host?: string } = {}): BbsThread[] {
+  const where: string[] = [];
+  const args: any[] = [];
+  if (opts.board) { where.push('t.board = ?'); args.push(opts.board); }
+  if (opts.host) { where.push('t.host = ?'); args.push(opts.host); }
+  const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  return db.prepare(
+    `SELECT t.*, (SELECT COUNT(*) FROM bbs_posts p WHERE p.thread_id = t.id) AS post_count
+     FROM bbs_threads t ${w} ORDER BY t.created_at DESC`,
+  ).all(...args) as BbsThread[];
+}
+
+export function getBbsThread(id: string): BbsThread | undefined {
+  return db.prepare('SELECT * FROM bbs_threads WHERE id = ?').get(id) as BbsThread | undefined;
+}
+
+/** Insert a thread if it doesn't already exist (P2P dedupe). Returns whether it was new. */
+export function createBbsThread(row: {
+  id: string;
+  board: string;
+  author_host: string;
+  author_kind: string;
+  title: string;
+  created_at: string;
+  host: string;
+}): boolean {
+  const r = db.prepare(
+    `INSERT OR IGNORE INTO bbs_threads (id, board, author_host, author_kind, title, created_at, host)
+     VALUES (@id, @board, @author_host, @author_kind, @title, @created_at, @host)`,
+  ).run(row);
+  return r.changes > 0;
+}
+
+/** Insert a post if it doesn't already exist (P2P dedupe). Returns whether it was new. */
+export function createBbsPost(row: {
+  id: string;
+  board: string;
+  thread_id: string | null;
+  reply_to: string | null;
+  author_host: string;
+  author_kind: string;
+  body: string;
+  created_at: string;
+  host: string;
+}): boolean {
+  const r = db.prepare(
+    `INSERT OR IGNORE INTO bbs_posts (id, board, thread_id, reply_to, author_host, author_kind, body, created_at, host)
+     VALUES (@id, @board, @thread_id, @reply_to, @author_host, @author_kind, @body, @created_at, @host)`,
+  ).run(row);
+  return r.changes > 0;
+}
+
+export function getBbsPost(id: string): BbsPost | undefined {
+  return db.prepare('SELECT * FROM bbs_posts WHERE id = ?').get(id) as BbsPost | undefined;
+}
+
+/** Delete a post by id. Returns whether one was removed. */
+export function deleteBbsPost(id: string): boolean {
+  return db.prepare('DELETE FROM bbs_posts WHERE id = ?').run(id).changes > 0;
+}
+
+/** Drop a thread row once it has no posts left — the message area lives in posts. */
+export function deleteBbsThreadIfEmpty(id: string): boolean {
+  return db.prepare(
+    'DELETE FROM bbs_threads WHERE id = ? AND NOT EXISTS (SELECT 1 FROM bbs_posts WHERE thread_id = ?)',
+  ).run(id, id).changes > 0;
+}
+
+export function listBbsPosts(opts: { board?: string; thread_id?: string; host?: string; limit?: number } = {}): BbsPost[] {
+  const limit = Math.max(1, opts.limit ?? 200);
+  const where: string[] = [];
+  const args: any[] = [];
+  if (opts.board) { where.push('board = ?'); args.push(opts.board); }
+  if (opts.thread_id) { where.push('thread_id = ?'); args.push(opts.thread_id); }
+  if (opts.host) { where.push('host = ?'); args.push(opts.host); }
+  const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  const order = opts.thread_id ? 'ASC' : 'DESC';
+  return db.prepare(`SELECT * FROM bbs_posts ${w} ORDER BY created_at ${order} LIMIT ?`).all(...args, limit) as BbsPost[];
+}
+
+/** Backfill rows created before the `host` column existed as owned by this node. */
+export function backfillBbsHost(hostname: string): void {
+  db.prepare(`UPDATE bbs_threads SET host = ? WHERE host = ''`).run(hostname);
+  db.prepare(`UPDATE bbs_posts SET host = ? WHERE host = ''`).run(hostname);
+}
+
+// ── BBS callers (third-party agents dialing in over MCP) ────────────────────
+
+export interface BbsCaller {
+  handle: string;
+  token_hash: string;
+  created_at: string;
+  last_seen: string | null;
+}
+
+export function createBbsCaller(handle: string, tokenHash: string): void {
+  db.prepare('INSERT INTO bbs_callers (handle, token_hash, created_at) VALUES (?, ?, ?)')
+    .run(handle, tokenHash, new Date().toISOString());
+}
+
+export function getBbsCallerByHash(tokenHash: string): BbsCaller | undefined {
+  return db.prepare('SELECT * FROM bbs_callers WHERE token_hash = ?').get(tokenHash) as BbsCaller | undefined;
+}
+
+export function listBbsCallers(): BbsCaller[] {
+  return db.prepare('SELECT * FROM bbs_callers ORDER BY created_at DESC').all() as BbsCaller[];
+}
+
+export function touchBbsCaller(handle: string): void {
+  db.prepare('UPDATE bbs_callers SET last_seen = ? WHERE handle = ?').run(new Date().toISOString(), handle);
+}
+
+export function deleteBbsCaller(handle: string): boolean {
+  return db.prepare('DELETE FROM bbs_callers WHERE handle = ?').run(handle).changes > 0;
 }

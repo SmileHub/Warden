@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import { execSync, spawn, spawnSync } from 'child_process';
 import http from 'http';
@@ -8,8 +9,14 @@ import { CronExpressionParser } from 'cron-parser';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { transcribeLocal } from './transcription.js';
-import { killCurrentAgent, getLiveStatus, getProgressHistory } from './agent-spawn.js';
-import { spawnOculusBackground, syncAgentCtxEnv } from './index.js';
+import { killCurrentAgent, cancelCurrentTurn, getLiveStatus, getLiveJobs, getProgressHistory } from './agent-spawn.js';
+import { syncAgentCtxEnv, runFriendTurn, runColab, getColabStatus } from './index.js';
+import { parseRelativeDuration } from './task-scheduler.js';
+import { handleBrowserMcp, startBrowserGate } from './browser-mcp-gate.js';
+import { handleFriendsRequest, setHumanPresence } from './friends.js';
+import { handleBotnetMcp } from './botnet-mcp.js';
+import { propagateOpsModel } from './ops-model.js';
+import { loadMemoryTree, runMemoryClassification, treeActivity, memoryTreeRunning, noteTreeActivity, filedTreeFacts, maybeBackfillTreeFacts, scanConfig, setScanConfig, requestScanAbort } from './memory-tree.js';
 import {
   ASSISTANT_NAME,
   CONTAINER_IMAGE,
@@ -36,30 +43,11 @@ import {
 } from './types.js';
 import type { RegisteredGroup } from './group-folder.js';
 import {
-  scrubFile,
-  loadVaultIndex,
-  getVaultEntry,
-  readScrubbed,
-  readMapping,
-  deleteVaultEntry,
-  updateVaultEntryStatus,
-  unscrub,
-  loadDictionary,
-  saveDictionary,
-  VAULT_DIR,
-  SCRUBBED_DIR,
-} from './scrubber.js';
-import {
   addMcpServer,
   loadMcpServers,
   removeMcpServer,
   setMcpServerEnabled,
 } from './mcp-registry.js';
-import {
-  recordAwarenessEvent,
-  queryAwarenessHostEvents,
-  clearOculusLogs,
-} from './security-log.js';
 import {
   createTask,
   createUserTask,
@@ -81,6 +69,9 @@ import {
   updateTask,
   updateUserTask,
   getRouterState,
+  readDefaultApps,
+  readPinnedTools,
+  DEFAULT_APP_CAPABILITIES,
   setRouterState,
   createEmailAccount,
   getEmailAccounts,
@@ -90,13 +81,6 @@ import {
   createEmailDraft,
   getEmailDraftsByAccount,
   deleteEmailDraft,
-  createSmsAccount,
-  getSmsAccounts,
-  getSmsAccount,
-  updateSmsAccount,
-  deleteSmsAccount,
-  storeSmsMessage,
-  getSmsMessages,
   insertNotification,
   getNotifications,
   getUnreadNotificationCount,
@@ -186,7 +170,7 @@ import {
   deletePasswordResetToken,
   getUserByEmail,
 } from './db.js';
-import { getDb, getSatelliteIp } from './db.js';
+import { getDb, getSatelliteIp, clearChatMessages } from './db.js';
 import { AgentSessionStore } from './agent-session-store.js';
 import { encryptApiKey } from './encryption.js';
 import httpProxy from 'http-proxy';
@@ -207,7 +191,7 @@ function probeLocalPort(port: number, path: string): Promise<boolean> {
   });
 }
 import { fetchEmails, sendEmail, testConnection } from './email.js';
-import { sendSMS, fetchMessages as fetchSmsMessages, testConnection as testSmsConnection, testCredentials as testSmsCredentials } from './sms.js';
+import { listTrainingFlags } from './training-flags.js';
 
 const STATUS_PORT = parseInt(process.env.STATUS_PORT || '3200', 10);
 
@@ -553,64 +537,9 @@ function serveStatic(res: http.ServerResponse, urlPath: string): void {
   });
 }
 
-// --- Password helpers ---
-
-function hashPassword(password: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const salt = crypto.randomBytes(16).toString('hex');
-    crypto.scrypt(password, salt, 64, (err, derived) => {
-      if (err) reject(err);
-      resolve(salt + ':' + derived.toString('hex'));
-    });
-  });
-}
-
-function verifyPassword(password: string, stored: string): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    const [salt, hash] = stored.split(':');
-    crypto.scrypt(password, salt, 64, (err, derived) => {
-      if (err) reject(err);
-      resolve(crypto.timingSafeEqual(Buffer.from(hash, 'hex'), derived));
-    });
-  });
-}
-
-function generateSessionToken(): string {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-const TURNSTILE_SECRET =
-  process.env.TURNSTILE_SECRET
-  || readEnvFile(['TURNSTILE_SECRET']).TURNSTILE_SECRET
-  || '0x4AAAAAADNaYWXE5XoK-cCLbFyp0DJEPYs';
-if (TURNSTILE_SECRET === '0x4AAAAAADNaYWXE5XoK-cCLbFyp0DJEPYs') {
-  logger.warn(
-    'SECURITY: TURNSTILE_SECRET is not set (env var or env file) — falling back to the hardcoded default secret, which is compromised. Set TURNSTILE_SECRET in data/env/env.',
-  );
-}
-
-async function verifyTurnstile(token: string | undefined): Promise<boolean> {
-  if (!token) return false;
-  try {
-    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ secret: TURNSTILE_SECRET, response: token }),
-    });
-    const data = await resp.json() as any;
-    return data.success === true;
-  } catch {
-    return false;
-  }
-}
-
-function validatePasswordStrength(pw: string): string | null {
-  if (pw.length < 6) return 'Must be at least 6 characters';
-  if (!/[A-Z]/.test(pw)) return 'Must contain an uppercase letter';
-  if (!/[0-9]/.test(pw)) return 'Must contain a number';
-  if (!/[^A-Za-z0-9]/.test(pw)) return 'Must contain a special character';
-  return null;
-}
+// (The multi-user password/Turnstile/session helpers were removed with the
+// admin route tree — single-user Warden has no auth gate. The old block lived
+// here; its only remains is a stale snapshot under Notes/, not live code.)
 
 // --- Route handlers ---
 
@@ -827,11 +756,14 @@ function getStatusData() {
     activeContainers: Math.max(queueStatus.activeCount, queueStatus.groups.filter((g: any) => g.active).length),
     scheduledTasks: deps.getAllTasks().length,
     runningJobs: getLiveStatus().jobs || 0,
+    // Structured per-job snapshot for the Oversight window (replaces the old
+    // parse-the-label-string approach).
+    jobs: getLiveJobs(),
     progress: getProgressHistory(),
     groups: groupList,
     timestamp: new Date().toISOString(),
     ollamaChatModel: process.env.OLLAMA_CHAT_MODEL || OLLAMA_CHAT_MODEL,
-    ollamaUrl: OLLAMA_URL,
+    ollamaUrl: process.env.OLLAMA_URL || OLLAMA_URL,
     defaultModelMode: DEFAULT_MODEL_MODE,
     ollamaEnabled: getRouterState('ollama_enabled') === 'true',
     system: getSystemMetrics(),
@@ -916,8 +848,8 @@ async function handleMessages(
     const limit = parseInt(params.get('limit') || '50', 10);
     const idea = params.get('idea') || '';
     const messages = deps.getMessagesForDashboard(jid, since, limit, idea || undefined)
-      // Hide raw AWARENESS triggers from the chat — they're internal events for
-      // Oculus, not user-facing. Oculus's own send_message reply still shows.
+      // Hide legacy AWARENESS trigger rows (pre-2026-09-15 eyes detector) —
+      // internal events, not user-facing chat.
       .filter((m: any) => !(m.content || '').startsWith('AWARENESS'));
     return json(res, { messages, jid });
   }
@@ -934,13 +866,6 @@ async function handleMessages(
       idea?: string;
     };
     if (!body.text) return error(res, 'text required');
-
-    // AWARENESS events are internal control messages for Oculus. They must be
-    // sent to the dedicated /api/awareness endpoint; they are never stored as
-    // chat/bot messages here.
-    if ((body.text || '').startsWith('AWARENESS')) {
-      return error(res, 'AWARENESS messages must be sent to /api/awareness');
-    }
 
     const jid = body.jid || WEB_DASHBOARD_JID;
 
@@ -1413,18 +1338,6 @@ async function handleFiles(
       return json(res, { files });
     }
 
-    // Build set of scrubbed file paths for badge indicators
-    const vaultIndex = loadVaultIndex();
-    const scrubbedPaths = new Set<string>();
-    for (const entry of vaultIndex) {
-      if (entry.status === 'scrubbed') {
-        scrubbedPaths.add(entry.originalPath);
-        // Also mark the .md replacement
-        const mdPath = entry.originalPath.replace(/\.[^.]+$/, '.md');
-        scrubbedPaths.add(mdPath);
-      }
-    }
-
     // Hide internal/system entries from file browser
     const HIDDEN_NAMES = new Set([
       'logs', 'conversations', '.claude',
@@ -1434,16 +1347,14 @@ async function handleFiles(
       .map((name) => {
       try {
         const s = fs.statSync(path.join(full, name));
-        const fullPath = path.join(full, name);
         return {
           name,
           type: s.isDirectory() ? 'dir' : 'file',
           size: s.size,
           mtime: s.mtime.toISOString(),
-          scrubbed: scrubbedPaths.has(fullPath),
         };
       } catch {
-        return { name, type: 'file', size: 0, mtime: '', scrubbed: false };
+        return { name, type: 'file', size: 0, mtime: '' };
       }
     });
     // No per-user folder filtering in single-user Warden.
@@ -1476,27 +1387,279 @@ import {
 // Re-export so existing `from './status-server.js'` importers keep working.
 export { OllamaServer, readOllamaServers, writeOllamaServers, resolveOllamaServerUrl, resolveAgentOllamaUrl };
 
-function handleSettings(res: http.ServerResponse): void {
+// Live built-in tool vocabulary, for the pinned-tools control in Settings: the
+// same toolsets module the agent-runner's ranker draws from, imported from its
+// compiled dist. Cached after the first load; on any import failure the pool
+// is empty and the dashboard shows the current pins only.
+let cachedToolPool: string[] | null = null;
+async function readToolPool(): Promise<string[]> {
+  if (cachedToolPool) return cachedToolPool;
+  try {
+    const m = (await import('../dist/agent-runner/toolsets.js')) as { TOOLSETS?: Record<string, { tools?: unknown[] }> };
+    const names = Object.values(m.TOOLSETS || {})
+      .flatMap((t) => (Array.isArray(t?.tools) ? t.tools : []))
+      .filter((n): n is string => typeof n === 'string' && !!n);
+    // MCP servers are pinnable too: one entry per ENABLED server, named
+    // mcp__<server> — the runner treats it as a prefix pin covering every
+    // tool that server exposes (its tool list lives only in the runner's
+    // live connection, so a per-tool pool here would always be stale).
+    const mcpEntries = loadMcpServers()
+      .filter((s) => s.enabled)
+      .map((s) => `mcp__${s.name}`);
+    cachedToolPool = [...new Set([...names, ...mcpEntries])].sort();
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? err }, 'tool pool unavailable — pinned-tools select shows current pins only');
+    cachedToolPool = [];
+  }
+  return cachedToolPool;
+}
+
+// --- MARM memory canvas -----------------------------------------------------
+// The MARM dash rebuilt natively on a Warden canvas — no iframe. The Warden
+// host reads MARM's SQLite store directly (same queries the MARM console uses)
+// and checks the live MARM API for health. MARM is optional: a down API or a
+// missing store degrades the canvas to "offline" and never blocks anything
+// else (the same optional-component contract as the browser capability).
+
+const MARM_URL = process.env.MARM_URL || 'http://127.0.0.1:8001';
+const MARM_DB_PATH = process.env.MARM_DB_PATH || path.join(os.homedir(), '.marm', 'marm_memory.db');
+let marmDb: Database.Database | null = null;
+
+function getMarmDb(): Database.Database | null {
+  if (marmDb) return marmDb;
+  try {
+    marmDb = new Database(MARM_DB_PATH, { fileMustExist: true });
+    // MARM's own service writes through the same file (WAL) — never wedge on a lock.
+    marmDb.pragma('busy_timeout = 3000');
+    return marmDb;
+  } catch {
+    return null;
+  }
+}
+
+/** Bounded health probe of the MARM API — both connect and body reads time out. */
+function marmHealth(): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: Record<string, unknown>) => { if (!settled) { settled = true; resolve(v); } };
+    try {
+      const probe = http.get(`${MARM_URL}/health`, (r) => {
+        let body = '';
+        r.on('data', (c: Buffer) => { body += c.toString(); if (body.length > 65536) probe.destroy(); });
+        r.on('end', () => {
+          try { done(JSON.parse(body) as Record<string, unknown>); } catch { done({ reachable: false }); }
+        });
+        r.on('error', () => done({ reachable: false }));
+      });
+      probe.on('error', () => done({ reachable: false }));
+      // Bounds the whole request: if no response within 3s, the canvas shows offline.
+      probe.setTimeout(3000, () => { probe.destroy(); done({ reachable: false }); });
+    } catch {
+      done({ reachable: false });
+    }
+  });
+}
+
+function marmCount(db: Database.Database, sql: string): number {
+  const n = db.prepare(sql).pluck().get();
+  return typeof n === 'number' ? n : 0;
+}
+
+/** Bounded JSON call into the live MARM API — connect AND response are timed out. */
+function marmApi(method: string, marmPath: string, body: unknown, timeoutMs: number): Promise<{ status: number; data: unknown }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (msg: string) => { if (!settled) { settled = true; reject(new Error(msg)); } };
+    try {
+      const u = new URL(MARM_URL + marmPath);
+      const payload = body == null ? null : Buffer.from(JSON.stringify(body));
+      const r = http.request(
+        {
+          hostname: u.hostname, port: u.port, path: u.pathname + u.search, method,
+          headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {},
+        },
+        (r2) => {
+          let buf = '';
+          r2.on('data', (c: Buffer) => { buf += c.toString(); if (buf.length > 8 * 1024 * 1024) r2.destroy(); });
+          r2.on('end', () => {
+            try { resolve({ status: r2.statusCode || 0, data: buf ? JSON.parse(buf) : null }); }
+            catch { fail(`MARM API returned non-JSON (HTTP ${r2.statusCode})`); }
+          });
+          r2.on('error', (e: Error) => fail(e.message));
+        }
+      );
+      r.on('error', (e) => fail(e.message));
+      r.setTimeout(timeoutMs, () => { r.destroy(); fail('MARM API timed out'); });
+      if (payload) r.write(payload);
+      r.end();
+    } catch (e: any) { fail(e.message); }
+  });
+}
+
+async function handleMarm(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  params: URLSearchParams,
+): Promise<void> {
+  const db = getMarmDb();
+  if (!db) return error(res, `MARM store unavailable at ${MARM_DB_PATH}`, 503);
+
+  const limit = Math.min(Math.max(Number(params.get('limit')) || 50, 1), 200);
+  const offset = Math.max(Number(params.get('offset')) || 0, 0);
+
+  // DELETE memories / logs — { ids: [...] }
+  if (req.method === 'DELETE' && (pathname === '/api/marm/memories' || pathname === '/api/marm/logs')) {
+    const body = parseJson(await parseBody(req)) as { ids?: (string | number)[] };
+    const ids = (Array.isArray(body.ids) ? body.ids : []).filter((x) => typeof x === 'string' || typeof x === 'number').slice(0, 500);
+    if (!ids.length) return error(res, 'ids required');
+    const table = pathname === '/api/marm/memories' ? 'memories' : 'log_entries';
+    const stmt = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
+    const deleted = db.transaction((list: (string | number)[]) => {
+      let n = 0;
+      for (const id of list) n += stmt.run(id).changes;
+      return n;
+    })(ids);
+    return json(res, { ok: true, deleted });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/marm/overview') {
+    const health = await marmHealth();
+    return json(res, {
+      health,
+      db: MARM_DB_PATH,
+      stats: {
+        active_memories: marmCount(db, "SELECT COUNT(*) FROM memories WHERE compaction_role IS NULL OR compaction_role != 'source'"),
+        compacted_sources: marmCount(db, "SELECT COUNT(*) FROM memories WHERE compaction_role = 'source'"),
+        missing_embeddings: marmCount(db, 'SELECT COUNT(*) FROM memories WHERE embedding IS NULL'),
+        sessions: marmCount(db, 'SELECT COUNT(*) FROM sessions'),
+        log_entries: marmCount(db, 'SELECT COUNT(*) FROM log_entries'),
+        notebook_entries: marmCount(db, 'SELECT COUNT(*) FROM notebook_entries'),
+        pending_compaction: marmCount(db, "SELECT COUNT(*) FROM compaction_staging WHERE status IN ('pending_summary','ready')"),
+        staged_compaction: marmCount(db, "SELECT COUNT(*) FROM compaction_staging WHERE status = 'staged'"),
+      },
+      projects: db.prepare("SELECT DISTINCT project FROM memories WHERE project IS NOT NULL AND project != '' ORDER BY project COLLATE NOCASE").pluck().all(),
+      platforms: db.prepare("SELECT DISTINCT platform FROM memories WHERE platform IS NOT NULL AND platform != '' ORDER BY platform COLLATE NOCASE").pluck().all(),
+    });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/marm/memories') {
+    const clauses: string[] = [];
+    const args: (string | number)[] = [];
+    const role = params.get('role');
+    if (role === 'compacted') clauses.push("compaction_role = 'source'");
+    else if (role !== 'all') clauses.push("(compaction_role IS NULL OR compaction_role != 'source')");
+    const session = params.get('session');
+    if (session) { clauses.push('session_name = ?'); args.push(session); }
+    const project = params.get('project');
+    if (project) { clauses.push('project = ?'); args.push(project); }
+    const q = params.get('q');
+    if (q) {
+      clauses.push("content LIKE ? ESCAPE '\\'");
+      args.push('%' + q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_') + '%');
+    }
+    const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+    const total = db.prepare(`SELECT COUNT(*) FROM memories${where}`).pluck().get(...args) as number;
+    const memories = db.prepare(
+      `SELECT id, session_name, project, platform, context_type, compaction_role, created_at, substr(content, 1, 500) AS content FROM memories${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).all(...args, limit, offset);
+    return json(res, { total, memories });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/marm/logs') {
+    const clauses: string[] = [];
+    const args: (string | number)[] = [];
+    const session = params.get('session');
+    if (session) { clauses.push('session_name = ?'); args.push(session); }
+    const q = params.get('q');
+    if (q) {
+      clauses.push("summary LIKE ? ESCAPE '\\'");
+      args.push('%' + q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_') + '%');
+    }
+    const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+    const total = db.prepare(`SELECT COUNT(*) FROM log_entries${where}`).pluck().get(...args) as number;
+    const logs = db.prepare(
+      `SELECT id, session_name, entry_date, topic, project, platform, created_at, substr(summary, 1, 400) AS summary FROM log_entries${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).all(...args, limit, offset);
+    return json(res, { total, logs });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/marm/sessions') {
+    const sessions = db.prepare(
+      'SELECT session_name, marm_active, created_at, last_accessed FROM sessions ORDER BY last_accessed DESC LIMIT ?'
+    ).all(limit);
+    return json(res, { sessions });
+  }
+
+  // Session create/delete straight in the store (same rows the console manages).
+  if (req.method === 'POST' && pathname === '/api/marm/sessions') {
+    const body = parseJson(await parseBody(req)) as { session_name?: string };
+    const name = String(body.session_name || '').trim().slice(0, 255);
+    if (!name) return error(res, 'session_name required');
+    db.prepare(
+      "INSERT OR IGNORE INTO sessions (session_name, marm_active, created_at, last_accessed) VALUES (?, 0, datetime('now'), datetime('now'))"
+    ).run(name);
+    return json(res, { ok: true, session_name: name });
+  }
+  if (req.method === 'DELETE' && pathname === '/api/marm/sessions') {
+    const body = parseJson(await parseBody(req)) as { names?: string[] };
+    const names = (Array.isArray(body.names) ? body.names : []).filter((x) => typeof x === 'string').slice(0, 500);
+    if (!names.length) return error(res, 'names required');
+    const stmt = db.prepare('DELETE FROM sessions WHERE session_name = ?');
+    const deleted = db.transaction((list: string[]) => {
+      let n = 0;
+      for (const nm of list) n += stmt.run(nm).changes;
+      return n;
+    })(names);
+    return json(res, { ok: true, deleted });
+  }
+
+  // Live MARM API passthroughs — every canvas action that belongs to the
+  // running service (recall, compaction, notebook, concepts, summary) goes
+  // through the API, never by second-guessing its internals in SQL.
+  const marmPassthrough: Record<string, [string, string]> = {
+    '/api/marm/memory':        ['POST', '/internal/memories'],
+    '/api/marm/log-entry':     ['POST', '/marm_log_entry'],
+    '/api/marm/smart-recall':  ['POST', '/marm_smart_recall'],
+    '/api/marm/compaction':    ['POST', '/marm_compaction'],
+    '/api/marm/notebook':      ['POST', '/marm_notebook'],
+    '/api/marm/concept-build': ['POST', '/marm_concept_build'],
+    '/api/marm/summary':       ['GET',  '/marm_summary'],
+  };
+  if (marmPassthrough[pathname]) {
+    const [method, marmPath] = marmPassthrough[pathname];
+    try {
+      const body = method === 'POST' ? parseJson(await parseBody(req)) : null;
+      const query = method === 'GET' && params.toString() ? '?' + params.toString() : '';
+      const out = await marmApi(method, marmPath + query, body, 60_000);
+      if (out.status >= 400) {
+        return error(res, `MARM said HTTP ${out.status}: ${JSON.stringify(out.data).slice(0, 300)}`, 502);
+      }
+      return json(res, out.data);
+    } catch (e: any) {
+      return error(res, `MARM API: ${e.message}`, 502);
+    }
+  }
+
+  return error(res, 'Not found', 404);
+}
+
+async function handleSettings(res: http.ServerResponse): Promise<void> {
   const envVals = readEnvFile([
     'CALENDAR_TOKEN',
     'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET',
     'MICROSOFT_CLIENT_ID', 'MICROSOFT_CLIENT_SECRET',
-    'TZ',
+    'TZ', 'OLLAMA_URL',
   ]);
   const googleId = process.env.GOOGLE_CLIENT_ID || envVals.GOOGLE_CLIENT_ID || '';
   const googleSecret = process.env.GOOGLE_CLIENT_SECRET || envVals.GOOGLE_CLIENT_SECRET || '';
   const msId = process.env.MICROSOFT_CLIENT_ID || envVals.MICROSOFT_CLIENT_ID || '';
   const msSecret = process.env.MICROSOFT_CLIENT_SECRET || envVals.MICROSOFT_CLIENT_SECRET || '';
-  let oculusMd = '';
-  try {
-    const oculusMdPath = path.resolve(WORKSPACE_ROOT, 'eyes_ears', 'oculus.md');
-    if (fs.existsSync(oculusMdPath)) oculusMd = fs.readFileSync(oculusMdPath, 'utf8');
-  } catch { /* ignore */ }
   const drivingForces = listDrivingForces();
-  // The five toolcall agents (Byte, Dexter, Iris, Oculus, Mercury) share one
-  // model + ctx — surfaced from the legacy local:subagent_model/_ctx wire that
-  // the dashboard "Toolcall model" row writes. Mirror it into the per-agent
-  // fields too so the voice Agents panel popover still displays a value.
+  // Iris (the single toolcall agent — byte merged in 2026-09-05) reads one
+  // model + ctx from the local:subagent_model/_ctx wire that the dashboard
+  // "Toolcall model" row writes. Mercury has its OWN model + ctx rows and
+  // keys (mercury:model / local:mercury_ctx), mirrored into the same fields below.
   const toolcallModel = getRouterState('local:subagent_model') || '';
   const toolcallCtx = getRouterState('local:subagent_ctx') || '';
   json(res, {
@@ -1508,41 +1671,45 @@ function handleSettings(res: http.ServerResponse): void {
     idleTimeout: IDLE_TIMEOUT,
     maxConcurrentContainers: 1,
     groupsDir: GROUPS_DIR,
-    ollamaUrl: OLLAMA_URL,
+    // Read OLLAMA_URL live (process.env, updated by the save handler, then the
+    // .env file) rather than the boot-cached config constant — otherwise the
+    // field keeps showing the value captured at startup and a saved change
+    // appears to revert until a restart.
+    ollamaUrl: process.env.OLLAMA_URL || envVals.OLLAMA_URL || OLLAMA_URL,
     ollamaModel: process.env.OLLAMA_MODEL || '',
     ollamaChatModel: process.env.OLLAMA_CHAT_MODEL || OLLAMA_CHAT_MODEL,
     defaultModelMode: DEFAULT_MODEL_MODE,
-    orchestratorModel: getRouterState('orchestrator:model') || '',
-    atlasModel: getRouterState('atlas:model') || '',
+    // Max tokens one reply may generate. NOT ctx — this is the output cap, and
+    // a blank row means the built-in default applies.
+    maxOutputTokens: getRouterState('local:max_output_tokens') || '',
     vulkanModel: getRouterState('vulkan:model') || '',
+    // Supervisor = the completion verdict on finished jobs. Blank = verdicts
+    // run the Atlas model. supervisorEnabled toggles the verdict pass.
+    supervisorModel: getRouterState('supervisor:model') || '',
+    supervisorEnabled: getRouterState('supervisor:enabled') !== 'false',
     // Per-agent models — each agent has its own concrete model (no blank/inherit).
-    // The five toolcall agents share one model (the dashboard "Toolcall model" row).
-    byteModel: toolcallModel,
-    dexterModel: toolcallModel,
+    // Iris (the single toolcall agent) runs on the dashboard "Toolcall model" row.
     irisModel: toolcallModel,
     artemisModel: getRouterState('artemis:model') || '',
-    drivingForce: getRouterState('orchestrator:driving_force') || '',
+    // Sentry has its own model wire (sentry:model) — report the real
+    // configured value, inheriting the Atlas model for display when
+    // blank (the runner falls back the same way).
+    sentryModel: getRouterState('sentry:model') || getRouterState('atlas:model'),
+    drivingForce: getRouterState('atlas:driving_force') || '',
     drivingForces,
     councilSkepticModel: getRouterState('council:skeptic_model') || '',
     councilPragmatistModel: getRouterState('council:pragmatist_model') || '',
     councilSynthesistModel: getRouterState('council:synthesist_model') || '',
-    oculusModel: toolcallModel,
     securitySatelliteIp: getSatelliteIp(),
     // ── Consolidated role URLs (Servers card) ───────────────────────────────
     wardenUrl: getRouterState('warden:url') || '',
     audioServerUrl: getRouterState('audio:url') || '',
-    videoServerUrl: getRouterState('video:url')
-      || (satIp => satIp ? `http://${satIp}:8765` : '')(getSatelliteIp()),
     satelliteUrl: getRouterState('satellite:url') || '',
     transcriptionUrl: getRouterState('transcription:whisper_url') || process.env.WHISPER_URL || '',
     transcriptionApiUrl: getRouterState('transcription:whisper_api_url') || process.env.WHISPER_API_URL || '',
     ollamaServers: readOllamaServers(),
     ollamaDefaultServerId: getRouterState('ollama:default_server') || '',
-    orchestratorOllamaServer: getRouterState('orchestrator:ollama_server') || '',
-    atlasOllamaServer: getRouterState('atlas:ollama_server') || '',
     vulkanOllamaServer: getRouterState('vulkan:ollama_server') || '',
-    oculusOllamaServer: getRouterState('oculus:ollama_server') || '',
-    oculusMd,
     ollamaEnabled: getRouterState('ollama_enabled') === 'true',
     hybridPrivacy: getRouterState('hybrid_privacy') || '',
     localPrivateModel: getRouterState('local:private_model') || '',
@@ -1551,32 +1718,55 @@ function handleSettings(res: http.ServerResponse): void {
     microsoft_client_id: msId,
     google_configured: !!(googleId && googleSecret),
     microsoft_configured: !!(msId && msSecret),
-    orchestratorCtx: getRouterState('local:orchestrator_ctx') || '',
-    subagentCtx: getRouterState('local:subagent_ctx') || '',
+    // Atlas (background jobs) — the dashboard row picks a different model for
+    // background work than the chat seat uses.
+    atlasModel: (getRouterState('atlas:model') || '').replace(/^local:/, ''),
     atlasCtx: getRouterState('local:atlas_ctx') || '',
+    subagentCtx: getRouterState('local:subagent_ctx') || '',
     toolsCtx: getRouterState('local:tools_ctx') || '',
     // Per-agent num_ctx overrides — blank means the model's native window.
-    // The five toolcall agents share one ctx (the dashboard "Toolcall model" row).
-    byteCtx: toolcallCtx,
-    dexterCtx: toolcallCtx,
+    // Iris (the single toolcall agent) uses the dashboard "Toolcall model" row.
     irisCtx: toolcallCtx,
     artemisCtx: getRouterState('local:artemis_ctx') || '',
     vulkanCtx: getRouterState('local:vulkan_ctx') || '',
-    oculusCtx: toolcallCtx,
+    // Sentry ctx: real per-agent key (local:sentry_ctx), inheriting the
+    // Atlas ctx for display (the runner falls back the same way).
+    sentryCtx: getRouterState('local:sentry_ctx') || getRouterState('local:atlas_ctx'),
     mercuryMode: getRouterState('mercury:mode') || 'full',
-    mercuryModel: toolcallModel,
-    mercuryCtx: toolcallCtx,
+    // Ops model — the ONE model choice for heavy utility tools and external
+    // integrations (today: Alpha Stack analysis + MARM topic model). Saved to
+    // router_state, then propagated to the components' own configs
+    // (src/ops-model.ts) — neither reads router_state itself.
+    opsModel: getRouterState('ops:model') || '',
+    // Mercury has its own model (mercury:model) — report the real value.
+    mercuryModel: getRouterState('mercury:model') || '',
+    mercuryCtx: getRouterState('local:mercury_ctx') || toolcallCtx,
     // Per-agent Ollama keep_alive (-1 = resident, 300 = 5 min). Set by the
-    // dashboard "Keep alive" checkboxes on the Orchestrator/Atlas/Toolcall rows.
-    orchestratorKeepAlive: getRouterState('local:orch_keep_alive') || '',
+    // dashboard "Keep alive" checkboxes on the Atlas/Toolcall rows.
     atlasKeepAlive: getRouterState('local:atlas_keep_alive') || '',
     toolcallKeepAlive: getRouterState('local:toolcall_keep_alive') || '',
+    // Default apps: capability -> 'builtin' | 'mcp:<server>'. One row per
+    // capability so a new capability needs no schema change.
+    defaultApps: readDefaultApps(),
+    pinnedTools: readPinnedTools(),
+    // Live built-in tool names (see readToolPool) — the checkbox pool for the
+    // pinned-tools control, so pins are picked from real tools, never typed.
+    toolPool: await readToolPool(),
+    defaultAppCapabilities: DEFAULT_APP_CAPABILITIES,
     thinking: getRouterState('local:thinking')
       || getRouterState(`thinking:${WEB_DASHBOARD_JID}`)
       || 'true',
-    // Minutes of user-message idle before the orchestrator context auto-clears.
-    // 0 = never. Default 30. Set by the Model Configuration card.
-    contextIdleClearMinutes: getRouterState('orchestrator:context_idle_clear_minutes') || '30',
+    verbose: true,
+    // Minutes of user-message idle before the Atlas context auto-clears.
+    // 0 = never. Default 0 (off) — see src/index.ts idle-context-clear block for
+    // why a desktop assistant must not auto-clear on idle. Set by the Model
+    // Configuration card.
+    contextIdleClearMinutes: getRouterState('atlas:context_idle_clear_minutes') || '0',
+    // Mercury compaction schedule (runs on the 2s poll loop, idle-gated).
+    // interval: compact at least this often (default 30, 0 = off).
+    // downtime: also compact after this long with no user activity (default 5, 0 = off).
+    mercuryIntervalMinutes: getRouterState('mercury:interval_minutes') || '30',
+    mercuryDowntimeMinutes: getRouterState('mercury:downtime_minutes') || '5',
   });
 }
 
@@ -1605,27 +1795,24 @@ async function handleSettingsSave(
   };
 
   // Router-state settings (not env vars)
-  if (body.globalDefaultModel !== undefined) {
-    setRouterState('orchestrator:model', String(body.globalDefaultModel));
-  }
   if (body.hybridPrivacy !== undefined) {
     setRouterState('hybrid_privacy', String(body.hybridPrivacy));
   }
   if (body.localPrivateModel !== undefined) {
     setRouterState('local:private_model', String(body.localPrivateModel));
   }
-  if (body.atlasModel !== undefined) {
-    setRouterState('atlas:model', String(body.atlasModel));
-  }
   if (body.vulkanModel !== undefined) {
     setRouterState('vulkan:model', String(body.vulkanModel || ''));
   }
-  // Per-agent models — each agent owns its own model (no blank/inherit, no fallback).
-  if (body.byteModel !== undefined) {
-    setRouterState('byte:model', String(body.byteModel || ''));
+  if (body.supervisorModel !== undefined) {
+    setRouterState('supervisor:model', String(body.supervisorModel || ''));
   }
-  if (body.dexterModel !== undefined) {
-    setRouterState('dexter:model', String(body.dexterModel || ''));
+  if (body.supervisorEnabled !== undefined) {
+    setRouterState('supervisor:enabled', body.supervisorEnabled ? 'true' : 'false');
+  }
+  // Per-agent models — each agent owns its own model (no blank/inherit, no fallback).
+  if (body.maxOutputTokens !== undefined) {
+    setRouterState('local:max_output_tokens', String(body.maxOutputTokens || ''));
   }
   if (body.irisModel !== undefined) {
     setRouterState('iris:model', String(body.irisModel || ''));
@@ -1633,23 +1820,34 @@ async function handleSettingsSave(
   if (body.artemisModel !== undefined) {
     setRouterState('artemis:model', String(body.artemisModel || ''));
   }
+  if (body.sentryModel !== undefined) {
+    // Sentry has its own model wire (sentry:model) — saving here changes
+    // only Sentry, not the shared Toolcall model.
+    setRouterState('sentry:model', String(body.sentryModel || ''));
+  }
   if (body.drivingForce !== undefined) {
     const newForce = String(body.drivingForce || '');
-    const prevForce = getRouterState('orchestrator:driving_force') || '';
-    setRouterState('orchestrator:driving_force', newForce);
-    // Switching the driving force clears the orchestrator's context: mark the
+    const prevForce = getRouterState('atlas:driving_force') || '';
+    setRouterState('atlas:driving_force', newForce);
+    // Switching the driving force clears the seat's context: mark the
     // clear time (the host gates <chat_history> on it, and the agent-runner
     // resets its in-memory conversation when it sees the marker change) and
     // advance the message cursor so nothing retries under the old persona.
     if (newForce !== prevForce) {
       const now = new Date().toISOString();
-      setRouterState('orchestrator:context_clear_at', now);
+      setRouterState('atlas:context_clear_at', now);
       setRouterState('last_agent_timestamp', now);
-      logger.info({ prev: prevForce, next: newForce }, 'Driving force changed — orchestrator context cleared');
+      logger.info({ prev: prevForce, next: newForce }, 'Driving force changed — Atlas context cleared');
     }
   }
   if (body.contextIdleClearMinutes !== undefined) {
-    setRouterState('orchestrator:context_idle_clear_minutes', String(body.contextIdleClearMinutes));
+    setRouterState('atlas:context_idle_clear_minutes', String(body.contextIdleClearMinutes));
+  }
+  if (body.mercuryIntervalMinutes !== undefined) {
+    setRouterState('mercury:interval_minutes', String(body.mercuryIntervalMinutes));
+  }
+  if (body.mercuryDowntimeMinutes !== undefined) {
+    setRouterState('mercury:downtime_minutes', String(body.mercuryDowntimeMinutes));
   }
   if (body.councilSkepticModel !== undefined) {
     setRouterState('council:skeptic_model', String(body.councilSkepticModel));
@@ -1659,12 +1857,6 @@ async function handleSettingsSave(
   }
   if (body.councilSynthesistModel !== undefined) {
     setRouterState('council:synthesist_model', String(body.councilSynthesistModel));
-  }
-  // Oculus (background security/awareness agent) model — vision-capable model
-  // that reads alert frames and structured camera data. Blank inherits the
-  // orchestrator model.
-  if (body.oculusModel !== undefined) {
-    setRouterState('oculus:model', String(body.oculusModel || ''));
   }
   // IP of the satellite running the security detector (camera + structured data feed).
   if (body.securitySatelliteIp !== undefined) {
@@ -1678,9 +1870,6 @@ async function handleSettingsSave(
   }
   if (body.audioServerUrl !== undefined) {
     setRouterState('audio:url', String(body.audioServerUrl || '').trim());
-  }
-  if (body.videoServerUrl !== undefined) {
-    setRouterState('video:url', String(body.videoServerUrl || '').trim());
   }
   if (body.satelliteUrl !== undefined) {
     setRouterState('satellite:url', String(body.satelliteUrl || '').trim());
@@ -1708,17 +1897,8 @@ async function handleSettingsSave(
     setRouterState('ollama:default_server', String(body.ollamaDefaultServerId || ''));
   }
   // Per-headline-agent Ollama server assignment (server id; '' = default).
-  if (body.orchestratorOllamaServer !== undefined) {
-    setRouterState('orchestrator:ollama_server', String(body.orchestratorOllamaServer || ''));
-  }
-  if (body.atlasOllamaServer !== undefined) {
-    setRouterState('atlas:ollama_server', String(body.atlasOllamaServer || ''));
-  }
   if (body.vulkanOllamaServer !== undefined) {
     setRouterState('vulkan:ollama_server', String(body.vulkanOllamaServer || ''));
-  }
-  if (body.oculusOllamaServer !== undefined) {
-    setRouterState('oculus:ollama_server', String(body.oculusOllamaServer || ''));
   }
   // Mirror toolcall model into router_state and live env so subprocess inherits it.
   if (body.ollamaChatModel !== undefined) {
@@ -1727,38 +1907,30 @@ async function handleSettingsSave(
     if (mdl) process.env.SUBAGENT_MODEL = mdl;
   }
   // Per-agent num_ctx overrides — stored in router_state, read by src/index.ts
-  // and passed to the agent-runner via env (ORCHESTRATOR_NUM_CTX, etc.).
+  // and passed to the agent-runner via env (ATLAS_NUM_CTX, etc.).
   // Empty string clears the override (agent-runner treats falsy as "use default").
-  if (body.orchestratorCtx !== undefined) {
-    setRouterState('local:orchestrator_ctx', String(body.orchestratorCtx || ''));
+  // Atlas (background jobs) — its own model/ctx, distinct from the chat seat's.
+  if (body.atlasModel !== undefined) {
+    setRouterState('atlas:model', String(body.atlasModel || ''));
+  }
+  if (body.atlasCtx !== undefined) {
+    setRouterState('local:atlas_ctx', String(body.atlasCtx || ''));
   }
   if (body.subagentCtx !== undefined) {
     setRouterState('local:subagent_ctx', String(body.subagentCtx || ''));
   }
   // Per-agent Ollama keep_alive (-1 = resident, 300 = 5 min) — set by the
-  // dashboard "Keep alive" checkboxes (Orchestrator / Atlas / Toolcall model).
-  if (body.orchestratorKeepAlive !== undefined) {
-    setRouterState('local:orch_keep_alive', String(body.orchestratorKeepAlive || ''));
-  }
+  // dashboard "Keep alive" checkboxes (Atlas / Toolcall model).
   if (body.atlasKeepAlive !== undefined) {
     setRouterState('local:atlas_keep_alive', String(body.atlasKeepAlive || ''));
   }
   if (body.toolcallKeepAlive !== undefined) {
     setRouterState('local:toolcall_keep_alive', String(body.toolcallKeepAlive || ''));
   }
-  if (body.atlasCtx !== undefined) {
-    setRouterState('local:atlas_ctx', String(body.atlasCtx || ''));
-  }
   if (body.toolsCtx !== undefined) {
     setRouterState('local:tools_ctx', String(body.toolsCtx || ''));
   }
   // Per-agent num_ctx overrides — blank clears to the model's native window.
-  if (body.byteCtx !== undefined) {
-    setRouterState('local:byte_ctx', String(body.byteCtx || ''));
-  }
-  if (body.dexterCtx !== undefined) {
-    setRouterState('local:dexter_ctx', String(body.dexterCtx || ''));
-  }
   if (body.irisCtx !== undefined) {
     setRouterState('local:iris_ctx', String(body.irisCtx || ''));
   }
@@ -1768,8 +1940,9 @@ async function handleSettingsSave(
   if (body.vulkanCtx !== undefined) {
     setRouterState('local:vulkan_ctx', String(body.vulkanCtx || ''));
   }
-  if (body.oculusCtx !== undefined) {
-    setRouterState('local:oculus_ctx', String(body.oculusCtx || ''));
+  if (body.sentryCtx !== undefined) {
+    // Sentry ctx is its own wire (local:sentry_ctx).
+    setRouterState('local:sentry_ctx', String(body.sentryCtx || ''));
   }
   if (body.mercuryMode !== undefined) {
     setRouterState('mercury:mode', String(body.mercuryMode || 'full'));
@@ -1780,6 +1953,11 @@ async function handleSettingsSave(
   if (body.mercuryCtx !== undefined) {
     setRouterState('local:mercury_ctx', String(body.mercuryCtx || ''));
   }
+  if (body.opsModel !== undefined) {
+    const v = String(body.opsModel || '').trim();
+    setRouterState('ops:model', v);
+    if (v) propagateOpsModel(v);
+  }
   // Push every per-agent ctx + keep_alive override just written into process.env
   // so they take effect IMMEDIATELY for fresh-spawn sub-agents (the scan/digest
   // one-shots inherit { ...process.env }) and the persistent child's next re-sync.
@@ -1788,37 +1966,52 @@ async function handleSettingsSave(
   // 2048 ctx with 300s keep_alive instead of the configured toolcall ctx / -1.
   syncAgentCtxEnv();
   // Thinking default — stored globally and mirrored to owner JID so the
-  // orchestrator picks it up on the next turn without requiring a restart.
+  // seat picks it up on the next turn without requiring a restart.
+  if (body.pinned_tools !== undefined) {
+    const v = Array.isArray(body.pinned_tools) ? body.pinned_tools.join(',') : String(body.pinned_tools || '');
+    setRouterState('local:pinned_tools', v);
+  }
+  if (body.default_apps !== undefined) {
+    const src = (body.default_apps && typeof body.default_apps === 'object') ? body.default_apps as Record<string, unknown> : {};
+    for (const cap of DEFAULT_APP_CAPABILITIES) {
+      const v = String(src[cap] ?? '').trim();
+      // 'builtin' (or empty) clears the row — the built-in provider is the
+      // absence of an override, so there is nothing to store for it.
+      setRouterState(`default_app:${cap}`, v && v !== 'builtin' ? v : '');
+    }
+  }
   if (body.thinking !== undefined) {
     const t = String(body.thinking);
     const normalized = t === 'max' ? 'max' : t === 'false' || t === '0' ? '0' : 'true';
     setRouterState('local:thinking', normalized);
     setRouterState(`thinking:${WEB_DASHBOARD_JID}`, normalized);
   }
-
   // Track whether any router-state settings were saved
-  const hadRouterState = body.globalDefaultModel !== undefined ||
-    body.hybridPrivacy !== undefined || body.localPrivateModel !== undefined ||
-    body.atlasModel !== undefined || body.vulkanModel !== undefined || body.drivingForce !== undefined ||
-    body.byteModel !== undefined || body.dexterModel !== undefined ||
+  const hadRouterState = body.hybridPrivacy !== undefined || body.localPrivateModel !== undefined ||
+    body.vulkanModel !== undefined || body.supervisorModel !== undefined || body.drivingForce !== undefined ||
     body.irisModel !== undefined || body.artemisModel !== undefined ||
-    body.byteCtx !== undefined || body.dexterCtx !== undefined ||
+    body.sentryModel !== undefined ||
     body.irisCtx !== undefined || body.artemisCtx !== undefined ||
-    body.vulkanCtx !== undefined || body.oculusCtx !== undefined ||
+    body.vulkanCtx !== undefined ||
+    body.atlasModel !== undefined || body.atlasCtx !== undefined ||
+    body.sentryCtx !== undefined ||
     body.councilSkepticModel !== undefined ||
     body.councilPragmatistModel !== undefined || body.councilSynthesistModel !== undefined ||
-    body.oculusModel !== undefined ||
     body.securitySatelliteIp !== undefined || body.mercuryMode !== undefined ||
     body.contextIdleClearMinutes !== undefined ||
+    body.mercuryIntervalMinutes !== undefined || body.mercuryDowntimeMinutes !== undefined ||
     body.mercuryModel !== undefined || body.mercuryCtx !== undefined ||
+    body.opsModel !== undefined ||
+    body.maxOutputTokens !== undefined ||
     body.thinking !== undefined ||
+    body.default_apps !== undefined ||
+    body.pinned_tools !== undefined ||
     body.wardenUrl !== undefined || body.audioServerUrl !== undefined ||
-    body.videoServerUrl !== undefined || body.satelliteUrl !== undefined ||
+    body.satelliteUrl !== undefined ||
     body.transcriptionUrl !== undefined || body.transcriptionApiUrl !== undefined ||
     body.ollamaServers !== undefined ||
     body.ollamaDefaultServerId !== undefined ||
-    body.orchestratorOllamaServer !== undefined || body.atlasOllamaServer !== undefined ||
-    body.vulkanOllamaServer !== undefined || body.oculusOllamaServer !== undefined;
+    body.vulkanOllamaServer !== undefined;
 
   const vars: Record<string, string> = {};
   for (const [key, envKey] of Object.entries(envMap)) {
@@ -1984,7 +2177,7 @@ async function handleOllamaTest(res: http.ServerResponse): Promise<void> {
   const { readEnvFile } = await import('./env.js');
   const envVars = readEnvFile(['OLLAMA_URL', 'OLLAMA_MODEL']);
   const ollamaUrl = process.env.OLLAMA_URL || envVars.OLLAMA_URL || 'http://127.0.0.1:11434';
-  const ollamaModel = process.env.OLLAMA_MODEL || envVars.OLLAMA_MODEL || 'granite4:latest';
+  const ollamaModel = process.env.OLLAMA_MODEL || envVars.OLLAMA_MODEL || '';
   const friendlyNames = readOllamaFriendlyNames();
   try {
     const resp = await fetch(`${ollamaUrl}/api/tags`);
@@ -2106,21 +2299,6 @@ function searchFiles(
   }
 }
 
-function searchVaultEntries(
-  query: string,
-  limit: number,
-): Array<{ id: string; originalName: string; originalPath: string }> {
-  const index = loadVaultIndex();
-  const lq = query.toLowerCase();
-  return index
-    .filter(
-      (e: any) =>
-        e.originalName?.toLowerCase().includes(lq) ||
-        e.originalPath?.toLowerCase().includes(lq),
-    )
-    .slice(0, limit);
-}
-
 // --- V2 API handlers ---
 
 async function handleSearch(
@@ -2138,13 +2316,12 @@ async function handleSearch(
   }));
   const files: Array<{ name: string; path: string; type: string }> = [];
   searchFiles(GROUPS_DIR, q, files, 10);
-  const vault = searchVaultEntries(q, 10);
   const tasks = searchTasks(q, 10).map((t) => ({
     id: t.id,
     prompt_snippet: t.prompt.slice(0, 200),
     status: t.status,
   }));
-  json(res, { messages, files, vault, tasks });
+  json(res, { messages, files, tasks });
 }
 
 function handleActivity(
@@ -2192,30 +2369,6 @@ function handleActivity(
 
   items.sort((a, b) => (b.timestamp > a.timestamp ? 1 : -1));
   json(res, { items: items.slice(0, limit) });
-}
-
-/** GET /api/oculus/awareness-log?limit=N — recent host AWARENESS event rows
- *  (assessment IS NULL, i.e. the rows the host auto-logged independent of
- *  Oculus's verdict rows), newest-first, with seconds_empty for arrivals. */
-async function handleAwarenessLog(res: http.ServerResponse, params: URLSearchParams): Promise<void> {
-  const limit = Math.min(Math.max(1, parseInt(params.get('limit') || '50', 10)), 1000);
-  try {
-    const rows = await queryAwarenessHostEvents(limit);
-    json(res, { rows });
-  } catch (err: any) {
-    json(res, { ok: false, error: String(err?.message ?? err) });
-  }
-}
-
-/** DELETE /api/oculus/logs — clear all Oculus logs on the laptop store. Backs
- *  the dashboard "Clear logs" button. */
-async function handleOculusClearLogs(res: http.ServerResponse): Promise<void> {
-  try {
-    const result = await clearOculusLogs();
-    json(res, result);
-  } catch (err: any) {
-    json(res, { ok: false, error: String(err?.message ?? err) });
-  }
 }
 
 function handleNotifications(
@@ -2331,7 +2484,6 @@ function handleSkills(res: http.ServerResponse): void {
   })();
   // Container skill detection
   const skillsDir = path.resolve(process.cwd(), 'data', 'skills');
-  installed['scrub'] = fs.existsSync(path.join(skillsDir, 'scrub', 'SKILL.md'));
   installed['agent-browser'] = fs.existsSync(
     path.join(skillsDir, 'agent-browser', 'SKILL.md'),
   );
@@ -2386,14 +2538,19 @@ async function handleTasksCrud(
       if (isNaN(ms) || ms <= 0) return error(res, 'Invalid interval');
       nextRun = new Date(Date.now() + ms).toISOString();
     } else if (scheduleType === 'once') {
-      const d = new Date(body.schedule_value);
-      if (isNaN(d.getTime())) return error(res, 'Invalid timestamp');
-      nextRun = d.toISOString();
+      const relMs = parseRelativeDuration(body.schedule_value);
+      if (relMs !== null) {
+        nextRun = new Date(Date.now() + relMs).toISOString();
+      } else {
+        const d = new Date(body.schedule_value);
+        if (isNaN(d.getTime())) return error(res, 'Invalid timestamp');
+        nextRun = d.toISOString();
+      }
     }
     const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     createTask({
       id: taskId,
-      chat_jid: body.chat_jid || 'web:dashboard',
+      chat_jid: body.chat_jid || OWNER_JID,
       prompt: body.prompt,
       schedule_type: scheduleType,
       schedule_value: body.schedule_value,
@@ -2456,142 +2613,7 @@ async function handleTasksCrud(
   return error(res, 'Not found', 404);
 }
 
-// --- Vault handlers ---
-
-async function handleVault(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  pathname: string,
-): Promise<void> {
-  // User-scoped folder filter (set by user session handler)
-  const userFolders: Set<string> | null = (req as any)._userFolders || null;
-  function isAllowedPath(filePath: string): boolean {
-    if (!userFolders) return true; // admin — no restriction
-    const rel = path.relative(GROUPS_DIR, filePath);
-    const topLevel = rel.split(path.sep)[0];
-    return userFolders.has(topLevel);
-  }
-  // POST /api/vault/scrub — scrub selected files
-  if (req.method === 'POST' && pathname === '/api/vault/scrub') {
-    const body = parseJson(await parseBody(req)) as {
-      paths?: string[];
-      useOllama?: boolean;
-    };
-    if (!body.paths || !Array.isArray(body.paths) || body.paths.length === 0) {
-      return error(res, 'paths array required');
-    }
-
-    const results: Array<{ path: string; entry?: any; error?: string; warnings?: string[]; ollamaUsed?: boolean }> = [];
-    for (const relPath of body.paths) {
-      const full = safePath(relPath);
-      if (!full) {
-        results.push({ path: relPath, error: 'Invalid path' });
-        continue;
-      }
-      if (!isAllowedPath(full)) {
-        results.push({ path: relPath, error: 'Access denied' });
-        continue;
-      }
-      if (!fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-        results.push({ path: relPath, error: 'Not a file' });
-        continue;
-      }
-      // Skip files larger than 20MB
-      if (fs.statSync(full).size > 20 * 1024 * 1024) {
-        results.push({ path: relPath, error: 'File too large (>20MB)' });
-        continue;
-      }
-      try {
-        const { entry, warnings, ollamaUsed } = await scrubFile(full, body.useOllama !== false);
-        results.push({ path: relPath, entry, warnings, ollamaUsed });
-      } catch (e: any) {
-        results.push({ path: relPath, error: e.message });
-      }
-    }
-    return json(res, { results });
-  }
-
-  // POST /api/vault/dictionary — update dictionary
-  if (req.method === 'POST' && pathname === '/api/vault/dictionary') {
-    const body = parseJson(await parseBody(req)) as Record<string, string[]>;
-    saveDictionary(body as any);
-    return json(res, { ok: true });
-  }
-
-  // GET /api/vault/dictionary
-  if (req.method === 'GET' && pathname === '/api/vault/dictionary') {
-    return json(res, loadDictionary());
-  }
-
-  // GET /api/vault — list entries (scoped to user's folders if applicable)
-  if (req.method === 'GET' && pathname === '/api/vault') {
-    const entries = loadVaultIndex().filter((e: any) => isAllowedPath(e.originalPath || ''));
-    return json(res, { entries });
-  }
-
-  // Routes with ID: /api/vault/{id}/...
-  const idMatch = pathname.match(
-    /^\/api\/vault\/([^/]+)\/(scrubbed|mapping|recombine)$/,
-  );
-  if (idMatch) {
-    const [, id, action] = idMatch;
-
-    const entry = getVaultEntry(id);
-    if (entry && !isAllowedPath(entry.originalPath || '')) return error(res, 'Access denied', 403);
-    if (!entry) return error(res, 'Vault entry not found', 404);
-
-    if (req.method === 'GET' && action === 'scrubbed') {
-      const content = readScrubbed(id);
-      if (!content) return error(res, 'Scrubbed file not found', 404);
-      return json(res, { content, entry });
-    }
-
-    if (req.method === 'GET' && action === 'mapping') {
-      const mapping = readMapping(id);
-      if (!mapping) return error(res, 'Mapping not found', 404);
-      return json(res, { mapping, entry });
-    }
-
-    if (req.method === 'POST' && action === 'recombine') {
-      const scrubbed = readScrubbed(id);
-      const mapping = readMapping(id);
-      if (!scrubbed || !mapping) return error(res, 'Missing vault data', 404);
-      const recombined = unscrub(scrubbed, mapping);
-
-      const ext = path.extname(entry.originalName).toLowerCase();
-      const isBinary = ext === '.docx' || ext === '.pdf';
-
-      if (isBinary && entry.originalPath && fs.existsSync(path.dirname(entry.originalPath))) {
-        // Restore original binary from vault
-        const vaultBinary = path.join(SCRUBBED_DIR, `${id}${ext}`);
-        if (fs.existsSync(vaultBinary)) {
-          fs.copyFileSync(vaultBinary, entry.originalPath);
-        }
-        // Remove the scrubbed .md
-        const mdPath = entry.originalPath.replace(/\.[^.]+$/, '.md');
-        if (fs.existsSync(mdPath)) fs.unlinkSync(mdPath);
-      } else if (entry.originalPath && fs.existsSync(path.dirname(entry.originalPath))) {
-        fs.writeFileSync(entry.originalPath, recombined);
-      }
-
-      updateVaultEntryStatus(id, 'recombined');
-      return json(res, {
-        content: recombined,
-        entry: { ...entry, status: 'recombined' },
-      });
-    }
-  }
-
-  // DELETE /api/vault/{id}
-  const deleteMatch = pathname.match(/^\/api\/vault\/([^/]+)$/);
-  if (req.method === 'DELETE' && deleteMatch) {
-    const ok = deleteVaultEntry(deleteMatch[1]);
-    if (!ok) return error(res, 'Entry not found', 404);
-    return json(res, { ok: true });
-  }
-
-  return error(res, 'Not found', 404);
-}
+// --- Vault handlers removed — /api/vault is 410-gated (local agent, no PII vault). ---
 
 // handleWorkTasks removed — /api/work-tasks is 410-gated at the routing layer.
 
@@ -2630,9 +2652,19 @@ async function handleChatStop(
   }
   // Multi-user scope check removed; single-user Warden has no per-user gates.
   void scopeUserId;
-  // For the single-user backend, also kill the in-process agent directly.
+  // For the single-user backend, also stop the in-process agent directly.
   // body.hard = true → immediate SIGKILL (the "stop" panic word).
-  const killed = killCurrentAgent(!!body.hard);
+  // Non-hard stops now soft-INTERRUPT the current turn instead of killing the
+  // runner child: the warm child (model, indexes, MCP connections) survives, so
+  // the next message doesn't pay a multi-second cold boot. If no persistent
+  // child exists to interrupt, fall back to the legacy kill.
+  let killed: boolean;
+  if (body.hard) {
+    killed = killCurrentAgent(true);
+  } else {
+    killed = cancelCurrentTurn();
+    if (!killed) killed = killCurrentAgent(false);
+  }
   if (body.soft) {
     // Soft stop: queue is a stub now; no-op.
     deps.queue.closeStdin(jid);
@@ -2662,7 +2694,7 @@ async function handleChatStop(
   return json(res, { ok: true, killed });
 }
 
-// Clear the orchestrator's context — the "New Thought" button. Sets the
+// Clear the Atlas context — the "New Thought" button. Sets the
 // context-clear marker (the agent-runner resets its in-memory conversation
 // when it sees this timestamp change, and the host gates <chat_history> on
 // it) so the next message starts fresh, and advances the message cursor so
@@ -2678,9 +2710,47 @@ async function handleClearContext(
     return error(res, 'jid required');
   }
   const now = new Date().toISOString();
-  setRouterState('orchestrator:context_clear_at', now);
+  setRouterState('atlas:context_clear_at', now);
   setRouterState('last_agent_timestamp', now);
   logger.info({ jid }, 'Context cleared (New Thought)');
+  return json(res, { ok: true });
+}
+
+// Clear the conversation FOR REAL — the "Clear Conversation" button. New
+// Thought only resets the live context window; this additionally deletes the
+// chat's stored message log and wipes the mercury summary (file + state), so
+// the chat starts from zero: nothing in the DB, nothing in compaction,
+// nothing in the runner's window.
+async function handleClearConversation(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = parseJson(await parseBody(req)) as any;
+  const jid = body.jid;
+  if (!jid || typeof jid !== 'string') {
+    return error(res, 'jid required');
+  }
+  const now = new Date().toISOString();
+  // Same context-reset semantics as New Thought: the agent-runner drops its
+  // in-memory conversation when the marker changes, and the cursor advance
+  // stops any in-flight batch from being answered under the old context.
+  setRouterState('atlas:context_clear_at', now);
+  setRouterState('last_agent_timestamp', now);
+  // Compaction state: both the file (the prompt-rendered summary) and the
+  // raw router-state JSON must go, or the next merge re-seeds from old facts.
+  setRouterState('mercury:state', '');
+  try {
+    const root = String(process.env.WORKSPACE_ROOT || '').replace(/^~(?=\/|$)/, process.env.HOME ?? '');
+    if (root) fs.rmSync(path.join(root, 'MERCURY_MEMORY.md'), { force: true });
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? err }, 'Mercury summary file not removed on clear-conversation');
+  }
+  try {
+    clearChatMessages(jid);
+  } catch (err: any) {
+    return error(res, `failed to delete messages: ${err?.message ?? err}`);
+  }
+  logger.info({ jid }, 'Conversation cleared (messages deleted, mercury reset)');
   return json(res, { ok: true });
 }
 
@@ -2707,6 +2777,43 @@ function getClientIp(req: http.IncomingMessage): string {
   return req.socket.remoteAddress || 'unknown';
 }
 
+// --- Friends surface guard (Tailscale vs local) ---
+// Warden binds 0.0.0.0 so a peer can reach the friends routes over the
+// tailnet, but the owner dashboard + owner API must never be reachable from
+// a peer. The friends mesh uses Tailscale's CGNAT range (100.64.0.0/10), so
+// "local" = loopback or a private LAN; anything else may reach ONLY the
+// peer-facing friends routes (which carry their own per-friendship
+// encryption + auth). The socket address is used directly — never a forwarded
+// header, which a peer could spoof to look local.
+const PEER_FRIENDS_ROUTES = new Set([
+  '/api/friends/whoami',
+  '/api/friends/invite',
+  '/api/friends/accept',
+  '/api/friends/ping',
+  '/api/friends/message',
+  '/api/friends/room-post',
+  '/api/friends/share',
+  '/api/friends/request',
+  '/api/friends/task',
+  '/api/friends/bbs/post',
+  '/api/friends/bbs/recent',
+  '/api/friends/bbs/file',
+  '/api/friends/patch',
+  // BotNet MCP gate — NOT trusted by virtue of reaching it: the handler
+  // itself demands a caller bearer token (src/botnet-mcp.ts). Listed here so
+  // callers on the tailnet aren't 403'd before the token check.
+  '/mcp/botnet',
+]);
+
+function isLoopbackOrLan(ip: string): boolean {
+  const v4 = ip.replace(/^::ffff:/, '');
+  if (ip === '::1' || v4 === '127.0.0.1' || v4.startsWith('127.')) return true;
+  if (/^10\./.test(v4)) return true;
+  if (/^192\.168\./.test(v4)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(v4)) return true;
+  return false;
+}
+
 // --- Security frame-server proxy (the "eyes") ---
 // The security detector (RF-DETR + webcam) runs on a separate host (the laptop)
 // and serves a frame server on 8765. The UI never reaches 8765 directly — the
@@ -2717,116 +2824,6 @@ function getClientIp(req: http.IncomingMessage): string {
 
 /** Fetch the 8765 frame server. Returns the Response on success (caller reads
  *  it); throws on network error or non-2xx. */
-async function fetchOculusSatellite(
-  subpath: string,
-  init: RequestInit = {},
-  timeoutMs = 8000,
-): Promise<Response> {
-  const ip = getSatelliteIp();
-  const url = `http://${ip}:8765${subpath}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`satellite ${subpath} returned ${res.status}${errText ? `: ${errText}` : ''}`);
-    }
-    return res;
-  } catch (err: any) {
-    if (err?.name === 'AbortError') throw new Error(`satellite ${subpath} timed out`);
-    throw new Error(`satellite ${subpath} unreachable: ${String(err?.message ?? err)}`);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** GET /api/oculus/status — satellite state {state, eyes_open, last_alert_ts}. */
-async function handleOculusStatus(res: http.ServerResponse): Promise<void> {
-  try {
-    const r = await fetchOculusSatellite('/status');
-    const data = await r.json();
-    return json(res, data);
-  } catch (err: any) {
-    return json(res, { ok: false, error: String(err?.message ?? err) }, 502);
-  }
-}
-
-/** GET /api/oculus/frame — latest JPEG frame as base64 over JSON, so it flows
- *  through the existing warden_api text bridge (QtWebEngine blocks binary
- *  fetch from file://). UI sets img.src = 'data:image/jpeg;base64,'+data. */
-async function handleOculusFrame(res: http.ServerResponse): Promise<void> {
-  try {
-    const r = await fetchOculusSatellite('/frame');
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (!buf || buf.length === 0) throw new Error('empty frame');
-    return json(res, { ok: true, data: buf.toString('base64'), ts: Date.now() });
-  } catch (err: any) {
-    return json(res, { ok: false, error: String(err?.message ?? err) }, 503);
-  }
-}
-
-/** POST a no-body action to the satellite (open/close eyes / alert close) and
- *  pass its JSON response through. */
-async function handleOculusPostAction(
-  res: http.ServerResponse,
-  subpath: string,
-): Promise<void> {
-  try {
-    const r = await fetchOculusSatellite(subpath, { method: 'POST' });
-    const data = await r.json().catch(() => ({ ok: true }));
-    return json(res, data);
-  } catch (err: any) {
-    return json(res, { ok: false, error: String(err?.message ?? err) }, 502);
-  }
-}
-
-/** POST /api/oculus/known/save {label} — register a known person. */
-async function handleOculusKnownSave(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  try {
-    const body = parseJson(await parseBody(req)) as { label?: string };
-    const label = String(body?.label || '').trim();
-    if (!label) return error(res, 'label required');
-    const r = await fetchOculusSatellite('/known/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label }),
-    });
-    const data = await r.json().catch(() => ({ ok: true }));
-    return json(res, data);
-  } catch (err: any) {
-    return json(res, { ok: false, error: String(err?.message ?? err) }, 502);
-  }
-}
-
-/** GET/POST /api/oculus/watch-out — the user's "watch out for" situations.
- *  Stored in router_state under `oculus:watch_out_for` as a JSON array of
- *  plain-text descriptions. Oculus matches incoming AWARENESS events against
- *  this list; on match it captures the frame to uploads + logs silently.
- *  GET returns the list; POST {items:[...]} replaces it. */
-async function handleOculusWatchOut(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const KEY = 'oculus:watch_out_for';
-  try {
-    if (req.method === 'GET') {
-      const raw = getRouterState(KEY) || '[]';
-      let items: string[] = [];
-      try { items = JSON.parse(raw); } catch { items = []; }
-      return json(res, { ok: true, items });
-    }
-    if (req.method === 'POST') {
-      const body = parseJson(await parseBody(req)) as { items?: string[] };
-      const items = Array.isArray(body?.items)
-        ? body.items.map((s) => String(s || '').trim()).filter(Boolean)
-        : [];
-      setRouterState(KEY, JSON.stringify(items));
-      return json(res, { ok: true, items });
-    }
-    return error(res, 'Method not allowed', 405);
-  } catch (err: any) {
-    return json(res, { ok: false, error: String(err?.message ?? err) });
-  }
-}
-
 // --- Voice ---
 
 async function handleVoice(
@@ -2945,6 +2942,7 @@ function ensureHeartbeatTask(): void {
 export function startStatusServer(d: StatusDeps): void {
   deps = d;
   startInboxCacheWarmer();
+  startBrowserGate();
 
   // --- Email ---
 
@@ -2983,6 +2981,9 @@ export function startStatusServer(d: StatusDeps): void {
         read_only: data.read_only !== false,
         enabled: data.enabled,
         user_id: scopeUserId ?? (data.user_id || null),
+        outbound_guard: data.outbound_guard ? true : false,
+        outbound_allowlist: data.outbound_allowlist || null,
+        outbound_max_recipients: data.outbound_max_recipients || 0,
       });
       return json(res, { ok: true, account: { ...account, password: '***' } }, 201);
     }
@@ -3013,6 +3014,9 @@ export function startStatusServer(d: StatusDeps): void {
       if (data.enabled !== undefined) updates.enabled = data.enabled ? 1 : 0;
       // Scoped users cannot reassign account ownership
       if (data.user_id !== undefined && !scopeUserId) updates.user_id = data.user_id;
+      if (data.outbound_guard !== undefined) updates.outbound_guard = data.outbound_guard ? 1 : 0;
+      if (data.outbound_allowlist !== undefined) updates.outbound_allowlist = data.outbound_allowlist;
+      if (data.outbound_max_recipients !== undefined) updates.outbound_max_recipients = data.outbound_max_recipients || 0;
 
       const updated = updateEmailAccount(id, updates);
       if (!updated) return error(res, 'Account not found', 404);
@@ -3113,171 +3117,6 @@ export function startStatusServer(d: StatusDeps): void {
       const draftId = decodeURIComponent(deleteDraftMatch[1]);
       const deleted = deleteEmailDraft(draftId);
       return json(res, { ok: deleted });
-    }
-
-    return error(res, 'Not found', 404);
-  }
-
-  async function handleSms(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    pathname: string,
-    params: URLSearchParams,
-    scopeUserId?: string,
-  ): Promise<void> {
-    // POST /api/sms/webhook/:accountId — Twilio inbound webhook (public, validated
-    // via X-Twilio-Signature against the account's auth token)
-    const webhookMatch = pathname.match(/^\/api\/sms\/webhook\/([^/]+)$/);
-    if (req.method === 'POST' && webhookMatch) {
-      const accountId = decodeURIComponent(webhookMatch[1]);
-      const account = getSmsAccount(accountId);
-      if (!account) return error(res, 'Account not found', 404);
-      const raw = await parseBody(req);
-      // Twilio posts application/x-www-form-urlencoded; accept JSON for manual/test posts
-      const contentType = (req.headers['content-type'] as string | undefined) || '';
-      let fields: Record<string, string> = {};
-      if (contentType.includes('json')) {
-        try { fields = (parseJson(raw) as Record<string, string>) || {}; } catch { fields = {}; }
-      } else {
-        for (const [k, v] of new URLSearchParams(raw.toString('utf-8'))) fields[k] = v;
-      }
-      // Validate X-Twilio-Signature: base64(HMAC-SHA1(authToken, fullUrl + sorted key+value pairs)).
-      // If the account has no auth token configured, keep accepting (legacy setups) but warn loudly.
-      if (account.auth_token) {
-        const signature = (req.headers['x-twilio-signature'] as string | undefined) || '';
-        const protoHeader = req.headers['x-forwarded-proto'];
-        const proto = (typeof protoHeader === 'string' && protoHeader.split(',')[0].trim()) || 'https';
-        const host = (req.headers['x-forwarded-host'] as string | undefined) || req.headers.host || '';
-        const fullUrl = proto + '://' + host + (req.url || pathname);
-        const payload = fullUrl + Object.keys(fields).sort().map((k) => k + fields[k]).join('');
-        const expected = crypto.createHmac('sha1', account.auth_token).update(Buffer.from(payload, 'utf-8')).digest();
-        let valid = false;
-        try {
-          const provided = Buffer.from(signature, 'base64');
-          valid = provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
-        } catch { valid = false; }
-        if (!valid) {
-          logger.warn({ accountId, url: fullUrl }, 'Rejected SMS webhook: invalid or missing X-Twilio-Signature');
-          return error(res, 'Invalid signature', 403);
-        }
-      } else {
-        logger.warn({ accountId }, 'SMS account has no auth token — accepting webhook WITHOUT Twilio signature validation');
-      }
-      const from = fields.From || fields.from || '';
-      const msgBody = fields.Body || fields.body || '';
-      const sid = fields.MessageSid || fields.messageSid || '';
-      if (from && msgBody) {
-        storeSmsMessage({
-          account_id: accountId,
-          direction: 'inbound',
-          from_number: from,
-          to_number: account.phone_number,
-          body: msgBody,
-          twilio_sid: sid,
-          status: 'received',
-        });
-      }
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end('<Response/>');
-      return;
-    }
-
-    // GET /api/sms/accounts
-    if (req.method === 'GET' && pathname === '/api/sms/accounts') {
-      // Scoped user sessions only ever see their own accounts (ignore ?userId)
-      const userId = scopeUserId ?? (params.get('userId') || undefined);
-      const accounts = getSmsAccounts(userId || null);
-      const safe = accounts.map((a) => ({ ...a, auth_token: '***' }));
-      return json(res, { accounts: safe });
-    }
-
-    // POST /api/sms/accounts
-    if (req.method === 'POST' && pathname === '/api/sms/accounts') {
-      const body = parseJson(await parseBody(req)) as any;
-      if (!body.name || !body.phone_number || !body.account_sid || !body.auth_token) {
-        return error(res, 'Missing required fields: name, phone_number, account_sid, auth_token');
-      }
-      const account = createSmsAccount({
-        name: body.name,
-        phone_number: body.phone_number,
-        account_sid: body.account_sid,
-        auth_token: body.auth_token,
-        read_only: body.read_only !== false,
-        enabled: body.enabled !== false,
-        // Scoped user sessions always own the accounts they create
-        user_id: scopeUserId ?? (body.user_id || null),
-      });
-      return json(res, { ok: true, account: { ...account, auth_token: '***' } }, 201);
-    }
-
-    // PUT /api/sms/accounts/:id
-    const smsAccountMatch = pathname.match(/^\/api\/sms\/accounts\/([^/]+)$/);
-    // Ownership gate for mutations: a scoped user may only touch their own accounts.
-    // 404 (not 403) so account IDs of other tenants are not disclosed.
-    if (smsAccountMatch && scopeUserId && (req.method === 'PUT' || req.method === 'DELETE')) {
-      const existing = getSmsAccount(decodeURIComponent(smsAccountMatch[1]));
-      if (!existing || existing.user_id !== scopeUserId) return error(res, 'Account not found', 404);
-    }
-    if (req.method === 'PUT' && smsAccountMatch) {
-      const id = decodeURIComponent(smsAccountMatch[1]);
-      const body = parseJson(await parseBody(req)) as any;
-      const updated = updateSmsAccount(id, body);
-      if (!updated) return error(res, 'Account not found', 404);
-      const account = getSmsAccount(id);
-      return json(res, { ok: true, account: account ? { ...account, auth_token: '***' } : null });
-    }
-
-    // DELETE /api/sms/accounts/:id
-    if (req.method === 'DELETE' && smsAccountMatch) {
-      const id = decodeURIComponent(smsAccountMatch[1]);
-      const deleted = deleteSmsAccount(id);
-      return json(res, { ok: deleted });
-    }
-
-    // GET /api/sms/messages
-    if (req.method === 'GET' && pathname === '/api/sms/messages') {
-      const accountId = params.get('accountId');
-      if (!accountId) return error(res, 'accountId required');
-      const limit = parseInt(params.get('limit') || '50', 10);
-      const from = params.get('from') || undefined;
-      const source = params.get('source') || 'twilio'; // 'twilio' | 'local'
-      try {
-        if (source === 'local') {
-          const messages = getSmsMessages(accountId, limit, from);
-          return json(res, { messages });
-        }
-        const messages = await fetchSmsMessages(accountId, limit, from);
-        return json(res, { messages });
-      } catch (e: any) {
-        return error(res, e.message, 500);
-      }
-    }
-
-    // POST /api/sms/send
-    if (req.method === 'POST' && pathname === '/api/sms/send') {
-      const body = parseJson(await parseBody(req)) as any;
-      if (!body.accountId || !body.to || !body.body) {
-        return error(res, 'accountId, to, and body are required');
-      }
-      const result = await sendSMS(body.accountId, body.to, body.body);
-      if (!result.success) {
-        return json(res, { ok: false, error: result.error }, result.error?.includes('Read Only') ? 403 : 500);
-      }
-      return json(res, { ok: true, messageSid: result.messageSid });
-    }
-
-    // POST /api/sms/test
-    if (req.method === 'POST' && pathname === '/api/sms/test') {
-      const body = parseJson(await parseBody(req)) as any;
-      if (body.accountId) {
-        const result = await testSmsConnection(body.accountId);
-        return json(res, result);
-      }
-      if (body.account_sid && body.auth_token) {
-        const result = await testSmsCredentials(body.account_sid, body.auth_token);
-        return json(res, result);
-      }
-      return error(res, 'accountId or (account_sid + auth_token) required');
     }
 
     return error(res, 'Not found', 404);
@@ -3670,15 +3509,17 @@ export function startStatusServer(d: StatusDeps): void {
   ): Promise<void> {
     // GET /api/channels — list channel status
     if (req.method === 'GET' && pathname === '/api/channels') {
-      const envVals = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID']);
+      const envVals = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_OWNER_ID', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID']);
       const channelStatus: Array<{ type: string; configured: boolean; connected: boolean; chatId?: string; channelId?: string; tokenHint?: string }> = [];
       if (envVals.TELEGRAM_BOT_TOKEN) {
         const ch = deps.channels.find((c) => c.name === 'telegram');
+        // The chat the bot listens on: env TELEGRAM_OWNER_ID (set from the
+        // dashboard) falling back to the auto-claimed router_state owner.
         channelStatus.push({
           type: 'telegram',
           configured: true,
           connected: ch?.isConnected?.() || false,
-          chatId: envVals.TELEGRAM_CHAT_ID || '',
+          chatId: envVals.TELEGRAM_OWNER_ID || getRouterState('telegram:owner_id') || '',
           tokenHint: envVals.TELEGRAM_BOT_TOKEN.slice(-4),
         });
       }
@@ -3713,16 +3554,23 @@ export function startStatusServer(d: StatusDeps): void {
       return json(res, status);
     }
 
-    // POST /api/channels/telegram — save token + chat id and reconnect
+    // POST /api/channels/telegram — save token and/or owner chat id and reconnect
     if (req.method === 'POST' && pathname === '/api/channels/telegram') {
       const body = parseJson(await parseBody(req)) as any;
-      if (!body.token) return error(res, 'token required');
+      if (!body.token && !body.chatId) return error(res, 'token or chatId required');
       const { writeEnvVars } = await import('./env.js');
-      const vars: Record<string, string> = { TELEGRAM_BOT_TOKEN: body.token };
-      if (body.chatId) vars.TELEGRAM_CHAT_ID = String(body.chatId);
-      writeEnvVars(vars);
-      process.env.TELEGRAM_BOT_TOKEN = body.token;
-      if (body.chatId) process.env.TELEGRAM_CHAT_ID = String(body.chatId);
+      const vars: Record<string, string> = {};
+      if (body.token) vars.TELEGRAM_BOT_TOKEN = body.token;
+      // chatId is the single chat the bot listens on (TELEGRAM_OWNER_ID).
+      // Written to env + router_state; the channel reads it on reconnect.
+      if (body.chatId) {
+        const id = String(body.chatId).trim();
+        vars.TELEGRAM_OWNER_ID = id;
+        setRouterState('telegram:owner_id', id);
+      }
+      writeEnvVars(vars); // only touches provided keys; existing token preserved on chat-id-only edits
+      if (body.token) process.env.TELEGRAM_BOT_TOKEN = body.token;
+      if (body.chatId) process.env.TELEGRAM_OWNER_ID = String(body.chatId).trim();
       const success = deps.reconnectChannel ? await deps.reconnectChannel('telegram') : false;
       return json(res, { ok: success });
     }
@@ -3876,6 +3724,32 @@ export function startStatusServer(d: StatusDeps): void {
     }
 
     try {
+      // Friends surface guard: a non-local (tailnet) source may reach ONLY the
+      // peer-facing friends routes. Everything else — dashboard, owner API,
+      // browser MCP gate — is local/LAN only. Placed before every other route.
+      if (!isLoopbackOrLan(req.socket.remoteAddress || '') && !PEER_FRIENDS_ROUTES.has(pathname)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forbidden' }));
+        return;
+      }
+      // Human presence heartbeat (BotNet autonomy gate): the dashboard tells
+      // the host whether the human is looking at the window. Local-only.
+      if (pathname === '/api/presence' && req.method === 'POST') {
+        try {
+          const buf = await parseBody(req);
+          const parsed = buf.length ? JSON.parse(buf.toString('utf-8')) : {};
+          setHumanPresence(parsed?.watching === true);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, watching: parsed?.watching === true }));
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'bad presence body' }));
+        }
+        return;
+      }
+      // Browser-driving MCP gate: stateless front for the extension bridge's
+      // single slot (see browser-mcp-gate.ts). Mounted before everything else.
+      if (pathname === '/mcp/browser') return await handleBrowserMcp(req, res);
       // --- Dropped route trees (single-user Warden: no admin, no per-user APIs) ---
       // The old multi-user / admin / group / company / work-task / session-link
       // route trees are gone. Surviving endpoints live directly under /api/*
@@ -3932,6 +3806,14 @@ export function startStatusServer(d: StatusDeps): void {
         return;
       }
 
+      // The PII vault was removed 2026-09-22 — Warden is a local agent, no
+      // scrubbing/recombination pipeline. 410 the whole route tree.
+      if (pathname.startsWith('/api/vault')) {
+        res.writeHead(410, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'vault removed (local agent)' }));
+        return;
+      }
+
       // --- Split-pane HTTP proxies (terminal HTML/assets + noVNC HTML/assets) ---
       // Container runtime is gone, so the ttyd/websockify split-pane is dead.
       // 410 the HTTP assets; the WS upgrade handler below also short-circuits.
@@ -3945,11 +3827,6 @@ export function startStatusServer(d: StatusDeps): void {
 
       // --- Public routes (no auth required) ---
 
-      // POST /api/sms/webhook/:accountId — Twilio inbound (public, no auth)
-      const smsWebhookMatch = pathname.match(/^\/api\/sms\/webhook\/([^/]+)$/);
-      if (smsWebhookMatch && req.method === 'POST') {
-        return await handleSms(req, res, pathname, params);
-      }
 
       // NOTE: /api/signup, /api/forgot-password, /api/reset-password/*, and
       // /api/users/:id/email were removed with the multi-user layer. They are
@@ -3993,6 +3870,8 @@ export function startStatusServer(d: StatusDeps): void {
         return await handleChatStop(req, res);
       if (pathname === '/api/chat/clear-context' && req.method === 'POST')
         return await handleClearContext(req, res);
+      if (pathname === '/api/chat/clear-conversation' && req.method === 'POST')
+        return await handleClearConversation(req, res);
       if (pathname === '/api/server/restart' && req.method === 'POST') {
         json(res, { ok: true });
         logger.info('Server restart requested via dashboard');
@@ -4005,7 +3884,7 @@ export function startStatusServer(d: StatusDeps): void {
           const body = parseJson(await parseBody(req)) as { span?: string; text?: string };
           // Accept the span from either the JSON body or the ?span= query param.
           // The Iris digest tasks put it in the URL path (?span=hourly) so the
-          // orchestrator can't drop it; older callers put it in the body.
+          // seat can't drop it; older callers put it in the body.
           const span = body.span || params.get('span') || 'daily';
           const text = body.text || '';
           if (!text.trim()) return json(res, { error: 'text required' }, 400);
@@ -4100,8 +3979,8 @@ export function startStatusServer(d: StatusDeps): void {
       if (pathname === '/api/process-logs' && req.method === 'GET') {
         try {
           const lines = Math.min(parseInt(params.get('lines') || '200', 10) || 200, 2000);
-          const logFile = path.join(DATA_DIR, '..', 'logs', 'dockbox.log');
-          const errFile = path.join(DATA_DIR, '..', 'logs', 'dockbox.error.log');
+          const logFile = path.join(DATA_DIR, '..', 'logs', 'warden.log');
+          const errFile = path.join(DATA_DIR, '..', 'logs', 'warden.error.log');
           const { execSync: execSyncLocal } = await import('child_process');
           let combined = '';
           try {
@@ -4122,8 +4001,8 @@ export function startStatusServer(d: StatusDeps): void {
         try {
           const body = parseJson(await parseBody(req)) as { action?: string };
           if (body.action === 'truncate') {
-            const logFile = path.join(DATA_DIR, '..', 'logs', 'dockbox.log');
-            const errFile = path.join(DATA_DIR, '..', 'logs', 'dockbox.error.log');
+            const logFile = path.join(DATA_DIR, '..', 'logs', 'warden.log');
+            const errFile = path.join(DATA_DIR, '..', 'logs', 'warden.error.log');
             const { execSync: execSyncLocal } = await import('child_process');
             execSyncLocal(`: > "${logFile}"; : > "${errFile}"`, { timeout: 5000 });
             logger.info('process logs truncated via dashboard');
@@ -4193,74 +4072,27 @@ export function startStatusServer(d: StatusDeps): void {
       }
       if (pathname === '/api/messages')
         return await handleMessages(req, res, params);
-      if (pathname === '/api/awareness' && req.method === 'POST') {
-        try {
-          const body = parseJson(await parseBody(req)) as { text?: string };
-          const text = String(body?.text || '');
-          if (!text.startsWith('AWARENESS')) {
-            return error(res, 'expected AWARENESS message');
-          }
-
-          // Spawn Oculus directly; no chat message, no channel relay.
-          const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
-          const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
-          // Pull the user's "watch out for" list so Oculus can match silently.
-          let watchOut: string[] = [];
-          try { watchOut = JSON.parse(getRouterState('oculus:watch_out_for') || '[]'); } catch { watchOut = []; }
-          const watchOutBlock = watchOut.length
-            ? `\n\nWatch out for (user-defined situations; if this event CLEARLY matches one, record it in awareness_log with assessment "flagged" and the matched situation, then call oculus_capture to save the photo to uploads — stay SILENT, do not message the user):\n${watchOut.map((w) => `- ${w}`).join('\n')}`
-            : '';
-          const task = `Current local time is ${localNow} (timezone ${tz}).\n\n${text}\n\nYou are Oculus, Warden's SILENT situational-awareness agent. Use tools only. Read eyes_ears/oculus.md and apply its rules exactly. Your ONLY job is to LOG this event silently: call awareness_log (action: record) with the event details, then stop. Do NOT message the user, do NOT greet, do NOT alert — you have no send_message.${watchOutBlock}\n\nThe AWARENESS payload includes:\n- event type (arrival|departure|camera_covered|camera_moved|motion_burst|note)\n- person_count\n- is_known and label (from InsightFace face embeddings when a face is visible)\n- room occupancy, motion area, camera state\n\nDo not write a plain-text response; use tools only.`;
-          // Host-side auto-log of the raw event, independent of Oculus.
-          recordAwarenessEvent(text);
-          spawnOculusBackground(task, text);
-
-          logger.info({ text: text.slice(0, 80) }, 'AWARENESS routed directly to Oculus');
-          return json(res, { ok: true });
-        } catch (err: any) {
-          return json(res, { ok: false, error: String(err?.message ?? err) });
-        }
+      // Friends — peer mesh over Tailscale (see src/friends.ts). Dispatched
+      // before the other /api/* handlers; the friends routes are the one
+      // deliberately peer-reachable surface, the rest stays single-user-local.
+      // BotNet MCP gate — third-party agents (non-Warden) dial into the BBS
+      // with a caller token. Token-gated at the handler itself, so it sits
+      // outside any of the /api trees (see src/botnet-mcp.ts).
+      if (pathname === '/mcp/botnet') {
+        if (await handleBotnetMcp(req, res, pathname)) return;
+      }
+      if (pathname.startsWith('/api/friends')) {
+        const handled = await handleFriendsRequest(req, res, pathname, params, runFriendTurn, runColab, getColabStatus);
+        if (handled) return;
       }
       if (pathname.startsWith('/api/files'))
         return await handleFiles(req, res, pathname, params);
+      if (pathname.startsWith('/api/marm'))
+        return await handleMarm(req, res, pathname, params);
       if (pathname === '/api/settings' && req.method === 'GET')
         return handleSettings(res);
       if (pathname === '/api/settings' && req.method === 'POST')
         return await handleSettingsSave(req, res);
-      if (pathname === '/api/oculus/rules') {
-        const oculusMdPath = path.resolve(WORKSPACE_ROOT, 'eyes_ears', 'oculus.md');
-        try {
-          if (req.method === 'GET') {
-            const content = fs.existsSync(oculusMdPath) ? fs.readFileSync(oculusMdPath, 'utf8') : '';
-            return json(res, { ok: true, content });
-          }
-          if (req.method === 'POST') {
-            const body = parseJson(await parseBody(req)) as any;
-            const content = typeof body?.content === 'string' ? body.content : '';
-            fs.mkdirSync(path.dirname(oculusMdPath), { recursive: true });
-            fs.writeFileSync(oculusMdPath, content, 'utf8');
-            return json(res, { ok: true });
-          }
-        } catch (err: any) {
-          return json(res, { ok: false, error: String(err?.message ?? err) });
-        }
-      }
-      // Oculus frame-server proxies (the "eyes" — UI pulls these "the same
-      // as any" tab; the Warden server reaches 8765 on getSatelliteIp()).
-      if (pathname === '/api/oculus/status' && req.method === 'GET')
-        return await handleOculusStatus(res);
-      if (pathname === '/api/oculus/frame' && req.method === 'GET')
-        return await handleOculusFrame(res);
-      if (pathname === '/api/oculus/open' && req.method === 'POST')
-        return await handleOculusPostAction(res, '/open');
-      if (pathname === '/api/oculus/close' && req.method === 'POST')
-        return await handleOculusPostAction(res, '/close');
-      if (pathname === '/api/oculus/alert/close' && req.method === 'POST')
-        return await handleOculusPostAction(res, '/alert/close');
-      if (pathname === '/api/oculus/known/save' && req.method === 'POST')
-        return await handleOculusKnownSave(req, res);
-      if (pathname === '/api/oculus/watch-out')
-        return await handleOculusWatchOut(req, res);
       if (pathname === '/api/audit/run' && req.method === 'POST') {
         try {
           const script = path.resolve(process.cwd(), 'tests/audit-agent-behavior.sh');
@@ -4296,6 +4128,344 @@ export function startStatusServer(d: StatusDeps): void {
             running = (r.stdout || '').trim().length > 0;
           } catch {}
           return json(res, { ok: true, running, tail });
+        } catch (err: any) {
+          return json(res, { ok: false, error: String(err?.message ?? err) });
+        }
+      }
+      // Training loop (audit → modify → train) — same detached-spawn + pgrep
+      // poll pattern as /api/audit above. Each step's stdout/stderr lands in
+      // training/loop/logs/<step>.log, which /api/training/status tails.
+      // All three steps unload Ollama models (VRAM for granite4.2:30b / the
+      // trainer), so they refuse to start under a live agent turn.
+      if (pathname.startsWith('/api/training/')) {
+        try {
+          // group: which Training sub-tab the step belongs to (its log dir and
+          // status tail). clearsVram: the step unloads Ollama models, so it
+          // refuses to start under a live agent turn. Steps from both groups
+          // are mutually exclusive — one GPU job at a time — except the
+          // parallel ones (HF base downloads: network only, one per base, run
+          // alongside anything).
+          type TrainingStep = { cmd: string; script: string; marker: string; group: 'loop' | 'bot'; clearsVram: boolean; parallel?: boolean };
+          const botBases = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'training', 'chatbot', 'bases.json'), 'utf-8')) as Record<string, { label: string; hf: string; ollama: string }>;
+          const TRAINING_STEPS: Record<string, TrainingStep> = {
+            ...Object.fromEntries(Object.keys(botBases).map((k) => [`bot-pull-${k}`, {
+              cmd: 'bash', script: 'training/chatbot/pull-base.sh', marker: `chatbot/pull-base.sh ${k}`, group: 'bot' as const, clearsVram: false, parallel: true,
+            }])),
+            audit: { cmd: 'node', script: 'training/loop/audit-failures.mjs', marker: 'loop/audit-failures.mjs', group: 'loop', clearsVram: true },
+            modify: { cmd: 'node', script: 'training/loop/modify-parts.mjs', marker: 'loop/modify-parts.mjs', group: 'loop', clearsVram: true },
+            train: { cmd: 'bash', script: 'training/loop/train-1epoch.sh', marker: 'loop/train-1epoch.sh', group: 'loop', clearsVram: true },
+            'bot-generate': { cmd: 'node', script: 'training/chatbot/gen-pairs.mjs', marker: 'chatbot/gen-pairs.mjs', group: 'bot', clearsVram: false },
+            'bot-train': { cmd: 'bash', script: 'training/chatbot/train.sh', marker: 'chatbot/train.sh', group: 'bot', clearsVram: true },
+          };
+          const stepLog = (step: string) => TRAINING_STEPS[step].group === 'bot'
+            ? path.join(process.cwd(), 'training', 'chatbot', 'logs', `${step}.log`)
+            : path.join(process.cwd(), 'training', 'loop', 'logs', `${step}.log`);
+          const stepRunning = (step: string) => {
+            const r = spawnSync('pgrep', ['-f', TRAINING_STEPS[step].marker], { encoding: 'utf-8' });
+            return ((r.stdout || '').trim().length > 0);
+          };
+          const launchStep = (step: keyof typeof TRAINING_STEPS, extraArgs: string[] = []): { ok: boolean; error?: string; step?: string; log?: string; pid?: number } => {
+            const def = TRAINING_STEPS[step];
+            const jobs = def.clearsVram ? getLiveJobs() : [];
+            if (jobs.length > 0)
+              return { ok: false, error: `An agent turn is running (${jobs.length} live job${jobs.length === 1 ? '' : 's'}) — wait for it to finish before clearing VRAM` };
+            for (const other of Object.keys(TRAINING_STEPS)) {
+              if (!def.parallel && !TRAINING_STEPS[other].parallel && other !== step && stepRunning(other))
+                return { ok: false, error: `Training step "${other}" is still running — wait for it` };
+            }
+            const script = path.resolve(process.cwd(), def.script);
+            if (!fs.existsSync(script)) return { ok: false, error: `${def.script} not found` };
+            if (def.parallel && stepRunning(step)) return { ok: false, error: `${step} is already running` };
+            try { spawnSync('pkill', ['-f', def.marker], { stdio: 'ignore' }); } catch {}
+            fs.mkdirSync(path.dirname(stepLog(step)), { recursive: true });
+            const out = fs.openSync(stepLog(step), 'w');
+            const errFd = fs.openSync(stepLog(step), 'a');
+            const child = spawn(def.cmd, [script, ...extraArgs], {
+              detached: true,
+              stdio: ['ignore', out, errFd],
+              cwd: process.cwd(),
+              // journalctl --user needs XDG_RUNTIME_DIR or the audit step sees nothing.
+              env: { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid ? process.getuid() : 1000}` },
+            });
+            child.unref();
+            fs.closeSync(out);
+            fs.closeSync(errFd);
+            logger.info({ pid: child.pid, step, log: stepLog(step) }, 'training step started');
+            return { ok: true, step, log: stepLog(step), pid: child.pid };
+          };
+          const startTrainingStep = (step: keyof typeof TRAINING_STEPS, extraArgs: string[] = []) => json(res, launchStep(step, extraArgs));
+          if (pathname === '/api/training/audit' && req.method === 'POST') {
+            const body = parseJson(await parseBody(req)) as { days?: number | string };
+            const days = parseInt(String(body?.days ?? 3), 10);
+            if (![1, 3, 7].includes(days)) return json(res, { ok: false, error: 'days must be 1, 3, or 7' });
+            return startTrainingStep('audit', ['--days', String(days)]);
+          }
+          if (pathname === '/api/training/modify' && req.method === 'POST') {
+            return startTrainingStep('modify');
+          }
+          if (pathname === '/api/training/train' && req.method === 'POST') {
+            return startTrainingStep('train');
+          }
+          if (pathname === '/api/training/stop' && req.method === 'POST') {
+            // {step} stops that step (e.g. one base download); no step = the
+            // running exclusive (GPU) step.
+            const body = parseJson(await parseBody(req)) as { step?: string };
+            let running: string | null = null;
+            if (body?.step && TRAINING_STEPS[body.step]) {
+              if (stepRunning(body.step)) running = body.step;
+            } else {
+              for (const step of Object.keys(TRAINING_STEPS)) {
+                if (!TRAINING_STEPS[step].parallel && stepRunning(step)) { running = step; break; }
+              }
+            }
+            if (!running) return json(res, { ok: false, error: 'No training step is running' });
+            // The step was spawned detached (own session), so its pid IS the
+            // process-group id — killing the group takes down the whole tree
+            // (bash wrapper → atlasorch.sh → torchrun), not just the wrapper.
+            const r = spawnSync('pgrep', ['-f', TRAINING_STEPS[running].marker], { encoding: 'utf-8' });
+            const pids = (r.stdout || '').trim().split('\n').filter(Boolean).map(Number).filter((p) => Number.isFinite(p));
+            for (const pid of pids) {
+              try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch {} }
+            }
+            try { fs.appendFileSync(stepLog(running), `\n[warden] ${running} stopped by user at ${new Date().toLocaleString()}\n`); } catch {}
+            logger.info({ step: running, pids }, 'training step stopped by user');
+            return json(res, { ok: true, stopped: running });
+          }
+          if (pathname === '/api/training/status' && req.method === 'GET') {
+            const group = params.get('group') === 'bot' ? 'bot' : 'loop';
+            let running: string | null = null;
+            for (const step of Object.keys(TRAINING_STEPS)) {
+              if (!TRAINING_STEPS[step].parallel && stepRunning(step)) { running = step; break; }
+            }
+            const pulls = Object.keys(TRAINING_STEPS).filter((st) => TRAINING_STEPS[st].parallel && stepRunning(st));
+            // Tail the group's running step, or whichever of its steps ran most recently.
+            let logStep: string | null = running && TRAINING_STEPS[running].group === group ? running : null;
+            if (!logStep) {
+              let newest = 0;
+              for (const step of Object.keys(TRAINING_STEPS).filter((st) => TRAINING_STEPS[st].group === group && !TRAINING_STEPS[st].parallel)) {
+                try {
+                  const m = fs.statSync(stepLog(step)).mtimeMs;
+                  if (m > newest) { newest = m; logStep = step; }
+                } catch {}
+              }
+            }
+            let tail = '';
+            if (logStep) {
+              try { tail = fs.readFileSync(stepLog(logStep), 'utf-8').split('\n').slice(-40).join('\n'); } catch {}
+            }
+            // Download tails ride along separately so a pull never hides the GPU step's log.
+            const pullTails: Record<string, string> = {};
+            if (group === 'bot') {
+              for (const st of Object.keys(TRAINING_STEPS).filter((x) => TRAINING_STEPS[x].parallel)) {
+                try { pullTails[st.replace('bot-pull-', '')] = fs.readFileSync(stepLog(st), 'utf-8').trim().split('\n').slice(-1)[0] || ''; } catch {}
+              }
+            }
+            return json(res, { ok: true, running, pulls: pulls.map((st) => st.replace('bot-pull-', '')), step: logStep, tail, pullTails });
+          }
+          if (pathname === '/api/training/catalogs' && req.method === 'GET') {
+            const dir = path.join(process.cwd(), 'training', 'loop', 'catalogs');
+            const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse() : [];
+            const catalogs = files.map((f) => {
+              try {
+                const cat = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'));
+                return { file: f, ts: cat.generated_at || '', entries: (cat.failures || []).length };
+              } catch {
+                return { file: f, ts: '', entries: -1 };
+              }
+            });
+            let newest: any = null;
+            if (files.length) {
+              try {
+                const cat = JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf-8'));
+                if (Array.isArray(cat.failures) && cat.failures.length > 50) cat.failures = cat.failures.slice(0, 50);
+                newest = cat;
+              } catch {}
+            }
+            return json(res, { ok: true, catalogs, newest });
+          }
+          // Artemis's trainable-error flags (src/training-flags.ts), newest
+          // first. Pending ones feed the next modify step.
+          if (pathname === '/api/training/flags' && req.method === 'GET') {
+            const flags = listTrainingFlags().reverse();
+            const pending = flags.filter((f) => f.status === 'pending').length;
+            return json(res, { ok: true, flags, counts: { pending, consumed: flags.length - pending, total: flags.length } });
+          }
+          // Custom chatbot sub-tab: an intake form (who the bot is, what it
+          // does, who it does it for) → granite writes persona pairs
+          // (bot-generate) → LoRA on a granite base from the HF cache
+          // (bot-pull-<base> installs it on save) → Ollama model "<slug>-bot" (bot-train).
+          // Each bot lives in training/chatbot/bots/<slug>/.
+          if (pathname.startsWith('/api/training/chatbot')) {
+            const botRoot = path.join(process.cwd(), 'training', 'chatbot');
+            const botsDir = path.join(botRoot, 'bots');
+            const bases = botBases;
+            const validSlug = (v: unknown): v is string => typeof v === 'string' && /^[a-z0-9][a-z0-9-]{0,40}$/.test(v);
+            const readJsonFile = (f: string) => { try { return JSON.parse(fs.readFileSync(f, 'utf-8')); } catch { return null; } };
+            const readPairs = (slug: string) => {
+              try {
+                return fs.readFileSync(path.join(botsDir, slug, 'pairs.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+              } catch { return []; }
+            };
+            // HF cache layout: <hub>/models--org--name/{snapshots/<rev>/…, blobs/…}.
+            // Cached = a snapshot with config.json, every weight shard the index
+            // names present, and no half-downloaded blob.
+            const hubDir = process.env.HF_HUB_CACHE || path.join(process.env.HF_HOME || path.join(os.homedir(), '.cache', 'huggingface'), 'hub');
+            const baseCache = (hf: string) => {
+              const repo = path.join(hubDir, 'models--' + hf.replace('/', '--'));
+              let cached = false, bytes = 0;
+              try {
+                for (const b of fs.readdirSync(path.join(repo, 'blobs'))) {
+                  if (b.endsWith('.incomplete')) return { cached: false, bytes: 0 };
+                  bytes += fs.statSync(path.join(repo, 'blobs', b)).size;
+                }
+                for (const rev of fs.readdirSync(path.join(repo, 'snapshots'))) {
+                  const snap = path.join(repo, 'snapshots', rev);
+                  if (!fs.existsSync(path.join(snap, 'config.json'))) continue;
+                  const idx = readJsonFile(path.join(snap, 'model.safetensors.index.json'));
+                  const shards: string[] = idx ? [...new Set(Object.values(idx.weight_map || {}) as string[])] : ['model.safetensors'];
+                  if (shards.every((sh) => fs.existsSync(path.join(snap, sh)))) cached = true;
+                }
+              } catch {}
+              return { cached, bytes };
+            };
+
+            if (pathname === '/api/training/chatbot' && req.method === 'GET') {
+              const bots = fs.existsSync(botsDir) ? fs.readdirSync(botsDir).filter(validSlug).sort().map((slug) => {
+                const intake = readJsonFile(path.join(botsDir, slug, 'intake.json'));
+                return { slug, name: intake?.fields?.name || slug, trained: readJsonFile(path.join(botsDir, slug, 'trained.json')) };
+              }) : [];
+              const slug = params.get('slug');
+              let bot = null;
+              if (validSlug(slug) && fs.existsSync(path.join(botsDir, slug, 'intake.json'))) {
+                bot = {
+                  slug,
+                  intake: readJsonFile(path.join(botsDir, slug, 'intake.json')),
+                  pairs: readPairs(slug).map((r: any) => ({
+                    category: r.category || '',
+                    user: r.messages?.find((m: any) => m.role === 'user')?.content || '',
+                    assistant: r.messages?.find((m: any) => m.role === 'assistant')?.content || '',
+                  })),
+                  trained: readJsonFile(path.join(botsDir, slug, 'trained.json')),
+                };
+              }
+              return json(res, {
+                ok: true,
+                bots,
+                bases: Object.entries(bases).map(([key, b]) => ({ key, label: b.label, hf: b.hf, ...baseCache(b.hf), installing: stepRunning(`bot-pull-${key}`) })),
+                bot,
+              });
+            }
+            if (pathname === '/api/training/chatbot/save' && req.method === 'POST') {
+              const body = parseJson(await parseBody(req)) as { slug?: string; fields?: Record<string, unknown>; base?: string };
+              const FIELDS = ['name', 'owner', 'what_it_is', 'what_it_does', 'who_for', 'personality', 'handoff'];
+              const fields: Record<string, string> = {};
+              for (const k of FIELDS) fields[k] = String(body?.fields?.[k] ?? '').slice(0, 4000);
+              if (!fields.name.trim()) return json(res, { ok: false, error: 'Give the bot a name' });
+              if (!body?.base || !bases[body.base]) return json(res, { ok: false, error: 'Pick a base model' });
+              const slug = validSlug(body.slug) ? body.slug
+                : fields.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'bot';
+              fs.mkdirSync(path.join(botsDir, slug), { recursive: true });
+              fs.writeFileSync(path.join(botsDir, slug, 'intake.json'),
+                JSON.stringify({ fields, base: body.base, saved_at: new Date().toISOString() }, null, 2));
+              // A base that isn't in the HF cache yet installs on save, in the
+              // background — pair generation runs on Ollama and doesn't need it.
+              let installing = stepRunning(`bot-pull-${body.base}`);
+              if (!installing && !baseCache(bases[body.base].hf).cached) {
+                const r = launchStep(`bot-pull-${body.base}`, [body.base]);
+                if (!r.ok) return json(res, { ok: false, slug, error: `Saved, but the ${bases[body.base].label} install did not start: ${r.error}` });
+                installing = true;
+              }
+              return json(res, { ok: true, slug, installing });
+            }
+            if (pathname === '/api/training/chatbot/pairs' && req.method === 'POST') {
+              const body = parseJson(await parseBody(req)) as { slug?: string; remove?: number[] };
+              if (!validSlug(body?.slug)) return json(res, { ok: false, error: 'bad slug' });
+              const drop = new Set((body.remove || []).map(Number));
+              const kept = readPairs(body.slug).filter((_r: unknown, i: number) => !drop.has(i));
+              fs.writeFileSync(path.join(botsDir, body.slug, 'pairs.jsonl'), kept.map((r: unknown) => JSON.stringify(r)).join('\n') + (kept.length ? '\n' : ''));
+              return json(res, { ok: true, pairs: kept.length });
+            }
+            if (pathname === '/api/training/chatbot/generate' && req.method === 'POST') {
+              const body = parseJson(await parseBody(req)) as { slug?: string; count?: number };
+              if (!validSlug(body?.slug) || !fs.existsSync(path.join(botsDir, body.slug, 'intake.json')))
+                return json(res, { ok: false, error: 'Save the intake form first' });
+              const count = [50, 100, 200].includes(Number(body.count)) ? Number(body.count) : 100;
+              return startTrainingStep('bot-generate', ['--slug', body.slug, '--count', String(count)]);
+            }
+            if (pathname === '/api/training/chatbot/train' && req.method === 'POST') {
+              const body = parseJson(await parseBody(req)) as { slug?: string };
+              if (!validSlug(body?.slug)) return json(res, { ok: false, error: 'bad slug' });
+              const intake = readJsonFile(path.join(botsDir, body.slug, 'intake.json'));
+              const base = intake && bases[intake.base];
+              if (!base) return json(res, { ok: false, error: 'Save the intake form with a base model first' });
+              if (!baseCache(base.hf).cached)
+                return json(res, { ok: false, error: stepRunning(`bot-pull-${intake.base}`) ? `${base.label} is still installing` : `${base.label} is not installed — save the form to install it` });
+              if (!readPairs(body.slug).length) return json(res, { ok: false, error: 'No pairs yet — generate them first' });
+              return startTrainingStep('bot-train', [body.slug]);
+            }
+            return error(res, 'unknown chatbot route');
+          }
+          return error(res, 'unknown training route');
+        } catch (err: any) {
+          return json(res, { ok: false, error: String(err?.message ?? err) });
+        }
+      }
+      // Alpha Stack (2026-09-22): the trading research stack copied from the
+      // old home into /opt/Warden/trading. The dashboard view embeds the
+      // stack's OWN webapp (trading/webapp — stdlib server bound to 0.0.0.0
+      // so the dashboard's mobile/LAN clients reach it; probed here on the
+      // loopback). The webapp is not a daemon: it is spawned on
+      // demand by the start route below (same detached-spawn pattern as the
+      // training loop steps) and the status route reports whether it is up.
+      const alphastackWebappUp = async () => {
+        try {
+          const resp = await fetch('http://127.0.0.1:8765/api/status', { signal: AbortSignal.timeout(1000) });
+          return resp.ok;
+        } catch { return false; }
+      };
+      if (pathname === '/api/alphastack/status' && req.method === 'GET') {
+        try {
+          const root = path.join(process.cwd(), 'trading');
+          const exists = (p: string) => fs.existsSync(p);
+          const inventory = {
+            root,
+            rootPresent: exists(root),
+            venvPython: exists(path.join(root, 'bin', 'python')),
+            webapp: exists(path.join(root, 'webapp', 'app.py')),
+          };
+          return json(res, { ok: true, webappUp: await alphastackWebappUp(), inventory });
+        } catch (err: any) {
+          return json(res, { ok: false, error: String(err?.message ?? err) });
+        }
+      }
+      if (pathname === '/api/alphastack/webapp/start' && req.method === 'POST') {
+        try {
+          if (await alphastackWebappUp()) return json(res, { ok: true, up: true, note: 'already running' });
+          const root = path.join(process.cwd(), 'trading');
+          const py = path.join(root, 'bin', 'python');
+          const script = path.join(root, 'webapp', 'app.py');
+          if (!fs.existsSync(py) || !fs.existsSync(script))
+            return json(res, { ok: false, error: 'trading venv or webapp missing' });
+          // A wedged instance that still holds 8765 without serving would block
+          // the fresh spawn — kill any stale copy first (it is a plain stdlib
+          // server; state lives on disk, so a restart loses nothing).
+          try { spawnSync('pkill', ['-f', 'webapp/app.py'], { stdio: 'ignore' }); } catch {}
+          fs.mkdirSync(path.join(root, 'logs'), { recursive: true });
+          const out = fs.openSync(path.join(root, 'logs', 'webapp.log'), 'a');
+          const child = spawn(py, [script], { detached: true, stdio: ['ignore', out, out], cwd: root });
+          child.unref();
+          fs.closeSync(out);
+          logger.info({ pid: child.pid }, 'alpha-stack webapp started');
+          // Bounded readiness wait — the stdlib server binds in well under a
+          // second; never hand back "started" for a server that never came up.
+          let up = false;
+          for (let i = 0; i < 10 && !up; i++) {
+            await new Promise((r) => setTimeout(r, 500));
+            up = await alphastackWebappUp();
+          }
+          return up
+            ? json(res, { ok: true, up: true, pid: child.pid })
+            : json(res, { ok: false, error: 'webapp did not come up within 5s — check trading/logs/webapp.log' });
         } catch (err: any) {
           return json(res, { ok: false, error: String(err?.message ?? err) });
         }
@@ -4356,13 +4526,99 @@ export function startStatusServer(d: StatusDeps): void {
         return handleTasks(res);
       if (pathname.startsWith('/api/tasks'))
         return await handleTasksCrud(req, res, pathname);
-      if (pathname.startsWith('/api/vault'))
-        return await handleVault(req, res, pathname);
+
+      // GET /api/memory-tree — the memory-tree taxonomy (data/memory-tree.json).
+      // Serves the eyes_ears memory galaxy: the STRUCTURE of the brain (28 base
+      // points, user-side weighted, 2-3 branches, two layers deep); the DETAILS
+      // live in MARM, filed there by the log classifier below.
+      if (req.method === 'GET' && pathname === '/api/memory-tree') {
+        try {
+          // One shot = the whole map: taxonomy structure + the durable
+          // per-path fact index (classifier-recorded at file time). The
+          // galaxy lights every node from this single call — no per-node
+          // MARM probes. Kick the one-time backfill if the index is empty.
+          void maybeBackfillTreeFacts();
+          return json(res, { roots: loadMemoryTree(), facts: filedTreeFacts() });
+        } catch (e: any) {
+          return error(res, 'memory-tree.json unreadable: ' + e.message, 500);
+        }
+      }
+
+      // GET /api/memory-tree/activity — the live memory-activity ring (last
+      // ~60 writes/recalls) + whether a classification run is in flight. The
+      // memory galaxy polls this every couple of seconds for its brain-scan
+      // flares: the region a fact lands on lights up.
+      // POST — the agent-runner reports MARM recalls here (auto-recall +
+      // explicit marm_smart_recall tool calls) so the galaxy can light up the
+      // regions being read from, not just the ones being written to.
+      if (pathname === '/api/memory-tree/activity') {
+        if (req.method === 'GET') {
+          return json(res, { events: treeActivity(), running: memoryTreeRunning() });
+        }
+        if (req.method === 'POST') {
+          try {
+            const body = parseJson(await parseBody(req, 64 * 1024)) as {
+              kind?: string; query?: string; path?: string; fact?: string;
+            };
+            const kind = body.kind === 'write' ? 'write' : 'recall';
+            const query = String(body.query || '').slice(0, 400);
+            const path = String(body.path || '').slice(0, 400);
+            const fact = String(body.fact || '').slice(0, 400);
+            if (!query && !path && !fact) return error(res, 'empty activity event');
+            noteTreeActivity(kind === 'write'
+              ? { kind: 'write', ...(path && { path }), ...(fact && { fact }), ...(query && { query }) }
+              : { kind: 'recall', query: query || fact || path });
+            return json(res, { ok: true });
+          } catch (e: any) {
+            return error(res, 'bad activity event: ' + e.message);
+          }
+        }
+      }
+
+      // POST /api/memory/classify — on-request memory-tree classification run.
+      // Kicks the granite4.1:30b log classifier off fire-and-forget (force=true:
+      // bypasses the idle gate); it loops batches until the warden.log backlog
+      // is finished, cursor-persisted, and aborts if the GPU is claimed again.
+      // Progress lands in logs/warden.log ("memory-tree: classification run…").
+      if (req.method === 'POST' && pathname === '/api/memory/classify') {
+        void runMemoryClassification(true)
+          .then((r) => logger.info(r, 'memory-tree: on-request classify run finished'))
+          .catch((err) => logger.warn({ err }, 'memory-tree: on-request classify run failed'));
+        return json(res, { ok: true, started: true });
+      }
+
+      // GET/POST /api/memory/scan-config — scan management for the galaxy's
+      // expand panel: which model classifies, whether the idle-gated auto-scan
+      // is paused, and the include/exclude dirs, files and patterns that shape
+      // what gets scanned. GET also reports whether a run is in flight; POST
+      // {stop:true} aborts a live run (it resumes from the cursor next time).
+      if (pathname === '/api/memory/scan-config') {
+        if (req.method === 'GET') {
+          return json(res, { ...scanConfig(), running: memoryTreeRunning() });
+        }
+        if (req.method === 'POST') {
+          try {
+            const body = parseJson(await parseBody(req, 64 * 1024)) as Record<string, unknown>;
+            if (body.stop) {
+              requestScanAbort();
+              return json(res, { ok: true, stopping: true });
+            }
+            const saved = setScanConfig({
+              model: body.model as string | undefined,
+              paused: body.paused as boolean | undefined,
+              includeDirs: body.includeDirs as string[] | undefined,
+              excludeDirs: body.excludeDirs as string[] | undefined,
+              excludeFiles: body.excludeFiles as string[] | undefined,
+              excludePatterns: body.excludePatterns as string[] | undefined,
+            });
+            return json(res, { ...saved, running: memoryTreeRunning() });
+          } catch (e: any) {
+            return error(res, 'bad scan config: ' + e.message);
+          }
+        }
+      }
       if (pathname === '/api/search') return await handleSearch(res, params);
       if (pathname === '/api/activity') return handleActivity(res, params);
-      if (pathname === '/api/oculus/awareness-log') return await handleAwarenessLog(res, params);
-      if (pathname === '/api/oculus/logs' && req.method === 'DELETE')
-        return await handleOculusClearLogs(res);
       if (pathname === '/api/notifications' && req.method === 'GET')
         return handleNotificationsSse(req, res);
       if (pathname === '/api/notifications/poll' && req.method === 'GET')
@@ -4468,9 +4724,51 @@ export function startStatusServer(d: StatusDeps): void {
         return json(res, { ok: true, enabled: cfg.enabled });
       }
       if (pathname === '/api/alarms' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ alarms: [] }));
-        return;
+        return json(res, { alarms: getUserAlarms(OWNER_JID) });
+      }
+      if (pathname === '/api/alarms' && req.method === 'POST') {
+        const body = parseJson(await parseBody(req)) as {
+          label?: string; alarm_time?: string; alarm_date?: string;
+          repeat_type?: string; repeat_days?: string; sound?: string;
+        };
+        if (!body.label || typeof body.label !== 'string') return error(res, 'label is required');
+        if (!body.alarm_time || typeof body.alarm_time !== 'string') return error(res, 'alarm_time is required');
+        const created = createAlarm(OWNER_JID, {
+          label: body.label,
+          alarm_time: body.alarm_time,
+          alarm_date: body.alarm_date,
+          repeat_type: body.repeat_type,
+          repeat_days: body.repeat_days,
+          sound: body.sound,
+        });
+        return json(res, { alarm: created }, 201);
+      }
+      const alarmIdMatch = pathname.match(/^\/api\/alarms\/(.+)$/);
+      if (alarmIdMatch && req.method === 'PUT') {
+        const id = alarmIdMatch[1];
+        const body = parseJson(await parseBody(req)) as Partial<{
+          label: string; alarm_time: string; alarm_date: string | null;
+          repeat_type: string; repeat_days: string; enabled: boolean;
+          snooze_until: string | null; sound: string;
+        }>;
+        const updates: Record<string, unknown> = {};
+        if (typeof body.label === 'string') updates.label = body.label;
+        if (typeof body.alarm_time === 'string') updates.alarm_time = body.alarm_time;
+        if (body.alarm_date === null || typeof body.alarm_date === 'string') updates.alarm_date = body.alarm_date;
+        if (typeof body.repeat_type === 'string') updates.repeat_type = body.repeat_type;
+        if (typeof body.repeat_days === 'string') updates.repeat_days = body.repeat_days;
+        if (typeof body.enabled === 'boolean') updates.enabled = body.enabled ? 1 : 0;
+        if (body.snooze_until === null || typeof body.snooze_until === 'string') updates.snooze_until = body.snooze_until;
+        if (typeof body.sound === 'string') updates.sound = body.sound;
+        const updated = updateAlarm(id, updates);
+        if (!updated) return error(res, 'Alarm not found', 404);
+        return json(res, { alarm: updated });
+      }
+      if (alarmIdMatch && req.method === 'DELETE') {
+        const id = alarmIdMatch[1];
+        const ok = deleteAlarmDb(id);
+        if (!ok) return error(res, 'Alarm not found', 404);
+        return json(res, { ok: true });
       }
       if (pathname === '/api/timers' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4935,8 +5233,6 @@ export function startStatusServer(d: StatusDeps): void {
       if (pathname === '/api/skills') return handleSkills(res);
       if (pathname.startsWith('/api/email'))
         return await handleEmail(req, res, pathname, params);
-      if (pathname.startsWith('/api/sms'))
-        return await handleSms(req, res, pathname, params);
       if (pathname.startsWith('/api/oauth'))
         return await handleOAuth(req, res, pathname, params);
 
@@ -5146,9 +5442,29 @@ export function startStatusServer(d: StatusDeps): void {
         message: alarm.label,
         taskId: alarm.id,
       });
-      // Multi-user chat-session relay removed; single-user Warden delivers
-      // alarms via pushNotification only.
-      logger.info({ alarmId: alarm.id, userId: alarm.user_id, label: alarm.label }, 'Alarm fired');
+      // The Pi is headless — no desktop, no notify-send, no notification center.
+      // Fire the alarm DIRECTLY into chat as a visible bot message (the same
+      // path reminders use in task-scheduler.ts) so the voice app speaks it.
+      // is_bot_message=true + idea='' → shown in the chat view but never routed
+      // to the seat (getNewMessages/getMessagesSince filter
+      // is_bot_message=0), so there's no model reply, no duplicate, no latency —
+      // the user hears the alarm label the moment it's due.
+      try {
+        deps.storeMessage({
+          id: `alarm-${alarm.id}-${Date.now()}`,
+          chat_jid: OWNER_JID,
+          sender: 'automation',
+          sender_name: '⏰ Alarm',
+          content: `⏰ ${alarm.label}`,
+          timestamp: new Date().toISOString(),
+          is_from_me: false,
+          is_bot_message: true,
+          idea: '',
+        });
+      } catch (err: any) {
+        logger.warn({ alarmId: alarm.id, err }, 'Failed to store alarm chat message');
+      }
+      logger.info({ alarmId: alarm.id, userId: alarm.user_id, label: alarm.label }, 'Alarm fired into chat');
     }
   }, 30000);
 }

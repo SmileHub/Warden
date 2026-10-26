@@ -4,7 +4,7 @@
  * single-user Warden dashboard:
  *   GET    /api/status              — verbose bar, agent activity, metrics
  *   GET    /api/settings           — load settings
- *   POST   /api/settings           — save settings (orchestrator/atlas/council/ctx/...)
+ *   POST   /api/settings           — save settings (atlas/agents/council/ctx/...)
  *   GET    /api/messages?jid&since&limit&idea
  *   POST   /api/messages            — { text, jid, sender_name, model, thinking, idea, verbose }
  *   GET    /api/ollama/test         — list of local models, friendly names, cloud models, thinking
@@ -273,9 +273,14 @@
     if (name === 'tasks') refreshTasks();
     else if (name === 'skills') { refreshSkills(); refreshMcp(); }
     else if (name === 'activity') refreshActivity();
+    else if (name === 'training') setTrainingTab(STATE.trainingTab || 'loop');
+    else if (name === 'alphastack') refreshAlphaStack();
+    else if (name === 'marm') refreshMarm();
     else if (name === 'security') refreshSecurity();
     else if (name === 'logs') refreshProcessLogs();
     else if (name === 'accounts') refreshAccounts();
+    else if (name === 'friends') refreshFriends();
+    else if (name === 'social') refreshSocial();
     else if (name === 'calendar' && window.PIM) window.PIM.refreshCalendar();
     else if (name === 'email' && window.PIM) window.PIM.refreshEmail();
     else if (window.UserDash) {
@@ -284,23 +289,14 @@
       if (name === 'projects' && UD.loadProjects) UD.loadProjects();
       else if (name === 'heartbeat' && UD.loadHeartbeat) UD.loadHeartbeat();
       else if (name === 'alarms' && UD.loadAlarms) UD.loadAlarms();
-      else if (name === 'vault' && UD.loadVault) UD.loadVault();
       else if (name === 'apikeys' && UD.loadUsageDashboard) UD.loadUsageDashboard();
       else if (name === 'actions' && UD.renderActions) UD.renderActions();
-      else if (name === 'sms' && UD.loadSmsView) UD.loadSmsView();
       else if (name === 'talk' && UD.initTalkView) UD.initTalkView();
     }
   }
   window.__localSwitchView = switchView;
 
-  // ============================================================= Status / verbose bar
-  // Last known global busy state + latest progress label, updated by
-  // pollStatus. Used by syncThinkingBar to keep the always-on thinking bar
-  // consistent with the progress panel beside it (background jobs, other
-  // containers, etc. — not just the current session's waitingForReply).
-  let lastBusy = false;
-  let lastProgressLabel = '';
-
+  // ============================================================= Status
   // Dashboard typing indicator state
   let waitingForReply = false;
   let typingWords = [];
@@ -349,18 +345,11 @@
       const active = groups.some(g => g.active && !g.idle);
       dot.className = 'dot' + (active ? ' busy' : '');
 
-      // live activity panel (grouped collapsible progress history) — replaces
-      // the old static verbose bar; its collapsed summary line is the live
-      // status, and expanding it shows the history. Keep it populated even
-      // when idle so the user can always click the thinking bar to review
-      // what just ran (tool/agent activity history). Background jobs
-      // (atlas/artemis) bump runningJobs without marking a foreground group
-      // active, so the `active`-only check would blank the panel mid-work.
-      const busy = active || (typeof d.runningJobs === 'number' && d.runningJobs > 0);
+      // Oversight window — structured per-agent/agent-job view of what is
+      // happening right now. Populated from d.jobs (background jobs), d.groups
+      // (foreground), and the latest supervisor note in d.progress.
       const progress = d.progress || [];
-      lastBusy = busy;
-      lastProgressLabel = progress.length ? (progress[progress.length - 1].label || progress[progress.length - 1].phase || '') : '';
-      renderProgressPanel(progress, busy);
+      renderOversight(d);
       syncThinkingBar();
 
       // stop button enable/disable
@@ -370,55 +359,76 @@
     }
   }
 
-  // ── Live activity panel (grouped, collapsible progress history) ──
-  // Progress lives here instead of as a stream of canned chat bubbles. The
-  // orchestrator's monitor-tick reports route to the dashboard (progress_event)
-  // and surface as 'supervisor' entries; real atlas/council status changes
-  // surface as 'status' entries. Collapsed = one summary line; expanded = the
-  // recent history.
-  function renderProgressPanel(events, busy) {
-    const panel = $('progressPanel');
-    const summary = $('progressSummary');
-    const countEl = $('progressCount');
-    const list = $('progressList');
-    if (!panel) return;
-    const evs = Array.isArray(events) ? events : [];
-    if (!evs.length) {
-      panel.classList.add('empty');
-      summary.textContent = 'No live activity';
-      countEl.textContent = '';
-      list.innerHTML = '';
-      return;
-    }
-    panel.classList.remove('empty');
-    const latest = evs[evs.length - 1];
-    // While idle, prefix the summary so it's clear nothing is currently
-    // running — the last event label is still shown as a hint to history.
-    summary.textContent = busy
-      ? (latest.label || latest.phase || 'Working…')
-      : ('Idle — last: ' + (latest.label || latest.phase || '—'));
-    countEl.textContent = `${evs.length} update${evs.length > 1 ? 's' : ''}`;
-    // Render newest-first inside the expanded body.
-    const rows = evs.slice().reverse().map((e) => {
-      const kind = e.kind || 'status';
-      const tag = kind === 'supervisor' ? 'supervisor'
-        : kind === 'done' ? 'done'
-        : kind === 'error' ? 'error'
-        : 'status';
-      const label = kind === 'supervisor' ? '▸ ' + esc(e.label || '')
-        : esc(e.label || e.phase || '');
-      return `<li><span class="ts">${fmtTime(e.ts)}</span><span class="kind ${tag}">${tag}</span><span class="label">${label}</span></li>`;
-    }).join('');
-    list.innerHTML = rows;
+  // ── Oversight window ──
+  // Structured view of what is happening right now — one row per running
+  // background job (from /api/status.jobs, emitted by the runner's
+  // emitJobsStatus heartbeat), one row for the foreground seat while
+  // a user turn runs, and the supervisor's latest note. Nothing spews raw
+  // "iteration N — thinking" events; when nothing runs it's a single quiet
+  // line. Poll-driven (pollStatus every 5s).
+  function ovRow(agent, main, action, meta, kind, taskTitle, metaClass) {
+    return `<div class="ov-row ${kind || ''}" data-agent="${esc(agent)}"${taskTitle ? ` title="${esc(taskTitle)}"` : ''}>` +
+      `<span class="ov-name">${esc(agent)}</span>` +
+      (main ? `<span class="ov-task">${esc(main)}</span>` : '') +
+      `<span class="ov-action">${esc(action)}</span>` +
+      (meta ? `<span class="ov-meta ${metaClass || ''}">${esc(meta)}</span>` : '') +
+      `</div>`;
   }
-
-  function toggleProgressPanel() {
-    const panel = $('progressPanel');
-    if (!panel) return;
-    const collapsed = panel.classList.toggle('collapsed');
-    const header = $('progressPanelHeader');
-    if (header) header.setAttribute('aria-expanded', String(!collapsed));
-    try { localStorage.setItem('warden-progress-expanded', collapsed ? '0' : '1'); } catch {}
+  function ovDur(s) {
+    if (s == null) return '';
+    s = Math.max(0, Math.round(Number(s) || 0));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60); return `${m}m${s % 60 ? ' ' + (s % 60) + 's' : ''}`;
+  }
+  function renderOversight(d) {
+    const panel = $('oversight'), rowsEl = $('oversightRows'),
+      dot = $('oversightDot'), countEl = $('oversightCount');
+    if (!panel || !rowsEl) return;
+    const rows = [];
+    // Foreground: the seat working on a user message right now.
+    const fg = (d.groups || []).find(g => g.active && !g.idle);
+    if (fg) {
+      const label = (fg.liveLabel || fg.livePhase || 'working on your message').replace(/^Warden is (generating|thinking)[.…]*$/i, 'composing a reply…');
+      rows.push(ovRow('Warden', '', label, '', 'fg'));
+    }
+    // One row per running background job — factual reporting only. The only
+    // reliable signals are calls, elapsed time, and seconds since the last tool
+    // call. Avoid invented categories like "stalled" or "waiting on model"; just
+    // state the idle duration and let the user interpret it.
+    for (const j of d.jobs || []) {
+      const idle = Number(j.idle) || 0;
+      const elapsed = Number(j.elapsed) || 0;
+      const calls = Number(j.calls) || 0;
+      // Live output scrollby: the runner streams a capped tail of the job's
+      // thinking/content, refreshed ~2.5x/s during generation. "streaming"
+      // (a chunk in the last 15s) means the model is actively producing
+      // tokens even with 0 tool calls — a long think pass used to read as
+      // "idle Ns / stalled" while it was writing.
+      const streamTail = String(j.streamContent || j.streamThinking || '').replace(/\s+/g, ' ').trim();
+      const streaming = Number(j.streamAt) > 0 && (Date.now() - Number(j.streamAt) < 15000);
+      const meta = [calls + ' call' + (calls === 1 ? '' : 's'), ovDur(elapsed),
+        streaming ? 'streaming' : (idle > 0 ? 'idle ' + ovDur(idle) : '')].filter(Boolean).join(' · ');
+      rows.push(ovRow(j.agent, j.task, j.lastAction || 'starting…', meta, 'job', j.task,
+        !streaming && idle > 300 ? 'stalled' : ''));
+      if (streamTail) {
+        const mode = j.streamContent ? 'writing' : 'thinking';
+        rows.push('<div class="ov-stream' + (streaming ? ' live' : '') + '" title="' + esc(streamTail) + '">' +
+          '<span class="ov-stream-mode">' + mode + '</span>' + esc(streamTail.slice(-160)) + '</div>');
+      }
+    }
+    // Supervisor's latest monitor-tick note (prose, routed here instead of chat).
+    const sups = (d.progress || []).filter(e => e.kind === 'supervisor' && e.label);
+    const sup = sups[sups.length - 1];
+    if (sup && Date.now() - sup.ts < 2 * 60 * 60 * 1000) {
+      rows.push(ovRow('supervisor', '', sup.label, fmtTime(sup.ts), 'sup'));
+    }
+    // Busy state: a foreground turn or any running job.
+    const jobCount = (d.jobs || []).length;
+    panel.classList.toggle('busy', !!fg || jobCount > 0);
+    countEl.textContent = jobCount
+      ? `${jobCount} job${jobCount > 1 ? 's' : ''}${fg ? ' · reply in progress' : ''}`
+      : (fg ? 'reply in progress' : '');
+    rowsEl.innerHTML = rows.length ? rows.join('') : ovRow('quiet', '', 'nothing running right now', '', 'quiet');
   }
 
   function startStatusPolling() {
@@ -466,10 +476,14 @@
     div.className = 'msg ' + (isBot ? 'bot' : 'user');
     const sender = isBot ? (m.sender_name || STATE.assistantName) : (m.sender_name || m.sender || 'You');
     const ts = fmtTime(m.timestamp);
+    // Meta goes ABOVE the text. With meta below (old order), each message's
+    // name/time sat directly on top of the NEXT message's bubble — the chat
+    // read as if every reply carried the previous sender's name (2026-09-21).
+    // .msg-meta's margin-bottom was authored for this header position.
     div.innerHTML =
-      '<div class="msg-text">' + renderMarkdown(m.content || '') + '</div>' +
       '<div class="msg-meta"><span class="sender ' + (isBot ? 'bot' : '') + '">' + esc(sender) + '</span>' +
-      '<span class="ts">' + esc(ts) + '</span></div>';
+      '<span class="ts">' + esc(ts) + '</span></div>' +
+      '<div class="msg-text">' + renderMarkdown(m.content || '') + '</div>';
     el.appendChild(div);
     el.scrollTop = el.scrollHeight;
     return div;
@@ -482,8 +496,8 @@
     const div = document.createElement('div');
     div.className = 'msg user pending';
     div.innerHTML =
-      '<div class="msg-text">' + renderMarkdown(text) + '</div>' +
-      '<div class="msg-meta"><span class="sender">You</span><span class="ts">sending…</span></div>';
+      '<div class="msg-meta"><span class="sender">You</span><span class="ts">sending…</span></div>' +
+      '<div class="msg-text">' + renderMarkdown(text) + '</div>';
     el.appendChild(div);
     el.scrollTop = el.scrollHeight;
     return div;
@@ -631,7 +645,7 @@
   }
 
   async function newThought() {
-    // Tell the server to drop the orchestrator's in-memory context so the
+    // Tell the server to drop the seat's in-memory context so the
     // next message starts fresh (the agent-runner resets when it sees the
     // context-clear marker change), then reset the chat view.
     try {
@@ -644,6 +658,26 @@
     loadMessages();
     startChatPolling();
     toast('New thought started', 'info');
+  }
+
+  async function clearConversation() {
+    // Delete the actual conversation log (messages in the DB) and reset all
+    // live context + mercury compaction — a true fresh start, unlike New
+    // Thought which only resets the context window. Destructive: confirm.
+    if (!window.confirm('Delete the entire conversation log and start completely fresh? The stored messages and the conversation summary will be permanently removed.')) return;
+    try {
+      await postJson('/api/chat/clear-conversation', { jid: STATE.currentJid });
+    } catch (e) {
+      toast('Clear failed: ' + e.message, 'error');
+      return;
+    }
+    STATE.chatLastTs = '';
+    STATE.waitingForReply = false;
+    waitingForReply = false;
+    hideTypingIndicator();
+    loadMessages();
+    startChatPolling();
+    toast('Conversation cleared', 'info');
   }
 
   // ============================================================= Settings drawer
@@ -835,8 +869,20 @@
       return modelOption(value, label);
     }).join('');
   }
+  function buildOutputOptions(currentValue) {
+    // '' (model default) must be FIRST, like buildCtxOptions: with no blank
+    // option an unset value (fresh install) matched nothing, left the select on
+    // 1024, and the next Save wrote max_output_tokens=1024 — silently capping
+    // every reply, including a sub-agent writing a file.
+    const common = ['', '1024', '2048', '4096', '8192', '16384', '32768'];
+    const cur = String(currentValue || '');
+    if (cur && !common.includes(cur)) common.push(cur);
+    common.sort((a, b) => (a === '' ? -1 : b === '' ? 1 : Number(a) - Number(b)));
+    return common.map(v => modelOption(v, v || 'default', cur === v)).join('');
+  }
+
   function buildCtxOptions(currentValue) {
-    const common = ['', '2048', '4096', '8192', '16384', '32768', '65536', '128000'];
+    const common = ['', '2048', '4096', '8192', '16384', '32768', '65536', '128000', '262144', '524288', '1048576'];
     const cur = String(currentValue || '');
     if (cur && !common.includes(cur)) common.push(cur);
     common.sort((a, b) => {
@@ -858,7 +904,7 @@
     // Cloud tags end in :cloud; everything else is local. No hardcoded cloud list.
     const orchHtml = buildModelOptions(models, fn, m => m);
     const anyModelHtml = buildModelOptions(models, fn, m => m, { inherit: true });
-    // Driving-force presets (orchestrator preamble) — from data/driving-forces/.
+    // Driving-force presets (seat preamble) — from data/driving-forces/.
     // '' = Warden default (the built-in preamble, preserves the dynamic name).
     const drivingForceHtml = '<option value="">Warden (default)</option>' +
       (d.drivingForces || []).map(p => modelOption(p.id, p.label)).join('');
@@ -893,45 +939,51 @@
       </div>
 
       <div class="setting-card">
+        <h3>Default apps</h3>
+        <div class="hint">Which tool does each job. Warden ships a built-in provider for each capability; an installed MCP server can take one over. Choosing a server <b>replaces</b> the built-in rather than sitting beside it — one provider per job, so there is never a choice to get wrong.</div>
+        <div id="defaultAppsRows"><div class="dim mono" style="font-size:11px">Loading…</div></div>
+        <div class="save-row"><button class="btn btn-primary btn-sm" id="btnSaveDefaultApps">Save</button><span class="status" id="defaultAppsStatus"></span></div>
+        <div class="section-divider">Pinned tools</div>
+        <div class="hint">Tools exempt from relevance ranking — always in the pool the agent sees, whatever the ask. Pin a tool whose description loses the user's words to generic ones. The list is the live tool pool; picking replaces typing.</div>
+        <div class="pin-chips" id="pinChips"></div>
+        <div class="pin-add-row"><select class="select" id="pinAddSelect"><option value="">Add a tool…</option></select></div>
+        <div class="save-row"><button class="btn btn-primary btn-sm" id="btnSavePinnedTools">Save pins</button><span class="status" id="pinnedToolsStatus"></span></div>
+      </div>
+
+      <div class="setting-card">
         <h3>Model Configuration</h3>
-        <div class="hint">Orchestrator replies to you. Atlas does browser/research/review. Artemis is the read-only audit seat. Vulkan codes. The Council uses three separate seats. Byte, Dexter, Iris, Mercury, and Oculus share one <b>Toolcall model</b> — the fast local tool-call agents.</div>
-        <div class="setting-row"><label>Orchestrator</label>
-          <select class="select" id="sOrchestrator">${orchHtml}</select>
-        </div>
-        <div class="setting-row"><label>Orchestrator Ollama</label>
-          <select class="select" id="sOrchestratorOllamaServer"></select>
-          <span class="dim mono" style="font-size:10px">blank = default server</span>
-        </div>
-        <div class="setting-row"><label>Orchestrator ctx</label>
-          <select class="select small" id="sOrchestratorCtx">${buildCtxOptions(d.orchestratorCtx)}</select>
-          <span class="dim mono" style="font-size:10px">common values; blank = model default</span>
-        </div>
-        <div class="setting-row"><label>Keep alive</label>
-          <label class="check"><input type="checkbox" id="sOrchKeepAlive"> hold model in VRAM between turns (no reload)</label>
-        </div>
-        <div class="setting-row"><label>Driving force</label>
-          <select class="select" id="sDrivingForce">${drivingForceHtml}</select>
-          <span class="dim mono" style="font-size:10px">orchestrator persona; switching clears context</span>
-        </div>
+        <div class="hint"><b>Atlas</b> is the one seat you talk to: it replies <em>and</em> does the work itself — browser, desktop, files, shell, web — and it owns multi-specialist chains: it calls the specialists directly (Vulkan, Iris, Artemis, Sentry) and verifies each result. Long jobs run as a background copy of it, on these same settings. Supervisor runs the checks on background jobs (small/cloud model recommended). Artemis is the read-only audit seat. Vulkan codes. The Council uses three separate seats. Iris is the single <b>Toolcall agent</b> — the fast local agent for email, scheduling, and work management, and email always routes there. Mercury (memory) and Oculus (awareness) have their own rows below.</div>
         <div class="setting-row"><label>Atlas</label>
           <select class="select" id="sAtlas">${orchHtml}</select>
-        </div>
-        <div class="setting-row"><label>Atlas Ollama</label>
-          <select class="select" id="sAtlasOllamaServer"></select>
-          <span class="dim mono" style="font-size:10px">blank = default server</span>
+          <span class="dim mono" style="font-size:10px">Atlas IS the seat — this model replies to you and runs every turn.</span>
         </div>
         <div class="setting-row"><label>Atlas ctx</label>
           <select class="select small" id="sAtlasCtx">${buildCtxOptions(d.atlasCtx)}</select>
           <span class="dim mono" style="font-size:10px">common values; blank = model default</span>
         </div>
-        <div class="setting-row"><label>Keep alive</label>
+        <div class="setting-row"><label>Atlas keep alive</label>
           <label class="check"><input type="checkbox" id="sAtlasKeepAlive"> hold model in VRAM between turns (no reload)</label>
+        </div>
+        <div class="setting-row"><label>Max output</label>
+          <select class="select small" id="sMaxOutput">${buildOutputOptions(d.maxOutputTokens)}</select>
+          <span class="dim mono" style="font-size:10px">tokens one reply may generate (not ctx) — caps a model that loses the thread</span>
+        </div>
+        <div class="setting-row"><label>Driving force</label>
+          <select class="select" id="sDrivingForce">${drivingForceHtml}</select>
+          <span class="dim mono" style="font-size:10px">seat persona; switching clears context</span>
         </div>
         <div class="setting-row"><label>Artemis</label>
           <select class="select" id="sArtemis">${orchHtml}</select>
         </div>
         <div class="setting-row"><label>Artemis ctx</label>
           <select class="select small" id="sArtemisCtx">${buildCtxOptions(d.artemisCtx)}</select>
+          <span class="dim mono" style="font-size:10px">common values; blank = model default</span>
+        </div>
+        <div class="setting-row"><label>Sentry</label>
+          <select class="select" id="sSentry">${orchHtml}</select>
+        </div>
+        <div class="setting-row"><label>Sentry ctx</label>
+          <select class="select small" id="sSentryCtx">${buildCtxOptions(d.sentryCtx)}</select>
           <span class="dim mono" style="font-size:10px">common values; blank = model default</span>
         </div>
         <div class="setting-row"><label>Vulkan</label>
@@ -957,7 +1009,7 @@
           <label>Toolcall model</label>
           <div style="flex:1">
             <select class="select" id="sToolcallModel">${orchHtml}</select>
-            <div class="dim mono" style="font-size:10px;margin-top:2px">Shared by Byte, Dexter, Iris, Mercury, Oculus — the fast local tool-call agents.</div>
+            <div class="dim mono" style="font-size:10px;margin-top:2px">The fast local tool-call agent — email, scheduling, work management.</div>
             <div class="setting-row" style="margin-top:6px"><label>ctx</label>
               <select class="select small" id="sToolcallCtx">${buildCtxOptions(d.subagentCtx)}</select>
               <span class="dim mono" style="font-size:10px">blank = model default</span>
@@ -967,6 +1019,13 @@
         </div>
         <div class="setting-row"><label>Ollama URL</label><input class="input" id="sOllamaUrl" value="${escAttr(d.ollamaUrl || '')}" placeholder="http://127.0.0.1:11434"></div>
         <div class="setting-row"><label>Mercury</label>
+          <select class="select" id="sMercuryModel">${orchHtml}</select>
+        </div>
+        <div class="setting-row"><label>Mercury ctx</label>
+          <select class="select small" id="sMercuryCtx">${buildCtxOptions(d.mercuryCtx)}</select>
+          <span class="dim mono" style="font-size:10px">blank = inherits Toolcall ctx</span>
+        </div>
+        <div class="setting-row"><label>Mercury mode</label>
           <select class="select" id="sMercury">
             <option value="off">Off — no automatic context</option>
             <option value="rag">RAG — inject relevant older turns</option>
@@ -974,9 +1033,20 @@
             <option value="full">Full — summary + RAG</option>
           </select>
         </div>
+        <div class="setting-row"><label>Ops model</label>
+          <select class="select" id="sOpsModel">${anyModelHtml}</select>
+          <span class="dim mono" style="font-size:10px">model for heavy utility tools &amp; external integrations — Alpha Stack analysis + MARM topic model today; blank = leave each to its own config</span>
+        </div>
+        <div class="setting-row"><label>Oculus</label>
+          <select class="select" id="sOculusModel">${orchHtml}</select>
+        </div>
+        <div class="setting-row"><label>Oculus ctx</label>
+          <select class="select small" id="sOculusCtx">${buildCtxOptions(d.oculusCtx)}</select>
+          <span class="dim mono" style="font-size:10px">blank = inherits Toolcall ctx</span>
+        </div>
         <div class="setting-row"><label>Oculus Ollama</label>
           <select class="select" id="sOculusOllamaServer"></select>
-          <span class="dim mono" style="font-size:10px">Oculus runs on the Toolcall model; blank = default server</span>
+          <span class="dim mono" style="font-size:10px">blank = default server</span>
         </div>
         <div class="setting-row"><label>Thinking</label>
           <select class="select" id="sThinking">
@@ -997,14 +1067,35 @@
           </select>
           <span class="dim mono" style="font-size:10px">clear context if the last user message was older than this</span>
         </div>
+        <div class="setting-row"><label>Mercury interval</label>
+          <select class="select small" id="sMercuryInterval">
+            <option value="0">Off</option>
+            <option value="5">5 min</option>
+            <option value="10">10 min</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="60">1 h</option>
+          </select>
+          <span class="dim mono" style="font-size:10px">compact the conversation at least this often (0 = only on downtime)</span>
+        </div>
+        <div class="setting-row"><label>Mercury downtime</label>
+          <select class="select small" id="sMercuryDowntime">
+            <option value="0">Off</option>
+            <option value="3">3 min</option>
+            <option value="5">5 min</option>
+            <option value="10">10 min</option>
+            <option value="15">15 min</option>
+          </select>
+          <span class="dim mono" style="font-size:10px">also compact after this long with no activity (0 = interval only)</span>
+        </div>
         <div class="save-row"><button class="btn btn-primary btn-sm" id="btnSaveModels">Save</button><span class="status" id="modelStatus"></span></div>
       </div>
 
       <div class="setting-card">
         <h3>Servers</h3>
         <div class="hint">Role URLs used by the Warden backend. Ollama servers below are referenced by per-agent dropdowns in Model Configuration.</div>
-        <div class="setting-row"><label>Audio / Transcription server</label><input class="input" id="sAudioServerUrl" value="${escAttr(d.audioServerUrl || '')}" placeholder="http://192.168.0.163:8766"></div>
-        <div class="setting-row"><label>Video server</label><input class="input" id="sVideoServerUrl" value="${escAttr(d.videoServerUrl || '')}" placeholder="http://192.168.0.163:8765"></div>
+        <div class="setting-row"><label>Audio / Transcription server</label><input class="input" id="sAudioServerUrl" value="${escAttr(d.audioServerUrl || '')}" placeholder="http://localhost:8766"></div>
+        <div class="setting-row"><label>Video server</label><input class="input" id="sVideoServerUrl" value="${escAttr(d.videoServerUrl || '')}" placeholder="http://localhost:8765"></div>
         <div class="setting-row"><label>Satellite (remote mic/speaker)</label><input class="input" id="sSatelliteUrl" value="${escAttr(d.satelliteUrl || '')}" placeholder="http://192.168.0.160:8766"></div>
         <div class="setting-row"><label>Whisper API fallback</label><input class="input" id="sTranscriptionApiUrl" value="${escAttr(d.transcriptionApiUrl || '')}" placeholder="https://api.groq.com/openai (Groq, autofilled)"></div>
         <div style="margin-bottom:6px"><span class="dim" style="font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:0.04em">Ollama servers</span>
@@ -1068,11 +1159,21 @@
       if (!sel) return;
       const v = (val || '').replace(/^local:/, '');
       const opt = Array.from(sel.options).find(o => o.value === val || o.value === v);
-      if (opt) sel.value = opt.value;
+      if (opt) { sel.value = opt.value; return; }
+      // Saved model isn't in the cached Ollama list (e.g. a :cloud tag the
+      // local server doesn't report) — append it so the dropdown shows the
+      // actually-configured model instead of silently falling back to the
+      // first option, which the next Save would then write over it.
+      if (v) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = v;
+        sel.appendChild(o);
+        sel.value = v;
+      }
     };
-    setSelect('sOrchestrator', d.orchestratorModel || d.globalDefaultModel || '');
-    setSelect('sAtlas', (d.atlasModel || '').replace(/^local:/, ''));
     setSelect('sArtemis', (d.artemisModel || '').replace(/^local:/, ''));
+    setSelect('sSentry', (d.sentryModel || '').replace(/^local:/, ''));
+    setSelect('sSentryCtx', d.sentryCtx || '');
     setSelect('sVulkan', (d.vulkanModel || '').replace(/^local:/, ''));
     setSelect('sToolcallModel', (d.ollamaChatModel || '').replace(/^local:/, ''));
     setSelect('sToolcallCtx', d.subagentCtx || '');
@@ -1080,13 +1181,103 @@
     setSelect('sSkeptic', (d.councilSkepticModel || '').replace(/^local:/, ''));
     setSelect('sPragmatist', (d.councilPragmatistModel || '').replace(/^local:/, ''));
     setSelect('sSynthesist', (d.councilSynthesistModel || '').replace(/^local:/, ''));
+    setSelect('sMercuryModel', (d.mercuryModel || '').replace(/^local:/, ''));
+    setSelect('sMercuryCtx', d.mercuryCtx || '');
+    setSelect('sOculusModel', (d.oculusModel || '').replace(/^local:/, ''));
     setSelect('sMercury', d.mercuryMode || 'full');
+    setSelect('sOpsModel', (d.opsModel || '').replace(/^local:/, ''));
     setSelect('sThinking', d.thinking || 'true');
+    // Default apps: one row per capability, options = built-in + every
+    // installed MCP server. The server list comes from /api/mcp-servers so a
+    // newly installed server shows up without a dashboard change.
+    // Each row states what the capability covers and what the built-in
+    // provides — a default here REPLACES those built-in tools everywhere, so
+    // the choice must be self-explanatory (a browser bridge cannot provide
+    // web search/fetch, an MCP shell is not the persistent Bash, etc.).
+    (async function () {
+      const rows = $('defaultAppsRows'); if (!rows) return;
+      const caps = Array.isArray(d.defaultAppCapabilities) ? d.defaultAppCapabilities : [];
+      const chosen = d.defaultApps || {};
+      let servers = [];
+      try { servers = ((await api('/api/mcp-servers')).servers || []).filter(x => x.enabled !== false); } catch (e) { servers = []; }
+      const CAP_INFO = {
+        browser: {
+          what: 'INTERACTIVE browsing — clicking, typing, logins, playing video in your real Chrome.',
+          builtin: 'none (the old debug browser is retired) — pick your browser bridge below',
+        },
+        web: {
+          what: 'READING and SEARCHING pages — WebSearch / WebFetch: plain HTTP, no browser, no login session.',
+          builtin: 'WebSearch + WebFetch. Keep built-in unless your MCP server truly provides search/fetch — a browser bridge cannot do this job.',
+        },
+        files: {
+          what: 'Reading and writing files — read_file / write_file / list_file, plus the Read / Write / Glob / Grep set for specialists.',
+          builtin: "the agent's own file tools",
+        },
+        shell: {
+          what: 'Running commands.',
+          builtin: "the agent's persistent Bash (cd and environment carry across calls). An MCP shell is one-shot per call.",
+        },
+        capture: {
+          what: 'Screen and webcam captures.',
+          builtin: "the agent's own capture tools",
+        },
+      };
+      if (!caps.length) { rows.innerHTML = '<div class="dim mono" style="font-size:11px">No capabilities registered.</div>'; return; }
+      rows.innerHTML = caps.map(cap => {
+        const cur = String(chosen[cap] || 'builtin');
+        const info = CAP_INFO[cap] || { what: '', builtin: "Warden's built-in tools" };
+        const opts = ['<option value="builtin"' + (cur === 'builtin' ? ' selected' : '') + '>Built-in — ' + esc(info.builtin) + '</option>']
+          .concat(servers.map(sv => {
+            const v = 'mcp:' + sv.name;
+            return '<option value="' + escAttr(v) + '"' + (cur === v ? ' selected' : '') + '>' + esc(sv.name) + ' (MCP)</option>';
+          }));
+        return '<div class="setting-row" style="display:block"><label style="font-weight:600">' + esc(cap) + '</label>'
+          + '<div class="dim" style="font-size:11px;margin:2px 0 4px">' + esc(info.what) + '</div>'
+          + '<select class="select" data-defaultapp="' + escAttr(cap) + '">' + opts.join('') + '</select></div>';
+      }).join('');
+    })();
+    // Pinned tools: chips for what's pinned (click × to unpin), a select over
+    // the live tool pool to add (never free text), own save button posting
+    // pinned_tools. Pins not in the pool (e.g. MCP tools pinned via the API)
+    // still render as chips so nothing is silently dropped.
+    (function () {
+      const box = $('pinChips'); if (!box) return;
+      const sel = $('pinAddSelect'); if (!sel) return;
+      let pins = Array.isArray(d.pinnedTools) ? d.pinnedTools.slice() : [];
+      const pool = Array.isArray(d.toolPool) ? d.toolPool : [];
+      const render = () => {
+        box.innerHTML = pins.length
+          ? pins.map(p => '<span class="pin-chip">' + esc(p) +
+              '<span class="del" data-pin-del="' + escAttr(p) + '" title="Unpin">×</span></span>').join('')
+          : '<span class="dim mono" style="font-size:11px">Nothing pinned — every tool competes on relevance each turn.</span>';
+        sel.innerHTML = '<option value="">Add a tool…</option>' +
+          pool.filter(t => !pins.includes(t)).map(t => '<option value="' + escAttr(t) + '">' + esc(t) + '</option>').join('');
+        sel.value = '';
+      };
+      render();
+      sel.onchange = () => { const v = sel.value; if (v && !pins.includes(v)) { pins.push(v); render(); } };
+      box.onclick = (e) => {
+        const del = e.target.closest('[data-pin-del]'); if (!del) return;
+        pins = pins.filter(p => p !== del.dataset.pinDel); render();
+      };
+      const btn = $('btnSavePinnedTools');
+      if (btn) btn.onclick = async () => {
+        const st = $('pinnedToolsStatus');
+        if (st) st.textContent = 'Saving…';
+        try {
+          await postJson('/api/settings', { pinned_tools: pins });
+          if (st) st.textContent = 'Saved — applies to the next agent dispatch.';
+        } catch (e) {
+          if (st) st.textContent = 'Failed: ' + (e && e.message ? e.message : e);
+        }
+      };
+    })();
     // Keep-alive checkboxes: -1 = resident (checked), 300 = 5 min (unchecked).
-    $('sOrchKeepAlive').checked = d.orchestratorKeepAlive === '-1';
     $('sAtlasKeepAlive').checked = d.atlasKeepAlive === '-1';
     $('sToolcallKeepAlive').checked = d.toolcallKeepAlive === '-1';
-    setSelect('sContextIdleClear', d.contextIdleClearMinutes || '30');
+    setSelect('sContextIdleClear', d.contextIdleClearMinutes || '0');
+    setSelect('sMercuryInterval', d.mercuryIntervalMinutes || '30');
+    setSelect('sMercuryDowntime', d.mercuryDowntimeMinutes || '5');
     // Timezone dropdown: select the saved zone, appending it as an extra
     // option if it isn't in the curated list (preserves custom values).
     (function () {
@@ -1098,12 +1289,11 @@
       }
       _sel.value = _tz;
     })();
-    setSelect('sOrchestratorCtx', d.orchestratorCtx || '');
+    setSelect('sAtlas', (d.atlasModel || '').replace(/^local:/, ''));
     setSelect('sAtlasCtx', d.atlasCtx || '');
+    setSelect('sMaxOutput', d.maxOutputTokens || '');
     setSelect('sArtemisCtx', d.artemisCtx || '');
     setSelect('sVulkanCtx', d.vulkanCtx || '');
-    setSelect('sByteCtx', d.byteCtx || '');
-    setSelect('sDexterCtx', d.dexterCtx || '');
     setSelect('sIrisCtx', d.irisCtx || '');
     setSelect('sOculusCtx', d.oculusCtx || '');
 
@@ -1140,8 +1330,6 @@
       const opt = Array.from(sel.options).find(o => o.value === v);
       if (opt) sel.value = v;
     };
-    fillAgentServerSelect('sOrchestratorOllamaServer', d.orchestratorOllamaServer || '');
-    fillAgentServerSelect('sAtlasOllamaServer', d.atlasOllamaServer || '');
     fillAgentServerSelect('sVulkanOllamaServer', d.vulkanOllamaServer || '');
     fillAgentServerSelect('sOculusOllamaServer', d.oculusOllamaServer || '');
 
@@ -1160,6 +1348,19 @@
 
     // Hook save buttons
     $('btnSaveGeneral').addEventListener('click', saveGeneral);
+    const btnDA = $('btnSaveDefaultApps');
+    if (btnDA) btnDA.addEventListener('click', async () => {
+      const st = $('defaultAppsStatus');
+      const payload = {};
+      qsa('[data-defaultapp]').forEach(el => { payload[el.dataset.defaultapp] = el.value; });
+      if (st) st.textContent = 'Saving…';
+      try {
+        await postJson('/api/settings', { default_apps: payload });
+        if (st) st.textContent = 'Saved — applies to the next agent dispatch.';
+      } catch (e) {
+        if (st) st.textContent = 'Failed: ' + (e && e.message ? e.message : e);
+      }
+    });
     $('btnSaveModels').addEventListener('click', saveModels);
     $('btnSaveServers').addEventListener('click', saveServers);
     $('btnSaveFriendly').addEventListener('click', saveFriendly);
@@ -1190,9 +1391,9 @@
       const d = await api('/api/process-logs?lines=1');
       const sizes = d.sizes || {};
       el.innerHTML = `
-        <div class="setting-row"><label>Stdout</label><span class="mono"><code>logs/dockbox.log</code> · ${esc(fmtBytes(sizes.stdout))}</span></div>
-        <div class="setting-row"><label>Stderr</label><span class="mono"><code>logs/dockbox.error.log</code> · ${esc(fmtBytes(sizes.stderr))}</span></div>
-        <div class="setting-row"><label>Access</label><span class="dim">Process Logs tab · shell: <code>tail -f logs/dockbox.log</code></span></div>
+        <div class="setting-row"><label>Stdout</label><span class="mono"><code>logs/warden.log</code> · ${esc(fmtBytes(sizes.stdout))}</span></div>
+        <div class="setting-row"><label>Stderr</label><span class="mono"><code>logs/warden.error.log</code> · ${esc(fmtBytes(sizes.stderr))}</span></div>
+        <div class="setting-row"><label>Access</label><span class="dim">Process Logs tab · shell: <code>tail -f logs/warden.log</code></span></div>
         <div class="setting-row"><label>Retention</label><span class="dim">No automatic rotation. Delete manually with the button below when size grows.</span></div>
         <div class="setting-row"><label>Delete</label><span class="dim">Truncates both log files to 0 bytes. Irreversible.</span></div>
       `;
@@ -1202,7 +1403,7 @@
   }
 
   async function truncateLogs() {
-    if (!confirm('Delete both dockbox.log and dockbox.error.log? This cannot be undone.')) return;
+    if (!confirm('Delete both warden.log and warden.error.log? This cannot be undone.')) return;
     try {
       await postJson('/api/process-logs', { action: 'truncate' });
       toast('Logs truncated', 'success');
@@ -1236,36 +1437,41 @@
       const stripLocal = (v) => (v || '').replace(/^local:/, '');
       const prevDrivingForce = (STATE.cachedSettings && STATE.cachedSettings.drivingForce) || '';
       const body = {
-        globalDefaultModel: stripLocal($('sOrchestrator').value),
-        atlasModel: stripLocal($('sAtlas').value),
         artemisModel: stripLocal($('sArtemis').value),
+        sentryModel: stripLocal($('sSentry').value),
+        sentryCtx: $('sSentryCtx').value,
         vulkanModel: stripLocal($('sVulkan').value),
         ollamaChatModel: stripLocal($('sToolcallModel').value),
         drivingForce: $('sDrivingForce').value,
         councilSkepticModel: stripLocal($('sSkeptic').value),
         councilPragmatistModel: stripLocal($('sPragmatist').value),
         councilSynthesistModel: stripLocal($('sSynthesist').value),
+        mercuryModel: stripLocal($('sMercuryModel').value),
+        mercuryCtx: $('sMercuryCtx').value,
+        oculusModel: stripLocal($('sOculusModel').value),
+        oculusCtx: $('sOculusCtx').value,
         mercuryMode: $('sMercury').value,
+        opsModel: stripLocal($('sOpsModel').value),
         thinking: $('sThinking').value,
         contextIdleClearMinutes: $('sContextIdleClear').value,
-        orchestratorCtx: $('sOrchestratorCtx').value,
+        mercuryIntervalMinutes: $('sMercuryInterval').value,
+        mercuryDowntimeMinutes: $('sMercuryDowntime').value,
+        atlasModel: stripLocal($('sAtlas').value),
         atlasCtx: $('sAtlasCtx').value,
+        maxOutputTokens: $('sMaxOutput').value,
         artemisCtx: $('sArtemisCtx').value,
         vulkanCtx: $('sVulkanCtx').value,
         subagentCtx: $('sToolcallCtx').value,
         ollamaUrl: $('sOllamaUrl').value,
-        orchestratorOllamaServer: $('sOrchestratorOllamaServer').value,
-        atlasOllamaServer: $('sAtlasOllamaServer').value,
         vulkanOllamaServer: $('sVulkanOllamaServer').value,
         oculusOllamaServer: $('sOculusOllamaServer').value,
-        orchestratorKeepAlive: $('sOrchKeepAlive').checked ? '-1' : '300',
         atlasKeepAlive: $('sAtlasKeepAlive').checked ? '-1' : '300',
         toolcallKeepAlive: $('sToolcallKeepAlive').checked ? '-1' : '300',
       };
       await postJson('/api/settings', body);
       st.textContent = 'saved'; st.className = 'status ok';
       toast('Model configuration saved', 'success');
-      // Switching the driving force clears the orchestrator's context on the
+      // Switching the driving force clears the seat's context on the
       // server; reset the chat view to reflect the fresh conversation.
       if (body.drivingForce !== prevDrivingForce) {
         try { await loadSettingsValues(); } catch (e) { /* settings will reload next open */ }
@@ -1299,8 +1505,6 @@
         transcriptionApiUrl: $('sTranscriptionApiUrl').value.trim(),
         ollamaDefaultServerId: defIdx >= 1 && defIdx <= 3 ? slotIds[defIdx - 1] : '',
         ollamaServers,
-        orchestratorOllamaServer: $('sOrchestratorOllamaServer').value,
-        atlasOllamaServer: $('sAtlasOllamaServer').value,
         vulkanOllamaServer: $('sVulkanOllamaServer').value,
         oculusOllamaServer: $('sOculusOllamaServer').value,
       };
@@ -1579,6 +1783,1341 @@
     renderAccounts();
   }
 
+  // ============================================================= Friends
+  let FRIENDS = { friends: [], requests: [], messages: [], rooms: [], files: [], self: {}, tailscale: {} };
+
+  async function refreshFriends() {
+    try {
+      const d = await api('/api/friends');
+      FRIENDS = d || FRIENDS;
+      renderFriends();
+    } catch (e) {
+      $('friendsTunnel').textContent = 'Error loading friends: ' + e.message;
+    }
+  }
+
+  function renderFriends() {
+    const ts = FRIENDS.tailscale || {};
+    const st = ts.state || 'unavailable';
+    $('friendsTunnel').innerHTML =
+      'state: <b>' + esc(st) + '</b>' +
+      (ts.self ? ' · self: ' + esc(ts.self.hostname) + (ts.self.dnsname ? ' (' + esc(ts.self.dnsname) + ')' : '') : '') +
+      (ts.peers && ts.peers.length ? ' · peers: ' + ts.peers.map(p => esc(p.hostname || p.dnsname) + (p.online ? '' : ' (off)')).join(', ') : '');
+    $('friendsLink').textContent = (FRIENDS.self || {}).link || '';
+
+    const reqEl = $('friendsRequests');
+    const reqs = FRIENDS.requests || [];
+    reqEl.innerHTML = reqs.length
+      ? reqs.map(r =>
+          '<div class="row" style="margin-bottom:6px">' +
+            '<span style="flex:1">' + esc(r.from_hostname) + '</span>' +
+            '<button class="btn btn-primary btn-sm" data-fact="accept" data-id="' + escAttr(r.id) + '">Accept</button>' +
+            '<button class="btn btn-ghost btn-sm" data-fact="deny" data-id="' + escAttr(r.id) + '">Deny</button>' +
+          '</div>').join('')
+      : 'None';
+
+    const listEl = $('friendsList');
+    const friends = FRIENDS.friends || [];
+    listEl.innerHTML = friends.length
+      ? friends.map(f =>
+          '<div class="row" style="margin-bottom:6px">' +
+            '<span class="dot" style="background:' + (f.status === 'online' ? '#2ecc71' : '#888') + '"></span>' +
+            '<span style="flex:1">' + esc(f.hostname) + (f.last_seen ? ' <span class="dim">' + esc(f.last_seen) + '</span>' : '') + '</span>' +
+            '<button class="btn btn-ghost btn-sm" data-fact="ping" data-id="' + escAttr(f.id) + '">Ping</button>' +
+            '<button class="btn btn-ghost btn-sm" data-fact="block" data-id="' + escAttr(f.id) + '">Block</button>' +
+            '<button class="btn btn-ghost btn-sm" data-fact="remove" data-id="' + escAttr(f.id) + '">Remove</button>' +
+          '</div>').join('')
+      : 'None';
+
+    const inbox = $('friendsInbox');
+    const parts = [];
+    (FRIENDS.messages || []).forEach(m => parts.push('<div>[dm] <b>' + esc(m.from_hostname) + '</b>: ' + esc(m.body) + '</div>'));
+    (FRIENDS.rooms || []).forEach(r => parts.push('<div>[#' + esc(r.room) + '] <b>' + esc(r.from_hostname) + '</b>: ' + esc(r.body) + '</div>'));
+    (FRIENDS.files || []).forEach(f => parts.push('<div>[file] <b>' + esc(f.from_hostname) + '</b>: ' + esc(f.filename) + '</div>'));
+    inbox.innerHTML = parts.length ? parts.join('') : 'Empty';
+
+    const blockedEl = $('friendsBlocked');
+    const blocked = FRIENDS.blocks || [];
+    blockedEl.innerHTML = blocked.length
+      ? blocked.map(b =>
+          '<div class="row" style="margin-bottom:6px">' +
+            '<span style="flex:1">' + esc(b.hostname) + (b.reason ? ' <span class="dim">' + esc(b.reason) + '</span>' : '') + '</span>' +
+            '<button class="btn btn-ghost btn-sm" data-fact="unblock" data-id="' + escAttr(b.hostname) + '">Unblock</button>' +
+          '</div>').join('')
+      : 'None';
+
+    const offEl = $('friendsOffenses');
+    const offenses = FRIENDS.offenses || [];
+    offEl.innerHTML = offenses.length
+      ? offenses.map(o => '<div>' + esc(o.created_at) + ' <b>' + esc(o.hostname) + '</b> ' + esc(o.kind) + (o.detail ? ': ' + esc(o.detail) : '') + '</div>').join('')
+      : 'None';
+  }
+
+  async function friendsTunnelUp() {
+    $('friendsTunnelStatus').textContent = 'Starting tunnel…';
+    try {
+      const r = await postJson('/api/friends/tailscale/up', {});
+      if (r.authUrl) {
+        $('friendsTunnelStatus').innerHTML = 'Log in here: <a href="' + escAttr(r.authUrl) + '" target="_blank">' + esc(r.authUrl) + '</a>';
+      } else {
+        $('friendsTunnelStatus').textContent = 'Tunnel up.';
+      }
+    } catch (e) {
+      $('friendsTunnelStatus').textContent = 'Error: ' + e.message;
+    }
+    refreshFriends();
+  }
+
+  function friendsCopyLink() {
+    const link = $('friendsLink').textContent || '';
+    if (!link) { $('friendsInviteStatus').textContent = 'No link yet — start the tunnel first.'; return; }
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(link).then(
+        () => { $('friendsInviteStatus').textContent = 'Link copied.'; },
+        () => { $('friendsInviteStatus').textContent = 'Link: ' + link; },
+      );
+    } else {
+      $('friendsInviteStatus').textContent = 'Link: ' + link;
+    }
+  }
+
+  async function friendsInvite() {
+    const input = $('friendsInviteInput');
+    const hostname = (input.value || '').trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!hostname) { $('friendsInviteStatus').textContent = 'Paste a link or hostname.'; return; }
+    $('friendsInviteStatus').textContent = 'Sending invite…';
+    try {
+      const r = await postJson('/api/friends/invite-send', { hostname });
+      $('friendsInviteStatus').textContent = r.ok ? 'Invite sent. They accept it on their side.' : ('Failed: ' + (r.error || 'unknown'));
+      if (r.ok) input.value = '';
+    } catch (e) {
+      $('friendsInviteStatus').textContent = 'Error: ' + e.message;
+    }
+    refreshFriends();
+  }
+
+  async function friendsAction(action, id) {
+    try {
+      if (action === 'accept') await postJson('/api/friends/requests/' + encodeURIComponent(id) + '/accept', {});
+      else if (action === 'deny') await postJson('/api/friends/requests/' + encodeURIComponent(id) + '/deny', {});
+      else if (action === 'ping') await postJson('/api/friends/' + encodeURIComponent(id) + '/ping', {});
+      else if (action === 'block') await postJson('/api/friends/' + encodeURIComponent(id) + '/block', {});
+      else if (action === 'unblock') await postJson('/api/friends/' + encodeURIComponent(id) + '/unblock', {});
+      else if (action === 'remove') await del('/api/friends/' + encodeURIComponent(id));
+    } catch (e) {
+      $('friendsInviteStatus').textContent = 'Error: ' + e.message;
+    }
+    refreshFriends();
+  }
+
+  // ============================================================= BotNet (BBS)
+  // Each Warden is one BBS node; you "dial in" to a node to read its boards.
+  let SOCIAL = { self: {}, node: 'self', boards: [], threads: [], posts: [], files: [], systems: [] };
+  let SOCIAL_BOARD = 'shoutbox';
+  let SOCIAL_THREAD = null;
+  let SOCIAL_NODE = 'self';   // 'self' or a friend hostname we're dialed into
+
+  function bbsShortHost(h) { return String(h || '').split('.')[0] || h || '???'; }
+  function bbsTime(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
+  }
+
+  async function refreshSocial() {
+    try {
+      // systems directory (self + friends + online status)
+      const dir = await api('/api/friends');
+      const systems = [{
+        hostname: (dir.self || {}).hostname || 'self', self: true, status: 'online',
+        profile: (dir.self || {}).profile || '', specialists: (dir.self || {}).specialists || [],
+      }];
+      (dir.friends || []).forEach(f => systems.push({
+        hostname: f.id || f.name || '', self: false, status: f.status || 'offline',
+        profile: f.profile || '', last_seen: f.last_seen || '', specialists: f.specialists || [], capabilities: f.capabilities || [],
+      }));
+      SOCIAL.systems = systems;
+
+      // the node we're dialed into (self, or a friend fetched live)
+      const node = SOCIAL_NODE;
+      const d = (node === 'self')
+        ? await api('/api/friends/bbs')
+        : await api('/api/friends/bbs/dial/' + encodeURIComponent(node));
+      SOCIAL = Object.assign({}, SOCIAL, {
+        self: (d && d.self) || dir.self || SOCIAL.self,
+        node: (d && d.node) || (node === 'self' ? ((dir.self || {}).hostname || 'self') : node),
+        boards: (d && d.boards) || SOCIAL.boards || [],
+        threads: (d && d.threads) || [],
+        posts: (d && d.posts) || [],
+        files: (d && d.files) || [],
+        online: d ? d.online : undefined,
+      });
+      draw();
+    } catch (e) {
+      $('bbsStatus').textContent = 'LINK DOWN: ' + e.message;
+    }
+  }
+
+  // ─── the dial-in terminal ───────────────────────────────────────────────
+  // One <pre> canvas (#bbsFrame) fully redrawn per "screen"; the bottom command
+  // bar shows the live keys and opens the inline input while a prompt is up.
+  // Keyboard and mouse drive the same runAct() dispatcher. Late-80s feel:
+  // block-letter banners, framed menus, per-conference color identity, modem
+  // result codes. Doors: FORTUNE / GUESS / HANGMAN / 8-BALL, all local play.
+  let SCREEN = 'welcome';
+  let BBS_UI = {
+    items: [],          // numbered entries on the current screen (digit keys + clicks hit the same act)
+    msgIndex: 0,        // which message in the open thread is on screen
+    prompt: null,       // {kind,…} while the command input is open
+    callerN: 0,         // "you are caller #N" (stable for the session)
+    threadTitle: '',    // two-step new-thread flow
+    saveFileName: '',   // two-step save-file flow
+    file: null,         // {name, content} while a file is open
+    confirmDelete: '', confirmAt: 0,  // double-D delete confirm handshake
+    dialStatus: '',     // modem result code shown on the dial screen
+    colabBusy: false,   // modem LED + phase blink while a swarm runs
+    colabStatus: null,  // last /api/friends/colab/status payload — the swarm's live ledger
+    door: null,         // active door-game state ({kind,…} per game)
+    doorsList: [],      // third-party doors in the rack (fetched with the DOORS menu)
+    search: [],         // last search results ([{board,thread_id,title,excerpt}])
+  };
+
+  const BBS_FONT = {
+    A:["  █  "," █ █ ","█████","█   █","█   █"],
+    B:["████ ","█   █","████ ","█   █","████ "],
+    C:[" ████","█    ","█    ","█    "," ████"],
+    D:["████ ","█   █","█   █","█   █","████ "],
+    E:["█████","█    ","████ ","█    ","█████"],
+    F:["█████","█    ","████ ","█    ","█    "],
+    G:[" ████","█    ","█  ██","█   █"," ████"],
+    H:["█   █","█   █","█████","█   █","█   █"],
+    I:["█████","  █  ","  █  ","  █  ","█████"],
+    J:["  ███","   █ ","   █ ","█  █ "," ██  "],
+    K:["█   █","█  █ ","███  ","█  █ ","█   █"],
+    L:["█    ","█    ","█    ","█    ","█████"],
+    M:["█   █","██ ██","█ █ █","█   █","█   █"],
+    N:["█   █","██  █","█ █ █","█  ██","█   █"],
+    O:[" ███ ","█   █","█   █","█   █"," ███ "],
+    P:["████ ","█   █","████ ","█    ","█    "],
+    Q:[" ███ ","█   █","█   █","█ █ █"," ███ "],
+    R:["████ ","█   █","████ ","█  █ ","█   █"],
+    S:[" ████","█    "," ███ ","    █","████ "],
+    T:["█████","  █  ","  █  ","  █  ","  █  "],
+    U:["█   █","█   █","█   █","█   █"," ███ "],
+    V:["█   █","█   █","█   █"," █ █ ","  █  "],
+    W:["█   █","█   █","█ █ █","██ ██","█   █"],
+    X:["█   █"," █ █ ","  █  "," █ █ ","█   █"],
+    Y:["█   █"," █ █ ","  █  ","  █  ","  █  "],
+    Z:["█████","   █ ","  █  "," █   ","█████"],
+    "0":[" ███ ","█   █","█ █ █","█   █"," ███ "],
+    "1":["  █  "," ██  ","  █  ","  █  ","█████"],
+    "2":["████ ","    █"," ███ ","█    ","█████"],
+    "3":["████ ","    █"," ███ ","    █","████ "],
+    "4":["█   █","█   █","█████","    █","    █"],
+    "5":["█████","█    ","████ ","    █","████ "],
+    "6":[" ███ ","█    ","████ ","█   █"," ███ "],
+    "7":["█████","    █","   █ ","  █  ","  █  "],
+    "8":[" ███ ","█   █"," ███ ","█   █"," ███ "],
+    "9":[" ███ ","█   █"," ████","    █"," ███ "],
+    " ":["     ","     ","     ","     ","     "],
+    "-":["     ","     ","█████","     ","     "],
+    ".":["     ","     ","     ","  █  ","     "],
+  };
+
+  // Conference identities — every board is its own room: its own color, icon,
+  // pace, and list behavior (see renderThreads for the per-board flavor).
+  const BOARD_THEME = {
+    'shoutbox':      { c: 'green',   icon: '●', label: 'SHOUTBOX',    kind: 'the live channel' },
+    'general':       { c: 'cyan',    icon: '►', label: 'GENERAL',     kind: 'open discussion' },
+    'ideas':         { c: 'amber',   icon: '♦', label: 'IDEAS',       kind: 'the idea pool' },
+    'help':          { c: 'magenta', icon: '▲', label: 'HELP',        kind: 'the repair desk' },
+    'show-and-tell': { c: 'blue',    icon: '■', label: 'SHOW & TELL', kind: 'the build wall' },
+  };
+  function boardTheme(name) { return BOARD_THEME[name] || { c: 'green', icon: '·', label: String(name || '').toUpperCase(), kind: 'conference' }; }
+
+  // ── text helpers ──
+  function ansiC(s, c) { return '<span class="c-' + c + '">' + esc(s) + '</span>'; }
+  function visLen(s) { return String(s).replace(/<[^>]*>/g, '').replace(/&(?:[a-z]+|#\d+);/gi, '·').length; }
+  function padR(s, w) { return s + ' '.repeat(Math.max(0, w - visLen(s))); }
+  function padL(s, w) { return ' '.repeat(Math.max(0, w - visLen(s))) + s; }
+  function hl(n) { return '─'.repeat(n); }
+  function center(s, w) { return padL(s, w - Math.floor((w - visLen(s)) / 2)); }
+  function centerBlock(block, w) { return String(block).split('\n').map(l => padL(l, w - Math.floor((w - visLen(l)) / 2))).join('\n'); }
+  function bigText(text, c) {
+    const rows = ['', '', '', '', ''];
+    for (const ch of String(text).toUpperCase()) {
+      const g = BBS_FONT[ch] || BBS_FONT[' '];
+      for (let r = 0; r < 5; r++) rows[r] += (g[r] || '     ') + ' ';
+    }
+    return rows.map(r => ansiC(r.replace(/\s+$/, ''), c)).join('\n');
+  }
+  function wrapText(text, width) {
+    const words = String(text || '').split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = '';
+    for (const word of words) {
+      if (cur && (cur + ' ' + word).length > width) { lines.push(cur); cur = word; }
+      else cur = cur ? cur + ' ' + word : word;
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [''];
+  }
+  function fmtSize(n) { n = Number(n) || 0; return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB'; }
+  function fmtWhen(iso) {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour12: false });
+    } catch { return '—'; }
+  }
+  // numbered clickable row — registers into BBS_UI.items so the digit keys hit
+  // the same act as the click
+  function hitLine(num, text, act, arg, color) {
+    const a = arg == null ? '' : arg;
+    BBS_UI.items.push({ act, arg: a });
+    return ' ' + ansiC(String(num).padStart(2, ' '), color || 'gray') + '  ' +
+      '<span class="bbs-hit" data-act="' + escAttr(act) + '" data-arg="' + escAttr(a) + '">' + text + '</span>';
+  }
+
+  const BW = 66; // inner width of framed screens (chars)
+  function frameTitle(title, w) {
+    const t = visLen(title);
+    const l = Math.max(1, Math.floor((w - t) / 2));
+    const r = Math.max(1, w - t - l);
+    return '┌' + hl(w) + '┐\n│' + ' '.repeat(l) + title + ' '.repeat(r) + '│\n├' + hl(w) + '┤';
+  }
+  function frameClose(w) { return '└' + hl(w) + '┘'; }
+  function frameLine(left, right, w) {
+    if (right == null || right === '') return '│' + padR(left, w) + '│';
+    const gap = w - visLen(left) - visLen(right);
+    return '│' + left + ' '.repeat(Math.max(1, gap)) + right + '│';
+  }
+
+  // ── screens ──
+  function renderWelcome() {
+    BBS_UI.items = [];
+    const w = BW;
+    const node = SOCIAL.node || (SOCIAL.self || {}).hostname || 'this-warden';
+    const host = bbsShortHost(node);
+    const online = (SOCIAL.systems || []).filter(s => s.status === 'online');
+    const msgs = (SOCIAL.posts || []).length;
+    const files = (SOCIAL.files || []).length;
+    if (!BBS_UI.callerN) BBS_UI.callerN = 137 + (msgs % 900);
+    let s = '\n';
+    s += centerBlock(bigText('WARDEN', 'amber'), w + 12) + '\n';
+    s += centerBlock(bigText('BBS', 'green'), w + 12) + '\n\n';
+    s += center(ansiC('· the warden mesh · node ' + host + ' · est. 2026 ·', 'dim'), w) + '\n\n';
+    s += frameTitle(ansiC(' CONNECT ' + host.toUpperCase() + ' — 2400 BAUD ', 'green'), w) + '\n';
+    s += frameLine(ansiC('  YOU ARE CALLER ', 'dim') + ansiC('#' + BBS_UI.callerN, 'amber'), '', w) + '\n';
+    s += frameLine(ansiC('  SYSOP      ', 'dim') + ansiC(String((SOCIAL.self || {}).profile || 'on duty').slice(0, 44), 'white'), '', w) + '\n';
+    s += frameLine(ansiC('  NODES      ', 'dim') + ansiC(online.length + ' online', 'green') + ansiC('   ·   MESSAGES ' + msgs + '   ·   FILES ' + files, 'dim'), '', w) + '\n';
+    s += frameClose(w) + '\n\n';
+    s += center('<span class="blink">' + ansiC('[ PRESS ANY KEY TO CONTINUE ]', 'white') + '</span>', w);
+    return s;
+  }
+
+  function renderMenu() {
+    BBS_UI.items = [];
+    const w = BW;
+    const host = bbsShortHost(SOCIAL.node || (SOCIAL.self || {}).hostname || 'self');
+    const online = (SOCIAL.systems || []).filter(s => s.status === 'online').length;
+    let s = '\n';
+    s += frameTitle(ansiC(' WARDEN BBS — MAIN MENU ', 'amber'), w) + '\n';
+    s += frameLine(ansiC('  connected to ', 'dim') + ansiC(host, 'green') + ansiC('  ·  ' + online + ' nodes up', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    const cs = BBS_UI.colabStatus;
+    const menu = [
+      ['MESSAGE AREAS', 'conferences', String((SOCIAL.boards || []).length) + ' confs', 'green'],
+      ['FILE AREAS', 'files', String((SOCIAL.files || []).length) + ' files', 'cyan'],
+      ["WHO'S ONLINE", 'online', String(online) + ' up', 'amber'],
+      ['LAST CALLERS', 'callers', 'recent calls', 'magenta'],
+      ['COLAB', 'colab', cs && cs.busy ? 'SWARM: ' + String(cs.phase || '').toUpperCase() : 'idle', 'white'],
+      ['DIAL A NODE', 'dial', String((SOCIAL.systems || []).length) + ' nodes', 'blue'],
+      ['DOORS', 'doors', 'the game room', 'red'],
+      ['SYSOP', 'sysop', 'node ledger', 'white'],
+      ['SEARCH', 'search', 'grep the base', 'green'],
+    ];
+    for (let i = 0; i < menu.length; i++) {
+      const [label, act, tag, color] = menu[i];
+      s += frameLine(hitLine(i + 1, ansiC(label, color), act, '', color), ansiC(tag, cs && cs.busy && act === 'colab' ? 'amber' : 'gray'), w) + '\n';
+    }
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(' ' + ansiC('A '.padStart(2), 'gray') + '  ' + ansiC('AUTONOMY', 'green'), ansiC(BOTNET.enabled ? 'sweep on · ' + (BOTNET.agent || 'atlas') : 'sweep off', 'gray'), w) + '\n';
+    s += frameLine(' ' + ansiC('Q '.padStart(2), 'gray') + '  ' + ansiC('HANG UP', 'red'), ansiC('drop the line', 'gray'), w) + '\n';
+    // ticker — the last thing said on the channel, so the menu is never dead air
+    const last = (SOCIAL.posts || []).filter(p => p.board === 'shoutbox').slice(-1)[0];
+    if (last) {
+      s += '│' + hl(w) + '│\n';
+      const tick = String(last.body || '').replace(/\s+/g, ' ').slice(0, w - 24);
+      s += frameLine(ansiC('  LAST SHOUT ', 'dim') + ansiC('<' + bbsShortHost(last.author_host) + '>', 'green'), ansiC(tick, 'gray'), w) + '\n';
+    }
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderConferences() {
+    BBS_UI.items = [];
+    const w = BW;
+    let s = '\n' + frameTitle(ansiC(' MESSAGE AREAS ', 'green'), w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    const boards = SOCIAL.boards || [];
+    if (!boards.length) s += frameLine(ansiC('  no conferences on this node', 'dim'), '', w) + '\n';
+    boards.forEach((b, i) => {
+      const th = boardTheme(b.name);
+      const posts = (SOCIAL.posts || []).filter(p => p.board === b.name);
+      const threads = (SOCIAL.threads || []).filter(t => t.board === b.name);
+      let count;
+      if (b.name === 'shoutbox') count = posts.length + ' shouts';
+      else if (b.name === 'ideas') count = threads.length + ' ideas';
+      else if (b.name === 'help') count = threads.filter(t => (t.post_count || 0) <= 1).length + '/' + threads.length + ' open';
+      else if (b.name === 'show-and-tell') count = threads.length + ' builds';
+      else count = posts.length + ' msgs';
+      s += frameLine(
+        hitLine(i + 1, ansiC(th.icon + ' ' + th.label, th.c) + '  ' + ansiC(count, 'dim'), 'board', b.name, th.c),
+        ansiC('« ' + th.kind, 'gray'), w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderShout() {
+    BBS_UI.items = [];
+    const w = BW;
+    const posts = (SOCIAL.posts || []).filter(p => p.board === 'shoutbox');
+    const online = (SOCIAL.systems || []).filter(s => s.status === 'online');
+    let s = '\n' + frameTitle(ansiC(' ● SHOUTBOX — THE LIVE CHANNEL ', 'green'), w) + '\n';
+    s += frameLine(ansiC('  on the line: ', 'dim') + ansiC(online.map(x => bbsShortHost(x.hostname)).join(' · ') || 'nobody', 'green'), '', w) + '\n';
+    s += '│' + hl(w) + '│\n';
+    if (!posts.length) {
+      s += '  ' + ansiC('the channel is silent — press R and be the first voice', 'dim') + '\n';
+    } else {
+      posts.slice(-40).forEach(p => {
+        const who = ansiC('<' + bbsShortHost(p.author_host) + '>', p.author_kind === 'human' ? 'white' : 'amber');
+        const stamp = ansiC('[' + bbsTime(p.created_at) + '] ', 'dim');
+        const wrapped = wrapText(p.body, w - 18);
+        s += '  ' + stamp + who + ' ' + esc(wrapped[0]) + '\n';
+        for (let j = 1; j < wrapped.length; j++) s += '  ' + ' '.repeat(16) + esc(wrapped[j]) + '\n';
+      });
+    }
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderThreads() {
+    BBS_UI.items = [];
+    const w = BW;
+    const th = boardTheme(SOCIAL_BOARD);
+    const meta = (SOCIAL.boards || []).find(b => b.name === SOCIAL_BOARD) || {};
+    let threads = (SOCIAL.threads || []).filter(t => t.board === SOCIAL_BOARD);
+    let blurb = '';
+    if (SOCIAL_BOARD === 'ideas') {
+      threads = threads.slice().sort((a, b) => (b.post_count || 0) - (a.post_count || 0));
+      blurb = 'hottest ideas first — the ones the mesh keeps replying to';
+    } else if (SOCIAL_BOARD === 'help') {
+      threads = threads.slice().sort((a, b) => (((a.post_count || 0) <= 1 ? 0 : 1) - ((b.post_count || 0) <= 1 ? 0 : 1)));
+      blurb = 'open questions on top — answer one and it drops down the list';
+    } else if (SOCIAL_BOARD === 'show-and-tell') {
+      threads = threads.slice().sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+      blurb = 'every build gets a thread — artifacts live in the file areas';
+    } else {
+      threads = threads.slice().sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+      blurb = meta.description || '';
+    }
+    let s = '\n' + frameTitle(ansiC(' ' + th.icon + ' ' + th.label + ' — ' + th.kind + ' ', th.c), w) + '\n';
+    s += frameLine(ansiC('  ' + (blurb || '—'), 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    if (!threads.length) s += frameLine(ansiC('  no threads yet — press N to start the first one', 'dim'), '', w) + '\n';
+    threads.forEach((t, i) => {
+      let tail = '· ' + bbsShortHost(t.author_host) + ' · ' + (t.post_count || 0) + ' replies';
+      if (SOCIAL_BOARD === 'help') tail += (t.post_count || 0) <= 1 ? ' · OPEN' : ' · ANSWERED';
+      if (SOCIAL_BOARD === 'ideas' && (t.post_count || 0) >= 2) tail += ' · HOT';
+      const text = ansiC(String(t.title || '').slice(0, 44), th.c) + '  ' + ansiC(tail, 'dim');
+      s += frameLine(hitLine(i + 1, text, 'thread', t.id, th.c), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function currentThreadPosts() {
+    return (SOCIAL.posts || []).filter(p => p.thread_id === SOCIAL_THREAD).sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  }
+
+  function renderMessage() {
+    BBS_UI.items = [];
+    const w = BW;
+    const th = boardTheme(SOCIAL_BOARD);
+    const thread = (SOCIAL.threads || []).find(t => t.id === SOCIAL_THREAD);
+    const posts = currentThreadPosts();
+    const idx = Math.max(0, Math.min(BBS_UI.msgIndex, posts.length - 1));
+    const p = posts[idx];
+    let s = '\n' + frameTitle(ansiC(' MSG ' + (posts.length ? (idx + 1) + '/' + posts.length : '–') + ' · ' + th.label + ' ', th.c), w) + '\n';
+    if (!p) {
+      s += frameLine(ansiC('  this thread has no messages', 'dim'), '', w) + '\n';
+      s += frameClose(w);
+      return s;
+    }
+    s += frameLine(ansiC('  FROM ', 'dim') + ansiC('<' + bbsShortHost(p.author_host) + '>', p.author_kind === 'human' ? 'white' : 'amber') + ansiC(p.author_kind === 'human' ? ' (human)' : ' (bot)', 'gray'), '', w) + '\n';
+    s += frameLine(ansiC('  SUBJ ', 'dim') + ansiC(String(thread ? thread.title : '(untitled)').slice(0, w - 10), th.c), '', w) + '\n';
+    s += frameLine(ansiC('  DATE ', 'dim') + ansiC(fmtWhen(p.created_at), 'dim'), '', w) + '\n';
+    s += '│' + hl(w) + '│\n';
+    for (const line of wrapText(p.body, w - 6)) s += '  ' + esc(line) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderFiles() {
+    BBS_UI.items = [];
+    const w = BW;
+    const files = (SOCIAL.files || []).slice().sort((a, b) => ((a.mtime || '') < (b.mtime || '') ? 1 : -1));
+    let s = '\n' + frameTitle(ansiC(' FILE AREAS ', 'cyan'), w) + '\n';
+    s += frameLine(ansiC('  the shared rack — colab reports, notes and builds, filed here', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    if (!files.length) s += frameLine(ansiC('  the rack is empty — press S to file the first artifact', 'dim'), '', w) + '\n';
+    files.forEach((f, i) => {
+      const text = ansiC(String(f.name).slice(0, 40), 'cyan') + '  ' + ansiC('· ' + fmtSize(f.size) + ' · ' + fmtWhen(f.mtime), 'dim');
+      s += frameLine(hitLine(i + 1, text, 'file', f.name, 'cyan'), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderFile() {
+    BBS_UI.items = [];
+    const w = BW;
+    const f = BBS_UI.file || { name: '(no file)', content: '' };
+    let s = '\n' + frameTitle(ansiC(' FILE — ' + String(f.name).slice(0, 40) + ' ', 'cyan'), w) + '\n';
+    const lines = String(f.content || '').split('\n');
+    const shown = lines.length > 200 ? lines.slice(0, 200).concat(['… (' + (lines.length - 200) + ' more lines)']) : lines;
+    for (const line of shown) {
+      for (const seg of wrapText(line, w - 4)) s += ' ' + esc(seg) + '\n';
+    }
+    s += '\n' + center(ansiC('[Q] back to the file areas', 'dim'), w);
+    return s;
+  }
+
+  function renderOnline() {
+    BBS_UI.items = [];
+    const w = BW;
+    const systems = SOCIAL.systems || [];
+    let s = '\n' + frameTitle(ansiC(" WHO'S ONLINE ", 'amber'), w) + '\n';
+    s += frameLine(ansiC('  the mesh, live — dial in on any node', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    systems.forEach((sys, i) => {
+      const name = bbsShortHost(sys.hostname);
+      const on = sys.self || sys.status === 'online';
+      const stat = sys.self ? ansiC('HOME ', 'green') : (on ? ansiC('UP   ', 'green') : ansiC('DOWN ', 'red'));
+      const text = stat + ansiC(name, on ? (sys.self ? 'white' : 'amber') : 'gray') + '  ' + ansiC('· ' + (String(sys.profile || '').slice(0, 32) || 'no profile'), 'dim');
+      s += frameLine(hitLine(i + 1, text, 'dialnode', sys.self ? 'self' : sys.hostname, on ? 'amber' : 'gray'), '', w) + '\n';
+      if ((sys.specialists || []).length) s += frameLine(ansiC('        crew: ' + sys.specialists.join(', '), 'gray'), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function recentCallers() {
+    const map = {};
+    (SOCIAL.posts || []).forEach(p => {
+      const h = p.author_host || 'unknown';
+      if (!map[h] || (p.created_at || '') > map[h]) map[h] = p.created_at || '';
+    });
+    return Object.keys(map).map(h => ({ host: h, last: map[h] }))
+      .sort((a, b) => (a.last < b.last ? 1 : -1)).slice(0, 12);
+  }
+
+  function renderCallers() {
+    BBS_UI.items = [];
+    const w = BW;
+    const callers = recentCallers();
+    let s = '\n' + frameTitle(ansiC(' LAST CALLERS ', 'magenta'), w) + '\n';
+    s += frameLine(ansiC('  who has been on this node most recently', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    if (!callers.length) s += frameLine(ansiC('  the log is empty — nobody has called yet', 'dim'), '', w) + '\n';
+    callers.forEach((c, i) => {
+      const text = ansiC('<' + bbsShortHost(c.host) + '>', 'magenta') + '  ' + ansiC('· last seen ' + (c.last ? fmtWhen(c.last) : '—'), 'dim');
+      s += frameLine(hitLine(i + 1, text, 'dialnode', c.host, 'magenta'), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  const COLAB_PHASE_LABELS = {
+    organizing: 'ORGANIZING — planning the split, opening a Warden project',
+    delegating: 'DELEGATING — workers running in parallel across the mesh',
+    combining:  'COMBINING — closing tasks, filing the report',
+  };
+
+  function renderColab() {
+    BBS_UI.items = [];
+    const w = BW;
+    const online = (SOCIAL.systems || []).filter(s => s.status === 'online' && !s.self);
+    let s = '\n' + frameTitle(ansiC(' ≡ COLAB — THE MESH WORKSHOP ', 'white'), w) + '\n';
+    s += frameLine(ansiC('  one task in — the mesh plans it, swarms it, files it', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    const crewLine = online.length ? online.map(x => bbsShortHost(x.hostname)).join(' · ').slice(0, w - 46) : '';
+    s += frameLine(ansiC('  CREW ', 'dim') + ansiC('you (sysop)', 'green') +
+      (online.length ? ansiC(' · ' + crewLine, 'amber') : ansiC(' · no friends online — solo run', 'gray')), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+
+    const st = BBS_UI.colabStatus;
+    if (st && st.phase && st.phase !== 'idle') {
+      s += frameLine(ansiC('  ► TASK: ', 'dim') + esc(String(st.task || '').slice(0, w - 14)), '', w) + '\n';
+      if (st.projectName) {
+        s += frameLine(ansiC('    ledger: ', 'gray') + ansiC(String(st.projectName).slice(0, 36), 'cyan') + ansiC(' → dash Projects', 'gray'), '', w) + '\n';
+      }
+      if (st.tree) {
+        s += frameLine(ansiC('    tree:   ', 'gray') + ansiC(String(st.tree).replace(/^\/home\/[^/]+/, '~').slice(0, w - 16), 'gray'), '', w) + '\n';
+      }
+      if (st.phase === 'error') {
+        s += frameLine(ansiC('  × ' + String(st.error || 'swarm failed').slice(0, w - 8), 'red'), '', w) + '\n';
+      } else if (st.phase !== 'done') {
+        s += frameLine('  <span class="blink">' + ansiC('► ' + (COLAB_PHASE_LABELS[st.phase] || st.phase), 'white') + '</span>', '', w) + '\n';
+      }
+      if ((st.workers || []).length) {
+        s += frameLine(' ', '', w) + '\n';
+        s += frameLine(ansiC('  STATE    WORKER       SUBTASK', 'dim'), '', w) + '\n';
+        st.workers.forEach((wk) => {
+          const who = wk.worker === 'local' ? 'this node' : bbsShortHost(wk.worker);
+          const elapsed = wk.elapsedMs ? ' ' + Math.round(wk.elapsedMs / 1000) + 's' : '';
+          const mark = wk.state === 'done' ? ansiC('DONE    ', 'green')
+            : wk.state === 'error' ? ansiC('ERR     ', 'red')
+            : wk.state === 'running' ? '<span class="blink">' + ansiC('RUNNING ', 'amber') + '</span>'
+            : ansiC('QUEUED  ', 'gray');
+          const titleW = Math.max(10, w - 26 - elapsed.length);
+          s += frameLine('  ' + mark + ' ' + ansiC(padR(esc(who), 11), wk.state === 'running' ? 'amber' : 'cyan') +
+            ansiC(esc(String(wk.title || '').slice(0, titleW)), wk.state === 'done' ? 'white' : 'gray') + ansiC(elapsed, 'dim'), '', w) + '\n';
+          if (wk.state !== 'queued' && wk.detail) {
+            s += frameLine(ansiC('           ' + esc(String(wk.detail).slice(0, w - 15)), 'gray'), '', w) + '\n';
+          }
+        });
+      }
+      if (st.phase === 'done' && st.report) {
+        s += '│' + hl(w) + '│\n';
+        for (const line of String(st.report).split('\n').slice(0, 36)) {
+          for (const seg of wrapText(line, w - 4)) s += '  ' + esc(seg) + '\n';
+        }
+        s += '│' + hl(w) + '│\n';
+        if (st.file) s += frameLine(ansiC('  FILED: ', 'dim') + ansiC(String(st.file).slice(0, w - 14), 'cyan'), '', w) + '\n';
+      }
+    } else {
+      s += frameLine(ansiC('  no run yet — press T and give the mesh a task', 'dim'), '', w) + '\n';
+    }
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC('  ARTIFACTS', 'cyan') + ansiC('  (filed reports)', 'dim'), '', w) + '\n';
+    const files = (SOCIAL.files || []).slice().sort((a, b) => ((a.mtime || '') < (b.mtime || '') ? 1 : -1)).slice(0, 8);
+    files.forEach((f, i) => {
+      s += frameLine(hitLine(i + 1, ansiC(String(f.name).slice(0, 36), 'cyan') + ansiC(' · ' + fmtSize(f.size) + ' · ' + fmtWhen(f.mtime), 'dim'), 'file', f.name, 'cyan'), '', w) + '\n';
+    });
+    if (!files.length) s += frameLine(ansiC('  (nothing filed yet)', 'gray'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderDial() {
+    BBS_UI.items = [];
+    const w = BW;
+    const systems = SOCIAL.systems || [];
+    let s = '\n' + frameTitle(ansiC(' DIAL DIRECTORY ', 'amber'), w) + '\n';
+    if (BBS_UI.dialStatus) s += frameLine(ansiC('  ' + BBS_UI.dialStatus, 'red'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    systems.forEach((sys, i) => {
+      const name = bbsShortHost(sys.hostname);
+      const on = sys.self || sys.status === 'online';
+      const stat = sys.self ? ansiC('[HOME] ', 'green') : (on ? ansiC('[UP]   ', 'green') : ansiC('[DOWN] ', 'red'));
+      const text = stat + ansiC(name, on ? 'amber' : 'gray') + '  ' + ansiC('· ' + (String(sys.profile || '').slice(0, 30) || 'no profile'), 'dim');
+      s += frameLine(hitLine(i + 1, text, 'dialnode', sys.self ? 'self' : sys.hostname, 'amber'), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderAutonomy() {
+    BBS_UI.items = [];
+    const w = BW;
+    let s = '\n' + frameTitle(ansiC(' AUTONOMY — THE IDLE SWEEP ', 'green'), w) + '\n';
+    s += frameLine(ansiC('  while you are away, the assigned specialist reads the BBS,', 'dim'), '', w) + '\n';
+    s += frameLine(ansiC('  replies where useful, and files anything worth keeping.', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC('  SWEEP      ', 'dim') + ansiC(BOTNET.enabled ? 'RUNNING' : 'OFF', BOTNET.enabled ? 'green' : 'red') + ansiC('     (E to toggle)', 'gray'), '', w) + '\n';
+    s += frameLine(ansiC('  SPECIALIST ', 'dim') + ansiC(String(BOTNET.agent || 'atlas').toUpperCase(), 'amber') + ansiC('     (A to switch atlas/vulkan)', 'gray'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  // ── doors ── the game room. All local play; FORTUNE dips into the message
+  // base for its cookies when there is material on the rack.
+  const DOOR_FORTUNES = [
+    'the modem giveth, and the carrier detect taketh away.',
+    'a watched node never dials.',
+    'he who posts last posts twice — the sweep always replies.',
+    'there are only two kinds of systems: those with backups, and those who will learn.',
+    'the best place to hide a good idea is on the ideas board.',
+    'if it compiles, commit; if it runs, celebrate quietly.',
+    'every 404 is a door somebody forgot to build.',
+    'uptime is a state of mind.',
+  ];
+  function pickFortune() {
+    const posts = (SOCIAL.posts || []).filter(p => p.board !== 'shoutbox' && (p.body || '').length > 40);
+    if (posts.length && Math.random() < 0.6) {
+      const p = posts[Math.floor(Math.random() * posts.length)];
+      return 'from ' + bbsShortHost(p.author_host) + ', somewhere on the board:\n\n“' + String(p.body).replace(/\s+/g, ' ').slice(0, 220) + '”';
+    }
+    return DOOR_FORTUNES[Math.floor(Math.random() * DOOR_FORTUNES.length)];
+  }
+
+  const HANGMAN_WORDS = ['MODEM', 'CARRIER', 'FIRMWARE', 'BAUD', 'PACKET', 'KERMIT', 'TELNET',
+    'KEYBOARD', 'TERMINAL', 'DOWNLOAD', 'SYSOP', 'LOGOUT', 'REBOOT', 'CURSOR', 'CRAYON',
+    'PHOSPHOR', 'SCANLINE', 'WILDCAT', 'FIDONET', 'PAGER', 'TURBINE', 'GATEWAY', 'HANDSHAKE'];
+  const HANGMAN_STAGES = [
+    ['', '', ''],
+    ['   |', '   |', '   |'],
+    [' +---+', '   |', '   |'],
+    [' +---+', ' O |', '   |'],
+    [' +---+', ' O |', '/| |'],
+    [' +---+', ' O |', '/|\\|'],
+    [' +---+', ' O |', '/|\\|'],
+  ];
+  const HANGMAN_LEGS = [' ', ' ', ' '];
+
+  function renderDoors() {
+    BBS_UI.items = [];
+    const w = BW;
+    let s = '\n' + frameTitle(ansiC(' DOORS — THE GAME ROOM ', 'red'), w) + '\n';
+    s += frameLine(ansiC('  games for the caller while the lines are busy', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    const doors = [
+      ['FORTUNE', 'door-fortune', 'a cookie from the rack'],
+      ['GUESS', 'door-guess', '1 to 100 — read the box\'s mind'],
+      ['HANGMAN', 'door-hangman', 'six strikes, one word'],
+      ['8-BALL', 'door-eightball', 'ask, shake, receive'],
+    ];
+    doors.forEach((d, i) => {
+      s += frameLine(hitLine(i + 1, ansiC(d[0], 'red'), d[1], '', 'red'), ansiC(d[2], 'gray'), w) + '\n';
+    });
+    // third-party doors — installed .html pages from the rack (max 5 shown)
+    const custom = (BBS_UI.doorsList || []).slice(0, 5);
+    if (custom.length) {
+      s += frameLine(' ', '', w) + '\n';
+      s += frameLine(ansiC('  THIRD-PARTY — from the door market', 'gray'), ansiC('launches in a tab', 'gray'), w) + '\n';
+      custom.forEach((d, i) => {
+        s += frameLine(hitLine(5 + i, ansiC(String(d.name).slice(0, 20).toUpperCase(), 'magenta'), 'door-open', d.file, 'magenta'),
+          ansiC(String(d.desc || d.file).slice(0, 26), 'gray'), w) + '\n';
+      });
+    } else {
+      s += frameLine(' ', '', w) + '\n';
+      s += frameLine(ansiC('  third-party rack is empty — install a .html from', 'gray'), '', w) + '\n';
+      s += frameLine(ansiC('  the file areas with [I] and it shows up here', 'gray'), '', w) + '\n';
+    }
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderFortune() {
+    BBS_UI.items = [];
+    const w = BW;
+    const text = (BBS_UI.door && BBS_UI.door.text) || pickFortune();
+    let s = '\n' + frameTitle(ansiC(' ♦ FORTUNE ', 'amber'), w) + '\n';
+    s += '│' + hl(w) + '│\n';
+    for (const line of String(text).split('\n')) {
+      for (const seg of wrapText(line, w - 6)) s += '  ' + ansiC(seg, 'amber') + '\n';
+      if (!line) s += '\n';
+    }
+    s += '│' + hl(w) + '│\n';
+    s += frameLine(ansiC('  [R] crack another cookie', 'dim'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderGuess() {
+    BBS_UI.items = [];
+    const w = BW;
+    const d = BBS_UI.door || { tries: 0, hint: 'the box has a number — 1 to 100', done: false };
+    let s = '\n' + frameTitle(ansiC(' ? GUESS — 1 TO 100 ', 'red'), w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC('  TRIES  ', 'dim') + ansiC(String(d.tries || 0), 'amber'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    for (const seg of wrapText(d.done ? 'SOLVED — the box concedes. Press N for a new round.' : (d.hint || ''), w - 6)) {
+      s += frameLine(ansiC('  ' + seg, d.done ? 'green' : 'white'), '', w) + '\n';
+    }
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC(d.done ? '  [N] new round' : '  type a guess below and hit enter', 'dim'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderHangman() {
+    BBS_UI.items = [];
+    const w = BW;
+    const d = BBS_UI.door || {};
+    const wrong = d.wrong || 0;
+    const art = HANGMAN_STAGES[Math.min(wrong, HANGMAN_STAGES.length - 1)];
+    const guessedWord = String(d.word || '').split('').map(ch => (d.guessed || '').includes(ch) ? ch : '·').join(' ');
+    const legs = wrong >= 6 ? '/\\' : wrong >= 3 ? '/' : '';
+    let s = '\n' + frameTitle(ansiC(' ≡ HANGMAN — ', 'red') + ansiC(String(d.wrongs || '') || '·', 'gray') + ansiC(' ', 'red'), w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    for (const a of art.slice(0, 2)) s += frameLine(ansiC('     ' + a, 'gray'), '', w) + '\n';
+    s += frameLine(ansiC('     ' + art[2].replace(/'/g, '') + (wrong >= 3 ? legs : ''), 'gray'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    s += center(ansiC(guessedWord, d.done === 'win' ? 'green' : 'white'), w) + '\n\n';
+    s += frameLine(ansiC('  MISSES  ', 'dim') + ansiC(String(d.wrongLetters || '—'), 'red') + ansiC('   (' + wrong + '/6)', 'gray'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    if (d.done === 'win') s += frameLine(ansiC('  SAVED — press N for another word', 'green'), '', w) + '\n';
+    else if (d.done === 'lose') s += frameLine(ansiC('  HANGED — the word was ' + (d.word || '?') + ' · [N] again', 'red'), '', w) + '\n';
+    else s += frameLine(ansiC('  press a letter key to guess', 'dim'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  const EIGHTBALL_ANSWERS = ['IT IS CERTAIN', 'WITHOUT A DOUBT', 'SIGNS POINT TO YES', 'ASK AGAIN LATER',
+    'CANNOT PREDICT NOW', 'CONCENTRATE AND ASK AGAIN', 'MY REPLY IS NO', 'OUTLOOK GRIM',
+    'THE MESH SAYS YES', 'CARRIER LOST ON THAT ONE', 'AFFIRMATIVE', 'NEGATIVE'];
+  function renderEightball() {
+    BBS_UI.items = [];
+    const w = BW;
+    const d = BBS_UI.door || {};
+    let s = '\n' + frameTitle(ansiC(' ● MAGIC 8-BALL ', 'magenta'), w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    const ball = ['    ______', '  /        \\', ' |   ____   |', ' |  /    \\  |', ' |  \\  ' + (d.answer ? '▲▲' : '  ') + '  /  |', ' |   \\____/   |', '  \\________/'];
+    for (const l of ball) s += center(ansiC(l, 'magenta'), w) + '\n';
+    s += '\n';
+    if (d.question) for (const seg of wrapText('you asked: ' + d.question, w - 6)) s += frameLine(ansiC('  ' + seg, 'dim'), '', w) + '\n';
+    if (d.answer) s += frameLine(' ', '', w) + '\n' + center(ansiC('► ' + d.answer + ' ◄', 'amber'), w) + '\n';
+    else s += frameLine(ansiC('  press S and ask your question', 'dim'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  // ── sysop / search ──
+  function renderSysop() {
+    BBS_UI.items = [];
+    const w = BW;
+    const boards = SOCIAL.boards || [];
+    const posts = SOCIAL.posts || [];
+    const threads = SOCIAL.threads || [];
+    const files = SOCIAL.files || [];
+    const bytes = files.reduce((n, f) => n + (Number(f.size) || 0), 0);
+    const maxB = Math.max(1, ...boards.map(b => posts.filter(p => p.board === b.name).length));
+    const callers = recentCallers().slice(0, 3);
+    let s = '\n' + frameTitle(ansiC(' SYSOP — THE NODE LEDGER ', 'white'), w) + '\n';
+    s += frameLine(ansiC('  the board at a glance — what is on the disk right now', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC('  MESSAGES ' + posts.length, 'cyan') + '  ' + ansiC('THREADS ' + threads.length, 'cyan') + '  ' + ansiC('FILES ' + files.length + ' (' + fmtSize(bytes) + ')', 'cyan'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    boards.forEach(b => {
+      const n = posts.filter(p => p.board === b.name).length;
+      const bar = '█'.repeat(Math.round((n / maxB) * 18)).padEnd(18, '░');
+      const th = boardTheme(b.name);
+      s += frameLine('  ' + ansiC(padR(th.label, 12), th.c) + ansiC(bar, th.c) + ' ' + ansiC(String(n), 'white'), '', w) + '\n';
+    });
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(ansiC('  SWEEP ', 'dim') + ansiC(BOTNET.enabled ? 'ON · ' + String(BOTNET.agent || 'atlas') : 'OFF', BOTNET.enabled ? 'green' : 'red') +
+      ansiC('      CALLERS ' + (callers.map(c => bbsShortHost(c.host)).join(' · ') || 'none yet').slice(0, 30), 'gray'), '', w) + '\n';
+    const cs = BBS_UI.colabStatus;
+    if (cs && cs.phase && cs.phase !== 'idle') {
+      s += frameLine(ansiC('  LAST SWARM ', 'dim') + ansiC(String(cs.task || '').slice(0, 30), 'white') + ansiC('  → ' + cs.phase, cs.phase === 'error' ? 'red' : 'gray'), '', w) + '\n';
+    }
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderSearch() {
+    BBS_UI.items = [];
+    const w = BW;
+    const hits = BBS_UI.search || [];
+    let s = '\n' + frameTitle(ansiC(' SEARCH — GREP THE MESSAGE BASE ', 'green'), w) + '\n';
+    if (BBS_UI.searchTerm) s += frameLine(ansiC('  term: "' + BBS_UI.searchTerm + '"', 'dim'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    if (!hits.length) s += frameLine(ansiC(BBS_UI.searchTerm ? '  no hits — [F] to search again' : '  press F and pick a term', 'dim'), '', w) + '\n';
+    hits.forEach((h, i) => {
+      const th = boardTheme(h.board);
+      const text = ansiC(th.icon + ' ', th.c) + ansiC(String(h.title || '(shout)').slice(0, 30), th.c) + '  ' + ansiC(String(h.excerpt).slice(0, 24) + '…', 'dim');
+      s += frameLine(hitLine(i + 1, text, 'search-hit', h.board + '|' + (h.thread_id || ''), th.c), '', w) + '\n';
+    });
+    s += frameClose(w);
+    return s;
+  }
+
+  function renderNoCarrier() {
+    BBS_UI.items = [];
+    const w = BW;
+    const host = bbsShortHost(SOCIAL_NODE);
+    let s = '\n' + frameTitle(ansiC(' NO CARRIER ', 'red'), w) + '\n';
+    s += frameLine(ansiC('  ' + host + ' is not answering — the line is dead.', 'red'), '', w) + '\n';
+    s += frameLine(' ', '', w) + '\n';
+    s += frameLine(hitLine(1, ansiC('DIAL DIRECTORY', 'amber'), 'dial'), '', w) + '\n';
+    s += frameLine(hitLine(2, ansiC('HANG UP (back to this node)', 'green'), 'hangup'), '', w) + '\n';
+    s += frameClose(w);
+    return s;
+  }
+
+  const RENDER = {
+    welcome: renderWelcome, menu: renderMenu, conferences: renderConferences,
+    shout: renderShout, threads: renderThreads, message: renderMessage,
+    files: renderFiles, file: renderFile, online: renderOnline,
+    callers: renderCallers, colab: renderColab, dial: renderDial,
+    autonomy: renderAutonomy, nocarrier: renderNoCarrier,
+    doors: renderDoors, fortune: renderFortune, guess: renderGuess,
+    hangman: renderHangman, eightball: renderEightball,
+    sysop: renderSysop, search: renderSearch,
+  };
+  const KEYS = {
+    welcome: 'any key — continue',
+    menu: '[1-9] select · [A] autonomy · [Q] hang up',
+    conferences: '[1-9] open a room · [Q] back',
+    shout: '[R] shout · [Q] back',
+    threads: '[1-9] open thread · [N] new thread · [Q] back',
+    message: '[R] reply · [N]ext · [P]rev · [D] del · [Q] back',
+    files: '[1-9] open · [S] save · [U] upload · [Q] back',
+    file: '[D] delete · [I] install .html as a door · [Q] back',
+    online: '[1-9] dial a node · [Q] back',
+    callers: '[1-9] dial a caller · [Q] back',
+    colab: '[T] new task · [1-9] open an artifact · [Q] back',
+    dial: '[1-9] dial · [Q] back',
+    autonomy: '[E] toggle sweep · [A] switch specialist · [Q] back',
+    doors: '[1-9] play a door · [Q] back',
+    fortune: '[R] another cookie · [Q] back',
+    guess: 'type a guess · [N] new round · [Q] back',
+    hangman: '[A-Z] guess a letter · [N] new word · [Q] back',
+    eightball: '[S] shake · [Q] back',
+    sysop: '[Q] back',
+    search: '[1-9] open a hit · [F] new search · [Q] back',
+  };
+
+  function draw() {
+    const frame = $('bbsFrame');
+    if (!frame) return;
+    const dead = SOCIAL_NODE !== 'self' && SOCIAL.online === false &&
+      !['welcome', 'menu', 'dial', 'autonomy', 'colab', 'doors', 'fortune', 'guess', 'hangman', 'eightball', 'sysop'].includes(SCREEN);
+    frame.innerHTML = dead ? renderNoCarrier() : (RENDER[SCREEN] || renderMenu)();
+    frame.scrollTop = 0;
+    $('bbsKeys').textContent = dead ? '[1] dial directory · [2] hang up · [Q] back' : (KEYS[SCREEN] || KEYS.menu);
+    $('bbsCommand').classList.toggle('prompting', !!BBS_UI.prompt);
+    if (!BBS_UI.prompt) $('bbsInput').value = '';
+    // modem activity LED — blinks amber while a colab swarm is on the wire
+    const led = $('bbsLed');
+    if (led) led.classList.toggle('busy', !!BBS_UI.colabBusy);
+  }
+
+  // ── navigation ──
+  function goto(screen) { SCREEN = screen; draw(); }
+  function back() {
+    const parent = {
+      welcome: 'welcome', menu: 'welcome', conferences: 'menu', shout: 'conferences',
+      threads: 'conferences', message: 'threads', files: 'menu', file: 'files',
+      online: 'menu', callers: 'menu', colab: 'menu', dial: 'menu', autonomy: 'menu',
+      doors: 'menu', sysop: 'menu', search: 'menu',
+      fortune: 'doors', guess: 'doors', hangman: 'doors', eightball: 'doors',
+    };
+    goto(parent[SCREEN] || 'menu');
+  }
+  function runAct(act, arg) {
+    switch (act) {
+      case 'conferences': goto('conferences'); break;
+      case 'files': goto('files'); break;
+      case 'online': goto('online'); break;
+      case 'callers': goto('callers'); break;
+      case 'colab': goto('colab'); void pollColab(); break;
+      case 'dial': goto('dial'); break;
+      case 'autonomy': goto('autonomy'); break;
+      case 'doors':
+        void (async () => {
+          try {
+            const d = await api('/api/friends/bbs/doors');
+            BBS_UI.doorsList = (d && d.doors) || [];
+          } catch { BBS_UI.doorsList = []; }
+          goto('doors');
+        })();
+        break;
+      case 'door-open':
+        window.open('/api/friends/bbs/door/' + encodeURIComponent(arg), '_blank');
+        $('bbsStatus').textContent = 'LAUNCHED: ' + arg;
+        break;
+      case 'door-install': {
+        if (SOCIAL_NODE !== 'self' || !BBS_UI.file) { $('bbsStatus').textContent = 'a remote file area is read-only from here'; break; }
+        const name = BBS_UI.file.name;
+        void (async () => {
+          try {
+            const r = await postJson('/api/friends/bbs/door-install', { name });
+            $('bbsStatus').textContent = (r && r.ok) ? 'INSTALLED AS DOOR: ' + name + ' — it is on the DOORS menu now' : 'FAILED: ' + ((r && r.error) || 'unknown');
+          } catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+        })();
+        break;
+      }
+      case 'sysop': goto('sysop'); break;
+      case 'search': openPrompt('search', { placeholder: 'search messages…' }); break;
+      case 'door-fortune': BBS_UI.door = { kind: 'fortune', text: pickFortune() }; goto('fortune'); break;
+      case 'door-guess':
+        BBS_UI.door = { kind: 'guess', n: 1 + Math.floor(Math.random() * 100), tries: 0, hint: 'the box has thought of a number from 1 to 100', done: false };
+        goto('guess');
+        openPrompt('guess-num', { placeholder: 'your guess (1-100)…' });
+        break;
+      case 'door-hangman': {
+        const word = HANGMAN_WORDS[Math.floor(Math.random() * HANGMAN_WORDS.length)];
+        BBS_UI.door = { kind: 'hangman', word, guessed: '', wrong: 0, wrongLetters: '', done: '' };
+        goto('hangman');
+        break;
+      }
+      case 'door-eightball': BBS_UI.door = { kind: 'eightball', question: '', answer: '' }; goto('eightball'); break;
+      case 'hang-letter': {
+        const d = BBS_UI.door;
+        if (!d || d.kind !== 'hangman' || d.done) break;
+        const ch = String(arg || '').toUpperCase();
+        if (!ch || d.guessed.includes(ch) || d.wrongLetters.includes(ch)) break;
+        if (d.word.includes(ch)) {
+          d.guessed += ch;
+          if (d.word.split('').every(c => d.guessed.includes(c))) d.done = 'win';
+        } else {
+          d.wrong = (d.wrong || 0) + 1;
+          d.wrongLetters = (d.wrongLetters ? d.wrongLetters + ' ' : '') + ch;
+          if (d.wrong >= 6) d.done = 'lose';
+        }
+        draw();
+        break;
+      }
+      case 'delmsg': {
+        if (SOCIAL_NODE !== 'self') { $('bbsStatus').textContent = 'remote messages are read-only from here'; break; }
+        const posts = currentThreadPosts();
+        const idx = Math.max(0, Math.min(BBS_UI.msgIndex, posts.length - 1));
+        const p = posts[idx];
+        if (!p) break;
+        if (BBS_UI.confirmDelete === p.id && Date.now() - (BBS_UI.confirmAt || 0) < 5000) {
+          BBS_UI.confirmDelete = '';
+          void (async () => {
+            try {
+              const r = await postJson('/api/friends/bbs/post-delete', { id: p.id });
+              $('bbsStatus').textContent = (r && r.ok) ? 'DELETED message ' + (idx + 1) + ' from this thread' : 'FAILED: ' + ((r && r.error) || 'unknown');
+            } catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+            await refreshSocial();
+            if (currentThreadPosts().length === 0) goto('threads');
+            else { BBS_UI.msgIndex = Math.min(idx, currentThreadPosts().length - 1); draw(); }
+          })();
+        } else {
+          BBS_UI.confirmDelete = p.id; BBS_UI.confirmAt = Date.now();
+          $('bbsStatus').textContent = 'press D again to delete this message';
+          draw();
+        }
+        break;
+      }
+      case 'search-hit': {
+        const [board, tid] = String(arg || '').split('|');
+        if (!board) break;
+        SOCIAL_BOARD = board;
+        if (tid) { SOCIAL_THREAD = tid; BBS_UI.msgIndex = 0; goto('message'); }
+        else goto(board === 'shoutbox' ? 'shout' : 'threads');
+        break;
+      }
+      case 'board':
+        SOCIAL_BOARD = arg; SOCIAL_THREAD = null; BBS_UI.msgIndex = 0;
+        goto(arg === 'shoutbox' ? 'shout' : 'threads');
+        break;
+      case 'thread': SOCIAL_THREAD = arg; BBS_UI.msgIndex = 0; goto('message'); break;
+      case 'file': viewFile(arg); break;
+      case 'dialnode': bbsDial(arg); break;
+      case 'hangup':
+        SOCIAL_NODE = 'self'; SOCIAL_BOARD = 'shoutbox'; SOCIAL_THREAD = null;
+        BBS_UI.dialStatus = '';
+        goto('menu');
+        void refreshSocial();
+        break;
+      case 'msgnext': BBS_UI.msgIndex++; draw(); break;
+      case 'msgprev': BBS_UI.msgIndex = Math.max(0, BBS_UI.msgIndex - 1); draw(); break;
+      case 'reply': openPrompt('reply', { placeholder: 'reply to this thread…' }); break;
+      case 'newthread': openPrompt('thread-title', { placeholder: 'thread title…' }); break;
+      case 'shoutnow': openPrompt('shout', { placeholder: 'shout into the channel…' }); break;
+      case 'colabnew': openPrompt('colab', { placeholder: 'describe the task for the mesh…' }); break;
+      case 'savefile': openPrompt('file-name', { placeholder: 'file name…' }); break;
+      case 'uploadfile':
+        if (SOCIAL_NODE !== 'self') { $('bbsStatus').textContent = 'a remote file area is read-only from here'; break; }
+        $('bbsUpload')?.click();
+        break;
+      case 'delfile': {
+        if (SOCIAL_NODE !== 'self' || !BBS_UI.file) { $('bbsStatus').textContent = 'a remote file area is read-only from here'; break; }
+        const name = BBS_UI.file.name;
+        if (BBS_UI.confirmDelete === name && Date.now() - (BBS_UI.confirmAt || 0) < 5000) {
+          BBS_UI.confirmDelete = '';
+          void (async () => {
+            try {
+              const r = await postJson('/api/friends/bbs/file-delete', { name });
+              $('bbsStatus').textContent = (r && r.ok) ? 'DELETED: ' + name : 'FAILED: ' + ((r && r.error) || 'unknown');
+            } catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+            BBS_UI.file = null;
+            await refreshSocial();
+            goto('files');
+          })();
+        } else {
+          BBS_UI.confirmDelete = name; BBS_UI.confirmAt = Date.now();
+          $('bbsStatus').textContent = 'press D again to delete ' + name;
+          draw();
+        }
+        break;
+      }
+      case 'autonomy-toggle': void setBotnet({ enabled: !BOTNET.enabled }); break;
+      case 'autonomy-agent': void setBotnet({ agent: (BOTNET.agent === 'vulkan') ? 'atlas' : 'vulkan' }); break;
+      case 'back': back(); break;
+      case 'quit': goto('welcome'); break;
+    }
+  }
+
+  // ── the command-bar input (reply / shout / new thread / colab / save file) ──
+  function openPrompt(kind, opts) {
+    BBS_UI.prompt = Object.assign({ kind }, opts || {});
+    const inp = $('bbsInput');
+    if (!inp) return;
+    inp.value = '';
+    inp.placeholder = (opts && opts.placeholder) || '>';
+    $('bbsCommand').classList.add('prompting');
+    inp.focus();
+  }
+  function cancelPrompt() {
+    BBS_UI.prompt = null;
+    $('bbsCommand').classList.remove('prompting');
+    $('bbsInput').value = '';
+    draw();
+  }
+  async function handlePromptSubmit() {
+    const p = BBS_UI.prompt;
+    if (!p) return;
+    const text = ($('bbsInput').value || '').trim();
+    if (!text) { cancelPrompt(); return; }
+    BBS_UI.prompt = null;
+    $('bbsCommand').classList.remove('prompting');
+    $('bbsInput').value = '';
+    switch (p.kind) {
+      case 'shout': await bbsPost(text, {}); break;
+      case 'reply': if (SOCIAL_THREAD) await bbsPost(text, { thread_id: SOCIAL_THREAD }); break;
+      case 'thread-title':
+        BBS_UI.threadTitle = text.slice(0, 120);
+        openPrompt('thread-body', { placeholder: 'first post…' });
+        return;
+      case 'thread-body':
+        await bbsPost(text, { title: BBS_UI.threadTitle });
+        BBS_UI.threadTitle = '';
+        break;
+      case 'colab':
+        startColab(text.slice(0, 2000));
+        return; // the colab screen shows the run live
+      case 'file-name':
+        BBS_UI.saveFileName = text.slice(0, 120);
+        openPrompt('file-body', { placeholder: 'contents of the file…' });
+        return;
+      case 'file-body':
+        await saveFile(BBS_UI.saveFileName || 'note.txt', text);
+        BBS_UI.saveFileName = '';
+        break;
+      case 'guess-num': {
+        const d = BBS_UI.door || {};
+        const g = parseInt(text, 10);
+        if (isNaN(g) || g < 1 || g > 100) { d.hint = 'a number from 1 to 100, caller — try again'; }
+        else {
+          d.tries = (d.tries || 0) + 1;
+          if (g === d.n) d.done = true;
+          else d.hint = g < d.n
+            ? g + ' is TOO LOW — the box hums at a higher frequency'
+            : g + ' is TOO HIGH — come down a little';
+        }
+        draw();
+        if (!d.done && SCREEN === 'guess') { openPrompt('guess-num', { placeholder: 'your guess (1-100)…' }); return; }
+        break;
+      }
+      case 'eightball': {
+        BBS_UI.door = { kind: 'eightball', question: text.slice(0, 140), answer: EIGHTBALL_ANSWERS[Math.floor(Math.random() * EIGHTBALL_ANSWERS.length)] };
+        break;
+      }
+      case 'search': {
+        const term = text.toLowerCase().slice(0, 80);
+        BBS_UI.searchTerm = text.slice(0, 80);
+        const threads = SOCIAL.threads || [];
+        const hits = [];
+        for (const p of (SOCIAL.posts || [])) {
+          if (!(p.body || '').toLowerCase().includes(term)) continue;
+          if (hits.some(h => h.thread_id && h.thread_id === p.thread_id)) continue;
+          const t = threads.find(x => x.id === p.thread_id);
+          const pos = p.body.toLowerCase().indexOf(term);
+          hits.push({
+            board: p.board, thread_id: p.thread_id || '',
+            title: t ? t.title : (p.board === 'shoutbox' ? '(shoutbox)' : p.board),
+            excerpt: String(p.body).replace(/\s+/g, ' ').slice(Math.max(0, pos - 6), pos + 30),
+          });
+          if (hits.length >= 9) break;
+        }
+        BBS_UI.search = hits;
+        goto('search');
+        return;
+      }
+    }
+    draw();
+  }
+
+  // one global keydown — maps keys by screen; never fires while the command
+  // input is open or the social view is not on screen
+  function onBbsKey(e) {
+    if (STATE.currentView !== 'social') return;
+    if (BBS_UI.prompt) return;
+    if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const k = e.key;
+    if (SCREEN === 'welcome') { goto('menu'); e.preventDefault(); return; }
+    if (/^[1-9]$/.test(k)) {
+      const it = (BBS_UI.items || [])[Number(k) - 1];
+      if (it) { runAct(it.act, it.arg); e.preventDefault(); }
+      return;
+    }
+    const key = String(k).toLowerCase();
+    if (SCREEN === 'menu') {
+      if (key === 'a') { goto('autonomy'); e.preventDefault(); }
+      else if (key === 'q') { goto('welcome'); e.preventDefault(); }
+      return;
+    }
+    if (key === 'q' || key === 'escape' || key === 'backspace') { back(); e.preventDefault(); return; }
+    if (SCREEN === 'shout' && (key === 'r' || key === 'enter')) { runAct('shoutnow'); e.preventDefault(); return; }
+    if (SCREEN === 'threads' && key === 'n') { runAct('newthread'); e.preventDefault(); return; }
+    if (SCREEN === 'message') {
+      if (key === 'r') { runAct('reply'); e.preventDefault(); }
+      else if (key === 'n') { runAct('msgnext'); e.preventDefault(); }
+      else if (key === 'p') { runAct('msgprev'); e.preventDefault(); }
+      else if (key === 'd') { runAct('delmsg'); e.preventDefault(); }
+      return;
+    }
+    if (SCREEN === 'files' && key === 's') { runAct('savefile'); e.preventDefault(); return; }
+    if (SCREEN === 'files' && key === 'u') { runAct('uploadfile'); e.preventDefault(); return; }
+    if (SCREEN === 'file' && key === 'd') { runAct('delfile'); e.preventDefault(); return; }
+    if (SCREEN === 'file' && key === 'i') { runAct('door-install'); e.preventDefault(); return; }
+    if (SCREEN === 'colab' && (key === 't' || key === 'enter')) { runAct('colabnew'); e.preventDefault(); return; }
+    if (SCREEN === 'fortune' && (key === 'r' || key === 'enter')) { runAct('door-fortune'); e.preventDefault(); return; }
+    if (SCREEN === 'guess' && key === 'n') { runAct('door-guess'); e.preventDefault(); return; }
+    if (SCREEN === 'hangman') {
+      if (key === 'n' && BBS_UI.door && BBS_UI.door.done) { runAct('door-hangman'); e.preventDefault(); return; }
+      if (/^[a-z]$/.test(key)) { runAct('hang-letter', key); e.preventDefault(); }
+      return;
+    }
+    if (SCREEN === 'eightball' && key === 's') { openPrompt('eightball', { placeholder: 'ask the ball…' }); e.preventDefault(); return; }
+    if (SCREEN === 'search' && key === 'f') { runAct('search'); e.preventDefault(); return; }
+    if (SCREEN === 'autonomy') {
+      if (key === 'e') { runAct('autonomy-toggle'); e.preventDefault(); }
+      else if (key === 'a') { runAct('autonomy-agent'); e.preventDefault(); }
+      return;
+    }
+  }
+
+  async function bbsPost(bodyText, opts) {
+    opts = opts || {};
+    const board = opts.board || SOCIAL_BOARD;
+    try {
+      let r;
+      if (SOCIAL_NODE === 'self') {
+        r = await postJson('/api/friends/bbs/new', Object.assign({ board: board, body: bodyText }, opts));
+      } else {
+        r = await postJson('/api/friends/bbs/dial/' + encodeURIComponent(SOCIAL_NODE) + '/post', Object.assign({ board: board, body: bodyText }, opts));
+      }
+      if (r && r.ok) {
+        $('bbsStatus').textContent = 'POSTED to ' + bbsShortHost(r.host || SOCIAL_NODE);
+      } else {
+        $('bbsStatus').textContent = 'FAILED: ' + ((r && r.error) || 'unknown');
+      }
+    } catch (e) {
+      $('bbsStatus').textContent = 'FAILED: ' + e.message;
+    }
+    await refreshSocial();
+  }
+
+  async function bbsDial(node) {
+    const target = (SOCIAL.systems || []).find(s => (node === 'self' && s.self) || s.hostname === node);
+    const offline = node !== 'self' && target && target.status !== 'online';
+    SOCIAL_NODE = node;
+    SOCIAL_BOARD = 'shoutbox';
+    SOCIAL_THREAD = null;
+    BBS_UI.msgIndex = 0;
+    BBS_UI.dialStatus = '';
+    if (offline) {
+      BBS_UI.dialStatus = 'NO CARRIER — ' + bbsShortHost(node) + ' is not answering';
+      $('bbsStatus').textContent = 'NO CARRIER';
+      goto('dial');
+      return;
+    }
+    $('bbsStatus').textContent = node === 'self' ? 'ONLINE' : 'DIALING ' + bbsShortHost(node) + '…';
+    await refreshSocial();
+    if (SOCIAL.online === false) {
+      BBS_UI.dialStatus = 'NO CARRIER — ' + bbsShortHost(node) + ' dropped the line';
+      goto('dial');
+    } else {
+      goto('shout');
+    }
+  }
+
+  async function viewFile(name) {
+    try {
+      const d = (SOCIAL_NODE === 'self')
+        ? await api('/api/friends/bbs/file/' + encodeURIComponent(name))
+        : await api('/api/friends/bbs/dial/' + encodeURIComponent(SOCIAL_NODE) + '/file/' + encodeURIComponent(name));
+      if (d && d.ok) {
+        let content = d.content || '';
+        // binary upload shown as bytes note, not mojibake on the tube
+        if (content.slice(0, 2048).includes('')) content = '[ binary file — ' + content.length + ' bytes — not shown on the tube ]';
+        BBS_UI.file = { name, content };
+        $('bbsStatus').textContent = 'FILE: ' + name;
+        goto('file');
+      } else {
+        $('bbsStatus').textContent = 'FAILED: ' + ((d && d.error) || 'unknown');
+      }
+    } catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+  }
+
+  async function saveFile(name, content) {
+    try {
+      const r = await postJson('/api/friends/bbs/file-save', { name, content });
+      if (r && r.ok) $('bbsStatus').textContent = 'SAVED: ' + (r.name || name);
+      else $('bbsStatus').textContent = 'FAILED: ' + ((r && r.error) || 'unknown');
+    } catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+    await refreshSocial();
+    goto('files');
+  }
+
+  // Colab run: POST only STARTS the swarm (it runs for minutes) — poll the
+  // status endpoint for the live ledger: planner phase, per-worker states,
+  // the filed report. The host also mirrors the run as a Warden project.
+  let colabPollTimer = null;
+  async function pollColab() {
+    try {
+      const st = await api('/api/friends/colab/status');
+      if (!st || !st.ok) return;
+      BBS_UI.colabStatus = st;
+      BBS_UI.colabBusy = !!st.busy;
+      if (st.busy && !colabPollTimer) colabPollTimer = setInterval(pollColab, 2000);
+      if (!st.busy && (st.phase === 'done' || st.phase === 'error')) {
+        if (colabPollTimer) { clearInterval(colabPollTimer); colabPollTimer = null; }
+        await refreshSocial(); // the new artifact lands in the file areas
+      }
+      if (STATE.currentView === 'social') draw();
+    } catch { /* transient — the next poll catches up */ }
+  }
+  async function startColab(task) {
+    try {
+      const r = await postJson('/api/friends/colab', { task });
+      if (!r || !r.ok) {
+        BBS_UI.colabBusy = false;
+        BBS_UI.colabStatus = { phase: 'error', busy: false, task, error: (r && r.error) || 'could not start the swarm', workers: [] };
+        draw();
+        return;
+      }
+      BBS_UI.colabBusy = true;
+      BBS_UI.colabStatus = { phase: 'organizing', busy: true, task, workers: [] };
+      draw();
+      void pollColab();
+    } catch (e) {
+      BBS_UI.colabBusy = false;
+      BBS_UI.colabStatus = { phase: 'error', busy: false, task, error: e.message, workers: [] };
+      draw();
+    }
+  }
+
+  // BotNet autonomy — which specialist runs the idle sweep, and whether it runs at all.
+  let BOTNET = { enabled: true, agent: 'atlas' };
+  async function loadBotnet() {
+    try { BOTNET = await api('/api/friends/botnet'); } catch {}
+    if (STATE.currentView === 'social') draw();
+  }
+  async function setBotnet(patch) {
+    try { BOTNET = await postJson('/api/friends/botnet', patch); }
+    catch (e) { $('bbsStatus').textContent = 'FAILED: ' + e.message; }
+    draw();
+  }
+
   function renderAccounts() {
     const oauthActions = $('oauthActions');
     const oauthList = $('oauthList');
@@ -1669,7 +3208,7 @@
       imapList.innerHTML = '<div class="account-empty">No IMAP/SMTP accounts.</div>';
     } else {
       imapList.innerHTML = ACCOUNTS.imap.map(a => {
-        return '<div class="account-card" data-imap-id="' + escAttr(a.id) + '" data-readonly="' + (a.read_only ? 'true' : 'false') + '" data-name="' + escAttr(a.name) + '" data-email="' + escAttr(a.email) + '" data-imap-host="' + escAttr(a.imap_host) + '" data-imap-port="' + escAttr(a.imap_port || '') + '" data-smtp-host="' + escAttr(a.smtp_host) + '" data-smtp-port="' + escAttr(a.smtp_port || '') + '" data-username="' + escAttr(a.username) + '" data-use-tls="' + (a.use_tls ? 'true' : 'false') + '" data-enabled="' + (a.enabled ? 'true' : 'false') + '" data-password="">' +
+        return '<div class="account-card" data-imap-id="' + escAttr(a.id) + '" data-readonly="' + (a.read_only ? 'true' : 'false') + '" data-name="' + escAttr(a.name) + '" data-email="' + escAttr(a.email) + '" data-imap-host="' + escAttr(a.imap_host) + '" data-imap-port="' + escAttr(a.imap_port || '') + '" data-smtp-host="' + escAttr(a.smtp_host) + '" data-smtp-port="' + escAttr(a.smtp_port || '') + '" data-username="' + escAttr(a.username) + '" data-use-tls="' + (a.use_tls ? 'true' : 'false') + '" data-enabled="' + (a.enabled ? 'true' : 'false') + '" data-outbound-guard="' + (a.outbound_guard ? 'true' : 'false') + '" data-outbound-allowlist="' + escAttr(a.outbound_allowlist || '') + '" data-outbound-max-recipients="' + escAttr(String(a.outbound_max_recipients || 0)) + '" data-password="">' +
           '<span class="badge">@</span>' +
           '<div class="info"><div class="line">' + esc(a.name || a.email) + '</div>' +
           '<div class="meta">' + esc(a.email) + ' · IMAP ' + esc(a.imap_host) + ' · ' + (a.read_only ? 'Read only' : 'Send enabled') + '</div></div>' +
@@ -1710,7 +3249,8 @@
       html = '<div class="drawer-form">' +
         '<p class="dim" style="font-size:11px;margin-bottom:10px">1. Message @BotFather on Telegram, send /newbot, and copy the API token. 2. Paste it below and click Connect. 3. Send /start to your bot on Telegram to pair.</p>' +
         '<label>Bot token</label><input type="password" class="input" id="chToken" value="" placeholder="123456:ABC...">' +
-        (ch?.chatId ? '<p class="dim" style="font-size:11px;margin:4px 0">Paired chat: <code>' + esc(ch.chatId) + '</code></p>' : '<p class="dim" style="font-size:11px;margin:4px 0">Not paired yet — send /start to your bot on Telegram</p>') +
+        '<label>Chat ID</label><input class="input" id="chChatId" value="' + escAttr(ch?.chatId || '') + '" placeholder="e.g. 6579797280">' +
+        '<p class="dim" style="font-size:11px;margin:4px 0">The chat the bot listens on. Add the bot to a group and /start there — it replies with that chat\'s id to paste here. Leave the token blank to keep the current one.</p>' +
         '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><button class="btn btn-primary btn-sm" id="btnSaveChannel">Connect</button></div>' +
       '</div>';
     } else if (type === 'slack') {
@@ -1736,13 +3276,17 @@
 
   async function saveChannel(type) {
     const token = $('chToken').value.trim();
-    if (!token) { toast('Token required', 'warn'); return; }
-    const body = { token };
+    const body = {};
+    if (token) body.token = token;
     if (type === 'telegram') {
       const chatId = $('chChatId')?.value?.trim();
       if (chatId) body.chatId = chatId;
     }
     if (type === 'slack') body.channelId = $('chChannelId').value.trim();
+    // Telegram: allow editing just the Chat ID without re-entering the bot token.
+    if (!body.token && !(type === 'telegram' && body.chatId)) {
+      toast('Token required', 'warn'); return;
+    }
     try {
       const d = await postJson('/api/channels/' + type, body);
       if (d.ok) { toast(type + ' connected', 'success'); closeDrawer(); await refreshAccounts(); }
@@ -1805,6 +3349,7 @@
     const d = dataset || {};
     const title = isNew ? 'Add IMAP/SMTP Account' : 'Edit Account';
     const html = '<div class="drawer-form">' +
+      '<div style="margin-bottom:10px"><button class="btn btn-ghost btn-sm" id="btnGmailPreset" type="button">⭐ Pre-fill for Gmail</button></div>' +
       '<label>Name</label><input class="input" id="imapName" value="' + escAttr(d.name || '') + '" placeholder="My Email">' +
       '<label>Email</label><input class="input" id="imapEmail" value="' + escAttr(d.email || '') + '" placeholder="me@example.com">' +
       '<label>IMAP host</label><input class="input" id="imapHost" value="' + escAttr(d.imapHost || '') + '" placeholder="imap.example.com">' +
@@ -1815,6 +3360,9 @@
       (isNew ? '<label>Password</label><input type="password" class="input" id="imapPassword" placeholder="Required for new account">' : '<label>New password (leave blank to keep)</label><input type="password" class="input" id="imapPassword" placeholder="">') +
       '<label><input type="checkbox" id="imapUseTls" ' + (d.useTls !== 'false' ? 'checked' : '') + '> Use TLS</label>' +
       '<label><input type="checkbox" id="imapReadOnly" ' + (d.readOnly !== 'false' ? 'checked' : '') + '> Read only</label>' +
+      '<label style="margin-top:8px"><input type="checkbox" id="imapOutboundGuard" ' + (d.outboundGuard === 'true' ? 'checked' : '') + '> Limit who this account can email</label>' +
+      '<label>Allowed recipients (one per line)</label><textarea class="input" id="imapAllowlist" rows="3" placeholder="daughter@example.com&#10;doctor@example.com">' + escAttr(d.outboundAllowlist || '') + '</textarea>' +
+      '<label>Max recipients per message (0 = no cap)</label><input class="input" id="imapMaxRecipients" value="' + escAttr(d.outboundMaxRecipients || '0') + '" placeholder="0">' +
       '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
         (isNew ? '' : '<button class="btn btn-ghost btn-sm" id="btnTestImap">Test</button>') +
         '<button class="btn btn-primary btn-sm" id="btnSaveImap">Save</button>' +
@@ -1824,6 +3372,19 @@
     openDrawer(title, html);
     $('btnSaveImap').addEventListener('click', () => saveImapAccount(id));
     if (!isNew) $('btnTestImap').addEventListener('click', () => testImapAccount(id));
+    const gmailBtn = $('btnGmailPreset');
+    if (gmailBtn) gmailBtn.addEventListener('click', () => {
+      if (!$('imapName').value.trim()) $('imapName').value = 'Gmail';
+      $('imapHost').value = 'imap.gmail.com';
+      $('imapPort').value = '993';
+      $('imapSmtpHost').value = 'smtp.gmail.com';
+      $('imapSmtpPort').value = '465';
+      const em = $('imapEmail').value.trim();
+      if (em) $('imapUsername').value = em;
+      $('imapUseTls').checked = true;
+      $('imapReadOnly').checked = false;
+      toast('Gmail filled in — paste your app password', 'info');
+    });
   }
 
   async function saveImapAccount(id) {
@@ -1837,9 +3398,12 @@
     const password = $('imapPassword').value;
     const use_tls = $('imapUseTls').checked;
     const read_only = $('imapReadOnly').checked;
+    const outbound_guard = $('imapOutboundGuard').checked;
+    const outbound_allowlist = $('imapAllowlist').value.trim();
+    const outbound_max_recipients = parseInt($('imapMaxRecipients').value, 10) || 0;
     if (!name || !email || !imap_host || !smtp_host || !username) { toast('Fill required fields', 'warn'); return; }
     if (!id && !password) { toast('Password required', 'warn'); return; }
-    const body = { name, email, imap_host, imap_port, smtp_host, smtp_port, username, use_tls, read_only, user_id: 'owner' };
+    const body = { name, email, imap_host, imap_port, smtp_host, smtp_port, username, use_tls, read_only, outbound_guard, outbound_allowlist, outbound_max_recipients, user_id: 'owner' };
     if (password) body.password = password;
     try {
       if (id) { await putJson('/api/email/accounts/' + encodeURIComponent(id), body); toast('Account updated', 'success'); }
@@ -1950,10 +3514,9 @@
           '<div>' +
             '<div class="name">' + esc(s.name) + '</div>' +
             '<div class="meta" title="' + escAttr(meta) + '">' + meta + '</div>' +
+            desc +
           '</div>' +
-          '<span></span>' +
           '<span class="del" data-mcp-del="' + escAttr(s.name) + '" title="Remove server">×</span>' +
-          desc +
           '</div>';
       }).join('');
     } catch (e) {
@@ -2104,6 +3667,327 @@
     }
   }
 
+  // ============================================================= MARM memory canvas
+  // The MARM dash as native Warden elements — no iframe. Data comes from the
+  // Warden host (/api/marm/*), which reads the MARM store and probes MARM.
+  let marmSearchTimer = null;
+
+  function refreshMarm() {
+    if (!$('view-marm')) return;
+    renderMarmOverview();
+    loadMarmMemories();
+    loadMarmSessions();
+    loadMarmLogs();
+    loadMarmNotebook();
+  }
+
+  async function renderMarmOverview() {
+    const statsEl = $('marmStats');
+    const healthEl = $('marmHealth');
+    try {
+      const d = await api('/api/marm/overview');
+      const h = d.health || {};
+      const healthy = h.status === 'healthy';
+      healthEl.textContent = healthy ? ('healthy · ' + (h.version || '')) : 'offline';
+      const s = d.stats || {};
+      const cards = [
+        ['active memories', s.active_memories],
+        ['compacted', s.compacted_sources],
+        ['pending compaction', s.pending_compaction],
+        ['staged', s.staged_compaction],
+        ['sessions', s.sessions],
+        ['log entries', s.log_entries],
+        ['notebook', s.notebook_entries],
+        ['missing embeddings', s.missing_embeddings],
+      ];
+      statsEl.innerHTML = cards.map(([k, v]) =>
+        '<div class="marm-stat"><b>' + esc(v == null ? '—' : String(v)) + '</b><span>' + esc(k) + '</span></div>'
+      ).join('');
+      const sel = $('marmProjectFilter');
+      const prev = sel.value;
+      sel.innerHTML = '<option value="">all projects</option>' + (d.projects || [])
+        .map(p => '<option value="' + escAttr(p) + '">' + esc(p) + '</option>').join('');
+      sel.value = prev;
+    } catch (e) {
+      statsEl.innerHTML = '<div class="task-empty">MARM store unavailable — ' + esc(e.message) + '</div>';
+      healthEl.textContent = 'offline';
+    }
+  }
+
+  async function loadMarmMemories() {
+    const el = $('marmMemoryList');
+    if (!el) return;
+    el.innerHTML = '<div class="task-empty">Loading…</div>';
+    try {
+      const p = new URLSearchParams();
+      const q = $('marmSearch').value.trim();
+      if (q) p.set('q', q);
+      const proj = $('marmProjectFilter').value;
+      if (proj) p.set('project', proj);
+      p.set('role', $('marmRoleFilter').value || 'active');
+      p.set('limit', '50');
+      const d = await api('/api/marm/memories?' + p.toString());
+      const rows = d.memories || [];
+      if (!rows.length) { el.innerHTML = '<div class="task-empty">No memories.</div>'; return; }
+      el.innerHTML = '<div class="task-empty">' + esc(String(d.total)) + ' total — showing ' + rows.length + '</div>' +
+        rows.map(m =>
+          '<div class="activity-item"><div class="row1">' +
+          '<span class="name">' + esc(m.context_type || 'memory') + '</span>' +
+          '<span class="label">' + esc([m.project, m.session_name].filter(Boolean).join(' · ')) + '</span>' +
+          '<span class="ts">' + esc(fmtTime(m.created_at)) + '</span></div>' +
+          '<div class="tools">' + esc((m.content || '').slice(0, 220)) + '</div>' +
+          '<div class="marm-actions"><button class="btn btn-ghost btn-sm marm-del" data-kind="memories" data-id="' + escAttr(m.id) + '">delete</button></div>' +
+          '</div>'
+        ).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="task-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function loadMarmSessions() {
+    const el = $('marmSessionList');
+    if (!el) return;
+    el.innerHTML = '<div class="task-empty">Loading…</div>';
+    try {
+      const d = await api('/api/marm/sessions?limit=15');
+      const rows = d.sessions || [];
+      if (!rows.length) { el.innerHTML = '<div class="task-empty">No sessions.</div>'; return; }
+      el.innerHTML = rows.map(s =>
+        '<div class="activity-item"><div class="row1">' +
+        '<span class="name">' + esc(s.session_name) + '</span>' +
+        '<span class="label">' + (s.marm_active ? 'active' : '') + '</span>' +
+        '<span class="ts">' + esc(fmtTime(s.last_accessed || s.created_at)) + '</span></div>' +
+        '<div class="marm-actions"><button class="btn btn-ghost btn-sm marm-summary" data-name="' + escAttr(s.session_name) + '">summary</button>' +
+        '<button class="btn btn-ghost btn-sm marm-session-del" data-name="' + escAttr(s.session_name) + '">delete</button></div>' +
+        '</div>'
+      ).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="task-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function loadMarmLogs() {
+    const el = $('marmLogList');
+    if (!el) return;
+    el.innerHTML = '<div class="task-empty">Loading…</div>';
+    try {
+      const d = await api('/api/marm/logs?limit=20');
+      const rows = d.logs || [];
+      if (!rows.length) { el.innerHTML = '<div class="task-empty">No log entries.</div>'; return; }
+      el.innerHTML = rows.map(l =>
+        '<div class="activity-item"><div class="row1">' +
+        '<span class="name">' + esc(l.topic || 'log') + '</span>' +
+        '<span class="label">' + esc([l.project, l.session_name].filter(Boolean).join(' · ')) + '</span>' +
+        '<span class="ts">' + esc(fmtTime(l.created_at)) + '</span></div>' +
+        '<div class="tools">' + esc((l.summary || '').slice(0, 200)) + '</div>' +
+        '<div class="marm-actions"><button class="btn btn-ghost btn-sm marm-del" data-kind="logs" data-id="' + escAttr(l.id) + '">delete</button></div>' +
+        '</div>'
+      ).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="task-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function deleteMarmItem(kind, id) {
+    try {
+      await del('/api/marm/' + kind, { ids: [id] });
+    } catch (e) {
+      alert('MARM delete failed: ' + e.message);
+      return;
+    }
+    renderMarmOverview();
+    if (kind === 'memories') loadMarmMemories();
+    else loadMarmLogs();
+  }
+
+  // --- Semantic recall (the live API, not the LIKE search) ---
+  async function marmRecall() {
+    const out = $('marmRecallOut');
+    const q = $('marmRecallQuery').value.trim();
+    if (!q) { out.style.display = 'none'; out.textContent = ''; return; }
+    out.style.display = 'block';
+    out.textContent = 'Thinking…';
+    try {
+      const d = await api('/api/marm/smart-recall', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q, session_name: 'main', search_all: true, limit: 8 }),
+      });
+      out.textContent = d.context_summary || d.message || JSON.stringify(d, null, 1);
+    } catch (e) {
+      out.textContent = 'Recall failed: ' + e.message;
+    }
+  }
+
+  // --- Add a memory through the live API ---
+  async function marmAddMemory() {
+    const content = $('marmNewContent').value.trim();
+    if (!content) { alert('Memory content required'); return; }
+    const payload = {
+      content,
+      session_name: $('marmNewSession').value.trim() || 'main',
+      context_type: $('marmNewContext').value.trim() || 'general',
+    };
+    const project = $('marmNewProject').value.trim();
+    if (project) payload.project = project;
+    try {
+      await api('/api/marm/memory', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      alert('Save failed: ' + e.message);
+      return;
+    }
+    $('marmNewContent').value = '';
+    renderMarmOverview();
+    loadMarmMemories();
+  }
+
+  // --- Compaction workflow: status → candidates → stage → apply/discard ---
+  async function marmCompaction(action, extra) {
+    const out = $('marmCompactionOut');
+    const chip = $('marmCompactionStatus');
+    out.innerHTML = '<div class="task-empty">Working…</div>';
+    try {
+      const d = await api('/api/marm/compaction', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({ action }, extra || {})),
+      });
+      if (action === 'status') {
+        const c = d.counts || {};
+        chip.textContent = 'pending ' + (c.pending_summary || 0) + ' · staged ' + (c.summary_staged || 0) + ' · applied ' + (c.applied || 0);
+        out.innerHTML = '<div class="task-empty">' + esc(JSON.stringify(d)) + '</div>';
+        return;
+      }
+      if (action === 'candidates') {
+        const rows = d.candidates || [];
+        if (!rows.length) { out.innerHTML = '<div class="task-empty">No compaction candidates right now.</div>'; return; }
+        out.innerHTML = rows.map((c, i) => {
+          const id = escAttr(c.candidate_id || '');
+          return '<div class="activity-item" style="flex-wrap:wrap">' +
+            '<div class="row1" style="flex:1;min-width:100%">' +
+            '<span class="name">candidate</span>' +
+            '<span class="label">' + esc(String(c.memory_count != null ? c.memory_count : '') ) + '</span></div>' +
+            '<div class="tools" style="flex:1">' + esc((c.prompt || JSON.stringify(c)).slice(0, 300)) + '</div>' +
+            '<textarea class="marm-comp-summary" data-cid="' + id + '" rows="2" placeholder="summary for these memories…" style="flex:1;min-width:60%"></textarea>' +
+            '<button class="btn btn-ghost btn-sm marm-comp" data-comp-action="stage" data-comp-id="' + id + '">Stage</button>' +
+            '<button class="btn btn-ghost btn-sm marm-comp" data-comp-action="discard" data-comp-id="' + id + '">Discard</button>' +
+            '</div>';
+        }).join('');
+        return;
+      }
+      if (action === 'review') {
+        const rows = d.proposals || [];
+        if (!rows.length) { out.innerHTML = '<div class="task-empty">Nothing staged.</div>'; return; }
+        out.innerHTML = rows.map(p => {
+          const id = escAttr(p.candidate_id || p.id || '');
+          const summ = esc(p.suggested_summary || p.summary || JSON.stringify(p).slice(0, 200));
+          return '<div class="activity-item" style="flex-wrap:wrap">' +
+            '<div class="tools" style="flex:1;min-width:100%">' + summ.slice(0, 400) + '</div>' +
+            '<button class="btn btn-ghost btn-sm marm-comp" data-comp-action="apply" data-comp-id="' + id + '">Apply</button>' +
+            '<button class="btn btn-ghost btn-sm marm-comp" data-comp-action="discard" data-comp-id="' + id + '">Discard</button>' +
+            '</div>';
+        }).join('');
+        return;
+      }
+      // stage/apply/discard landed — refresh the state
+      marmCompaction('status');
+      renderMarmOverview();
+    } catch (e) {
+      out.innerHTML = '<div class="task-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  // --- Notebook (live API: add + show) ---
+  async function loadMarmNotebook() {
+    const el = $('marmNotebookList');
+    if (!el) return;
+    try {
+      const d = await api('/api/marm/notebook', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'show' }),
+      });
+      const rows = d.entries || [];
+      if (!rows.length) { el.innerHTML = '<div class="task-empty">No notebook entries.</div>'; return; }
+      el.innerHTML = rows.map(n =>
+        '<div class="activity-item"><div class="row1">' +
+        '<span class="name">' + esc(n.name || 'entry') + '</span>' +
+        '<span class="ts">' + esc(fmtTime(n.created_at || n.updated_at)) + '</span></div>' +
+        '<div class="tools">' + esc(String(n.data || '').slice(0, 200)) + '</div></div>'
+      ).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="task-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function marmNotebookAdd() {
+    const name = $('marmNotebookName').value.trim();
+    const data = $('marmNotebookData').value.trim();
+    if (!name || !data) { alert('Entry name and content required'); return; }
+    try {
+      await api('/api/marm/notebook', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add', name, data }),
+      });
+    } catch (e) {
+      alert('Notebook add failed: ' + e.message);
+      return;
+    }
+    $('marmNotebookName').value = ''; $('marmNotebookData').value = '';
+    loadMarmNotebook();
+  }
+
+  // --- Sessions: create + per-session summary (live API) ---
+  async function marmSessionAdd() {
+    const name = $('marmNewSessionName').value.trim();
+    if (!name) { alert('Session name required'); return; }
+    try {
+      await api('/api/marm/sessions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_name: name }),
+      });
+    } catch (e) {
+      alert('Session create failed: ' + e.message);
+      return;
+    }
+    $('marmNewSessionName').value = '';
+    loadMarmSessions();
+    renderMarmOverview();
+  }
+
+  async function marmShowSummary(name) {
+    const out = $('marmSummaryOut');
+    out.style.display = 'block';
+    out.textContent = 'Summarizing ' + name + '…';
+    try {
+      const d = await api('/api/marm/summary?session_name=' + encodeURIComponent(name));
+      out.textContent = d.summary || JSON.stringify(d, null, 1);
+    } catch (e) {
+      out.textContent = 'Summary failed: ' + e.message;
+    }
+  }
+
+  // --- Log a new entry (live API) ---
+  async function marmAddLog() {
+    const entry = $('marmNewLogEntry').value.trim();
+    if (!entry) { alert('Log entry required'); return; }
+    const payload = { entry };
+    const session = $('marmNewLogSession').value.trim();
+    if (session) payload.session_name = session;
+    try {
+      await api('/api/marm/log-entry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      alert('Log failed: ' + e.message);
+      return;
+    }
+    $('marmNewLogEntry').value = ''; $('marmNewLogSession').value = '';
+    loadMarmLogs();
+    renderMarmOverview();
+  }
+
   // ============================================================= Security events
   function fmtAbsence(seconds) {
     if (seconds == null) return '';
@@ -2212,6 +4096,426 @@
     }
   }
 
+  // ============================================================= Training loop
+  // audit (parse logs with granite4.2:30b) → modify (write SFT part rows) →
+  // train (1 epoch). Each step runs detached server-side; this polls it.
+  const TRAINING_BTNS = ['btnTrainingAudit', 'btnTrainingModify', 'btnTrainingTrain'];
+  function setTrainingButtons(enabled) {
+    TRAINING_BTNS.forEach(id => { const b = $(id); if (b) b.disabled = !enabled; });
+    const stop = $('btnTrainingStop');
+    if (stop) stop.disabled = enabled; // stop is available exactly when the steps aren't
+  }
+  async function stopTraining() {
+    try {
+      const d = await postJson('/api/training/stop', {});
+      if (!d.ok) { toast(d.error || 'Stop failed', 'error'); return; }
+      toast('Stopped ' + d.stopped, 'info');
+      if (STATE.trainingTab === 'bot') refreshBotStatus(); else refreshTrainingStatus();
+    } catch (e) {
+      toast('Stop failed: ' + e.message, 'error');
+    }
+  }
+  function setTrainingStatus(text, state) {
+    const chip = $('trainingStatus');
+    if (!chip) return;
+    chip.textContent = text;
+    chip.dataset.state = state;
+  }
+  // Highlight the running step's card; otherwise mark the step whose log is shown as "last run".
+  function paintTrainingSteps(running, logStep) {
+    document.querySelectorAll('#view-training .tr-step').forEach(card => {
+      const step = card.dataset.step;
+      const st = card.querySelector('[data-role="state"]');
+      card.classList.toggle('running', step === running);
+      card.classList.toggle('last', !running && step === logStep);
+      if (st) st.textContent = step === running ? 'running…' : (!running && step === logStep ? 'last run' : '');
+    });
+    const ls = $('trainingLogStep');
+    if (ls) ls.textContent = logStep ? '· ' + logStep : '';
+  }
+  async function startTrainingStep(step, body) {
+    const tail = $('trainingTail');
+    try {
+      const d = await postJson('/api/training/' + step, body || {});
+      if (!d.ok) {
+        tail.textContent = d.error || 'failed to start';
+        toast(d.error || 'Failed to start ' + step, 'error');
+        return;
+      }
+      setTrainingStatus(step + ' running', 'running');
+      paintTrainingSteps(step, step);
+      setTrainingButtons(false);
+      if (!STATE.trainingPollTimer) STATE.trainingPollTimer = setInterval(refreshTrainingStatus, 5000);
+      refreshTrainingStatus();
+    } catch (e) {
+      tail.textContent = 'Failed: ' + e.message;
+    }
+  }
+  async function refreshTrainingStatus() {
+    const tail = $('trainingTail');
+    try {
+      const d = await api('/api/training/status');
+      const atBottom = tail.scrollHeight - tail.scrollTop - tail.clientHeight < 24;
+      tail.textContent = d.tail || '(no step has run yet)';
+      if (atBottom || d.running) tail.scrollTop = tail.scrollHeight;
+      paintTrainingSteps(d.running, d.step);
+      if (d.running) {
+        setTrainingStatus(d.running + ' running', 'running');
+        setTrainingButtons(false);
+      } else {
+        if (STATE.trainingPollTimer) { clearInterval(STATE.trainingPollTimer); STATE.trainingPollTimer = null; }
+        setTrainingStatus('idle', 'idle');
+        setTrainingButtons(true);
+        refreshTrainingCatalogs();
+      }
+    } catch (e) {
+      setTrainingStatus('error', 'error');
+      tail.textContent = 'Failed: ' + e.message;
+    }
+  }
+  // The Alpha Stack view embeds the stack's OWN webapp (its full UI, served on
+  // 127.0.0.1:8765). The webapp is spawned on demand by the server — we just
+  // check it's up, start it if not, then load the iframe. The src is set once
+  // so re-opening the view doesn't reload the webapp out from under the user.
+  function showAlphaStackFrame() {
+    const chip = $('alphaStackStatus'), frame = $('alphaStackFrame'), fallback = $('alphaStackFallback');
+    const meta = document.querySelector('#view-alphastack .chat-meta-row');
+    chip.textContent = 'ready';
+    fallback.style.display = 'none';
+    frame.style.display = '';
+    // Hide Warden's chip/refresh row while live — the webapp has its own
+    // top chrome, and a second header is what made it read as a frame.
+    if (meta) meta.style.display = 'none';
+    // Use the dashboard's own hostname, not a hardcoded localhost: the
+    // dashboard is reached from other devices (phone), where localhost
+    // would point at the phone itself and the iframe would die.
+    // ?embed=1 → webapp hides its own sidebar (no dashboard-in-dashboard);
+    // &theme= → webapp matches Warden's theme (synced live on toggle below).
+    if (!frame.getAttribute('src'))
+      frame.setAttribute('src', 'http://' + location.hostname + ':8765/?embed=1&theme='
+        + (document.documentElement.getAttribute('data-theme') || 'dark'));
+  }
+  async function refreshAlphaStack() {
+    const chip = $('alphaStackStatus'), fallback = $('alphaStackFallback');
+    // (Re)show the chip/refresh row while checking; showAlphaStackFrame hides
+    // it again once the webapp is live.
+    const meta = document.querySelector('#view-alphastack .chat-meta-row');
+    if (meta) meta.style.display = '';
+    try {
+      const d = await api('/api/alphastack/status');
+      if (!d.ok) { chip.textContent = 'error'; fallback.style.display = ''; fallback.textContent = d.error || 'unavailable'; return; }
+      if (d.webappUp) { showAlphaStackFrame(); return; }
+      chip.textContent = 'starting webapp…';
+      fallback.style.display = '';
+      fallback.textContent = 'Starting the alpha-stack webapp…';
+      const s = await postJson('/api/alphastack/webapp/start', {});
+      if (!s.ok) {
+        chip.textContent = 'webapp down';
+        fallback.textContent = s.error || 'failed to start the webapp';
+        return;
+      }
+      showAlphaStackFrame();
+    } catch (e) {
+      chip.textContent = 'error';
+      fallback.style.display = '';
+      fallback.textContent = 'Failed: ' + e.message;
+    }
+  }
+
+  // Newest catalog → stat tiles, class filter pills, expandable failure rows;
+  // every catalog → the history list. Filter state survives re-renders.
+  const TRAINING_FILTER = { cls: '', q: '' };
+  let trainingNewest = null;
+  function fmtTrainingTs(ts) {
+    const d = ts ? new Date(ts) : null;
+    return d && !isNaN(d) ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : (ts || '');
+  }
+  function renderTrainingStats(cat) {
+    const el = $('trainingStats');
+    if (!cat) { el.innerHTML = '<div class="dim">No catalogs yet — run the audit.</div>'; return; }
+    const fails = cat.failures || [];
+    const real = fails.filter(f => (f.classification || {}).failure_class !== 'not_a_failure').length;
+    const unclassified = (cat.classifiers || {}).unclassified || 0;
+    const tile = (k, v, sub, cls) =>
+      `<div class="tr-stat ${cls || ''}"><div class="k">${esc(k)}</div><div class="v${typeof v === 'string' && v.length > 8 ? ' sm' : ''}" title="${esc(v)}">${esc(v)}</div>${sub ? `<div class="s" title="${esc(sub)}">${esc(sub)}</div>` : ''}</div>`;
+    el.innerHTML =
+      tile('Generated', fmtTrainingTs(cat.generated_at), (cat.days ? cat.days + '-day window' : '') + (cat.source ? ' · ' + cat.source : '')) +
+      tile('Lines scanned', (cat.log_lines_scanned ?? 0).toLocaleString()) +
+      tile('Failure slices', cat.failure_slices_found ?? fails.length, 'detected in logs') +
+      tile('Classified', fails.length, real + ' actionable', real ? 'warn' : 'ok') +
+      tile('Classifier', (cat.classifiers || {}).model || '—', unclassified ? unclassified + ' unclassified' : '') +
+      tile('Status', cat.complete === false ? 'partial' : 'complete', cat.complete === false ? 'audit stopped early' : '', cat.complete === false ? 'warn' : 'ok');
+  }
+  function renderTrainingFailures() {
+    const el = $('trainingCatalogs'), pills = $('trainingClassFilter');
+    const fails = (trainingNewest && trainingNewest.failures) || [];
+    if (!fails.length) { pills.innerHTML = ''; el.innerHTML = '<div class="dim">No failures in the newest catalog.</div>'; return; }
+    const counts = {};
+    fails.forEach(f => { const c = (f.classification || {}).failure_class || '?'; counts[c] = (counts[c] || 0) + 1; });
+    if (TRAINING_FILTER.cls && !counts[TRAINING_FILTER.cls]) TRAINING_FILTER.cls = '';
+    pills.innerHTML = `<span class="tr-class ${TRAINING_FILTER.cls ? '' : 'active'}" data-c="">all <b>${fails.length}</b></span>` +
+      Object.keys(counts).sort((a, b) => counts[b] - counts[a]).map(c =>
+        `<span class="tr-class ${TRAINING_FILTER.cls === c ? 'active' : ''}" data-c="${escAttr(c)}">${esc(c)} <b>${counts[c]}</b></span>`).join('');
+    pills.querySelectorAll('.tr-class').forEach(p => p.onclick = () => { TRAINING_FILTER.cls = p.dataset.c; renderTrainingFailures(); });
+    const q = TRAINING_FILTER.q.toLowerCase();
+    const shown = fails.filter(f => {
+      const c = f.classification || {};
+      if (TRAINING_FILTER.cls && (c.failure_class || '?') !== TRAINING_FILTER.cls) return false;
+      if (!q) return true;
+      return [f.id, c.failure_class, c.what_went_wrong, c.correct_behavior, c.sft_correction_hint, c.candidate_role, (c.tools_relevant || []).join(' ')]
+        .join(' ').toLowerCase().includes(q);
+    });
+    if (!shown.length) { el.innerHTML = '<div class="dim">No failures match the filter.</div>'; return; }
+    const open = new Set([].map.call(el.querySelectorAll('.tr-fail[open]'), d => d.dataset.id));
+    el.innerHTML = shown.map(f => trainingFailRow(f, open)).join('');
+  }
+  // One collapsible failure row — shared by the catalog list and Artemis flags.
+  // extraBadge (optional) is pre-rendered HTML placed after the class badge.
+  function trainingFailRow(f, open, extraBadge, meta) {
+    const c = f.classification || {};
+    const cls = c.failure_class || '?';
+    const block = (lbl, txt) => txt ? `<div><div class="lbl">${lbl}</div><p>${esc(txt)}</p></div>` : '';
+    const tags = (f.detected_by || []).map(t => `<span class="tr-badge">${esc(t)}</span>`)
+      .concat((c.tools_relevant || []).map(t => `<span class="tr-badge" data-c="other">${esc(t)}</span>`)).join('');
+    return `<details class="tr-fail" data-id="${escAttr(f.id)}" ${open.has(f.id) ? 'open' : ''}>
+      <summary><span class="tr-fail-id">${esc(f.id)}</span><span class="tr-badge" data-c="${escAttr(cls)}">${esc(cls)}</span>${extraBadge || ''}
+        <span class="tr-fail-what">${esc(c.what_went_wrong || '(no description)')}</span><span class="tr-fail-role">${esc(c.candidate_role || '')}</span></summary>
+      <div class="tr-fail-body">
+        ${meta ? `<div class="tr-fail-meta">${meta}</div>` : ''}
+        ${block('Correct behavior', c.correct_behavior)}
+        ${block('SFT correction hint', c.sft_correction_hint)}
+        ${tags ? `<div><div class="lbl">Signals &amp; tools</div><div class="tr-tags">${tags}</div></div>` : ''}
+        ${f.log_excerpt ? `<div><div class="lbl">Log excerpt</div><pre class="audit-log">${esc(f.log_excerpt)}</pre></div>` : ''}
+      </div></details>`;
+  }
+  // Artemis-flagged trainable errors (GET /api/training/flags). The section
+  // stays hidden when the route is missing (older server) or errors.
+  function renderTrainingFlags(d) {
+    const el = $('trainingFlaggedErrors');
+    if (!el) return;
+    const flags = (d && d.ok && Array.isArray(d.flags)) ? d.flags : null;
+    if (!flags) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+    const counts = d.counts || {};
+    const pending = counts.pending ?? flags.filter(f => f.status === 'pending').length;
+    const consumed = counts.consumed ?? flags.filter(f => f.status === 'consumed').length;
+    const open = new Set([].map.call(el.querySelectorAll('.tr-fail[open]'), x => x.dataset.id));
+    const rows = flags.map(f => {
+      const st = f.status === 'consumed' ? (f.outcome || 'consumed') : 'pending';
+      const meta = [
+        f.flagged_at ? 'flagged ' + esc(fmtTrainingTs(f.flagged_at)) : '',
+        f.log_timestamp ? 'log ' + esc(f.log_timestamp) : '',
+        f.consumed_at ? 'consumed ' + esc(fmtTrainingTs(f.consumed_at)) : '',
+      ].filter(Boolean).join(' · ');
+      return trainingFailRow(f, open, `<span class="tr-flag-st" data-s="${escAttr(st)}">${esc(st.replace('_', ' '))}</span>`, meta);
+    }).join('');
+    el.innerHTML = `<div class="tr-section-head"><div class="section-divider">Flagged by Artemis</div><span class="spacer"></span>
+        <span class="tr-flag-count" data-s="pending"><b>${pending}</b> pending</span>
+        <span class="tr-flag-count"><b>${consumed}</b> consumed</span></div>
+      <div class="tr-fails">${rows || '<div class="dim">No flagged errors yet.</div>'}</div>`;
+    el.classList.remove('hidden');
+  }
+  async function refreshTrainingFlags() {
+    let d = null;
+    try { d = await api('/api/training/flags'); } catch (e) { d = null; }
+    renderTrainingFlags(d);
+  }
+  async function refreshTrainingCatalogs() {
+    const el = $('trainingCatalogs');
+    if (!el) return;
+    refreshTrainingFlags();
+    try {
+      const d = await api('/api/training/catalogs');
+      const hist = $('trainingHistory');
+      if (!d.catalogs || !d.catalogs.length) {
+        trainingNewest = null;
+        renderTrainingStats(null);
+        $('trainingClassFilter').innerHTML = '';
+        el.innerHTML = '<div class="dim">No catalogs yet — run the audit.</div>';
+        hist.innerHTML = '<div class="dim">—</div>';
+        return;
+      }
+      hist.innerHTML = d.catalogs.map(c =>
+        `<div><span class="f" title="${escAttr(c.file)}">${esc(c.ts ? fmtTrainingTs(c.ts) : c.file)}</span><span class="n">${c.entries >= 0 ? c.entries + ' failures' : 'unreadable'}</span></div>`
+      ).join('');
+      trainingNewest = d.newest;
+      renderTrainingStats(d.newest);
+      renderTrainingFailures();
+    } catch (e) {
+      el.textContent = 'Failed: ' + e.message;
+    }
+  }
+
+  // ============================================================= Custom chatbot
+  // Intake form → Save (installs the chosen granite base into the HF cache in
+  // the background when it's missing) → granite writes persona pairs → Train
+  // packs a LoRA as the Ollama model "<slug>-bot". Steps run server-side.
+  const BOT_FIELDS = { name: 'botName', owner: 'botOwner', what_it_is: 'botWhatItIs', what_it_does: 'botWhatItDoes', who_for: 'botWhoFor', personality: 'botPersonality', handoff: 'botHandoff' };
+  const BOT = { slug: '', pairs: [], bases: [], running: null, pulls: [], pullTails: {}, timer: null };
+  function setTrainingTab(tab) {
+    STATE.trainingTab = tab;
+    qsa('#view-training .tr-tab').forEach(b => b.classList.toggle('active', b.dataset.trtab === tab));
+    qsa('#view-training [data-trpanel]').forEach(p => p.classList.toggle('hidden', p.dataset.trpanel !== tab));
+    $('trainingSub').textContent = tab === 'bot'
+      ? 'Intake form → granite writes persona pairs → LoRA on a granite base'
+      : 'Audit logs → modify SFT data → train one epoch';
+    if (tab === 'bot') refreshBot(!$('botName').value && !BOT.slug);
+    else { refreshTrainingStatus(); refreshTrainingCatalogs(); }
+  }
+  function renderBotBases(selected) {
+    const sel = $('botBase');
+    const cur = selected || sel.value || (BOT.bases[0] && BOT.bases[0].key) || '';
+    sel.innerHTML = BOT.bases.map(b =>
+      `<option value="${escAttr(b.key)}">${esc(b.label)}${b.cached ? '' : b.installing ? ' — installing…' : ' — not installed'}</option>`).join('');
+    sel.value = cur;
+    paintBotBaseNote();
+  }
+  function paintBotBaseNote() {
+    const b = BOT.bases.find(x => x.key === $('botBase').value);
+    const note = $('botBaseNote');
+    note.dataset.state = !b ? '' : b.cached ? 'ok' : b.installing ? 'running' : 'warn';
+    note.textContent = !b ? ''
+      : b.cached ? `${b.hf} · installed (${(b.bytes / 1e9).toFixed(1)} GB)`
+      : b.installing ? `${b.hf} · installing${BOT.pullTails[b.key] ? ' — ' + BOT.pullTails[b.key] : ''}`
+      : `${b.hf} · installs when you save`;
+    paintBotButtons();
+  }
+  function paintBotButtons() {
+    const base = BOT.bases.find(x => x.key === $('botBase').value);
+    const train = $('btnBotTrain');
+    $('btnBotGenerate').disabled = !!BOT.running;
+    const panel = document.querySelector('[data-trpanel="bot"]');
+    if (panel) panel.classList.toggle('bot-busy', !!(BOT.running || (BOT.pulls && BOT.pulls.length)));
+    paintBotReady();
+    train.disabled = !!BOT.running || !BOT.slug || !BOT.pairs.length || !(base && base.cached);
+    train.title = !base || base.cached ? '' : base.label + (base.installing ? ' is still installing' : ' is not installed — save to install it');
+  }
+  function paintBotReady() {
+    const el = $('botReady');
+    if (!el) return;
+    const ids = Object.values(BOT_FIELDS);
+    const n = ids.filter(id => $(id).value.trim()).length;
+    el.textContent = `${n}/${ids.length} filled`;
+    el.dataset.state = n === ids.length ? 'ok' : n ? 'warn' : '';
+  }
+  function botCatClass(c) {
+    let h = 0;
+    for (const ch of String(c)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return 'bc' + (h % 5);
+  }
+  function renderBotPairs() {
+    const el = $('botPairs');
+    if (!BOT.pairs.length) {
+      el.innerHTML = '<div class="bot-empty">No pairs yet — fill in the intake and generate.</div>';
+    } else {
+      el.innerHTML = `<div class="bot-pairs-head">${BOT.pairs.length} pairs</div>` + BOT.pairs.map((p, i) =>
+        `<div class="bot-pair"><div class="u"><b>USER</b>${esc(p.user)}</div><div class="a"><b>BOT</b>${esc(p.assistant)}</div>` +
+        `<div class="x">${p.category ? `<span class="tr-badge bot-cat ${botCatClass(p.category)}">${esc(p.category)}</span>` : ''}` +
+        `<button class="btn btn-ghost btn-sm" data-drop="${i}" title="Remove this pair">✕</button></div></div>`).join('');
+      el.querySelectorAll('[data-drop]').forEach(b => b.onclick = () => dropBotPair(parseInt(b.dataset.drop, 10)));
+    }
+    paintBotButtons();
+  }
+  Object.values(BOT_FIELDS).forEach(id => { const el = $(id); if (el) el.addEventListener('input', paintBotReady); });
+  async function dropBotPair(i) {
+    try {
+      const d = await postJson('/api/training/chatbot/pairs', { slug: BOT.slug, remove: [i] });
+      if (!d.ok) { toast(d.error || 'Remove failed', 'error'); return; }
+      BOT.pairs.splice(i, 1);
+      renderBotPairs();
+    } catch (e) { toast('Remove failed: ' + e.message, 'error'); }
+  }
+  // fillForm: load the selected bot's saved intake into the form (on bot
+  // switch); polling refreshes leave the fields alone so typing isn't clobbered.
+  async function refreshBot(fillForm) {
+    try {
+      const d = await api('/api/training/chatbot' + (BOT.slug ? '?slug=' + encodeURIComponent(BOT.slug) : ''));
+      if (!d.ok) { toast(d.error || 'Chatbot load failed', 'error'); return; }
+      BOT.bases = d.bases || [];
+      const sel = $('botSelect');
+      sel.innerHTML = '<option value="">+ New chatbot</option>' +
+        (d.bots || []).map(b => `<option value="${escAttr(b.slug)}">${esc(b.name)}</option>`).join('');
+      sel.value = BOT.slug;
+      const bot = d.bot;
+      if (fillForm) {
+        const f = (bot && bot.intake && bot.intake.fields) || {};
+        for (const [k, id] of Object.entries(BOT_FIELDS)) $(id).value = f[k] || '';
+        paintBotReady();
+      }
+      renderBotBases(fillForm && bot && bot.intake ? bot.intake.base : null);
+      BOT.pairs = (bot && bot.pairs) || [];
+      renderBotPairs();
+      const t = bot && bot.trained;
+      $('botTrained').textContent = t ? `trained → ollama ${t.model} · ${t.base} · ${t.pairs} pairs · ${fmtTrainingTs(t.trained_at)}` : '';
+      refreshBotStatus();
+    } catch (e) {
+      toast('Chatbot load failed: ' + e.message, 'error');
+    }
+  }
+  async function refreshBotStatus() {
+    const tail = $('botTail');
+    try {
+      const d = await api('/api/training/status?group=bot');
+      const atBottom = tail.scrollHeight - tail.scrollTop - tail.clientHeight < 24;
+      tail.textContent = d.tail || '(no step has run yet)';
+      if (atBottom || d.running) tail.scrollTop = tail.scrollHeight;
+      $('botLogStep').textContent = d.step ? '· ' + d.step.replace(/^bot-/, '') : '';
+      const pulls = d.pulls || [];
+      // A step or an install just ended → reload pairs / install state.
+      const finished = (BOT.running && BOT.running !== d.running) || BOT.pulls.some(k => !pulls.includes(k));
+      BOT.running = d.running;
+      BOT.pulls = pulls;
+      BOT.pullTails = d.pullTails || {};
+      BOT.bases.forEach(b => { b.installing = pulls.includes(b.key); });
+      renderBotBases();
+      setTrainingStatus(d.running ? d.running + ' running' : pulls.length ? 'installing ' + pulls.join(', ') : 'idle',
+        d.running || pulls.length ? 'running' : 'idle');
+      $('btnTrainingStop').disabled = !d.running;
+      if (finished) refreshBot(false);
+      if ((d.running || pulls.length) && !BOT.timer) BOT.timer = setInterval(refreshBotStatus, 4000);
+      if (!d.running && !pulls.length && BOT.timer) { clearInterval(BOT.timer); BOT.timer = null; }
+    } catch (e) {
+      tail.textContent = 'Failed: ' + e.message;
+    }
+  }
+  async function saveBot() {
+    const fields = {};
+    for (const [k, id] of Object.entries(BOT_FIELDS)) fields[k] = $(id).value;
+    const d = await postJson('/api/training/chatbot/save', { slug: BOT.slug || undefined, fields, base: $('botBase').value });
+    if (d.slug) BOT.slug = d.slug;
+    if (!d.ok) { toast(d.error || 'Save failed', 'error'); return null; }
+    const base = BOT.bases.find(x => x.key === $('botBase').value);
+    if (d.installing && base && !base.installing) toast(`Installing ${base.label} in the background`, 'info');
+    return d;
+  }
+  async function startBotStep(route, body) {
+    const d = await postJson('/api/training/chatbot/' + route, body);
+    if (!d.ok) {
+      $('botTail').textContent = d.error || 'failed to start';
+      toast(d.error || 'Failed to start', 'error');
+      return;
+    }
+    BOT.running = d.step;
+    paintBotButtons();
+    refreshBotStatus();
+  }
+  async function onBotSave() {
+    try { if (await saveBot()) { toast('Intake saved', 'info'); refreshBot(false); } }
+    catch (e) { toast('Save failed: ' + e.message, 'error'); }
+  }
+  async function onBotGenerate() {
+    try {
+      if (!(await saveBot())) return;
+      await startBotStep('generate', { slug: BOT.slug, count: parseInt($('botCount').value, 10) || 100 });
+    } catch (e) { toast('Generate failed: ' + e.message, 'error'); }
+  }
+  async function onBotTrain() {
+    if (!confirm('Train this chatbot? This clears VRAM and takes a while.')) return;
+    try {
+      if (!(await saveBot())) return;
+      await startBotStep('train', { slug: BOT.slug });
+    } catch (e) { toast('Train failed: ' + e.message, 'error'); }
+  }
+
   // ============================================================= Help modal
   function showModal(title, bodyHtml) {
     $('genericModalTitle').textContent = title;
@@ -2305,7 +4609,7 @@
       title: 'Welcome',
       body: `
         <h2>This is Warden.</h2>
-        <p>Warden is a <strong>personal hybrid agent</strong> — one orchestrator model that replies to you, plus a fleet of specialist sub-agents (Atlas, Byte, Dexter, Iris, Artemis, The Council) it can delegate to. It can read files, run code, open browsers, send email, and schedule tasks on your machine.</p>
+        <p>Warden is a <strong>personal hybrid agent</strong> — one seat, <strong>Atlas</strong>, that replies to you and does the work itself, plus a fleet of specialist sub-agents (Vulkan, Iris, Artemis, Sentry, The Council) it can call on. It can read files, run code, open browsers, send email, and schedule tasks on your machine.</p>
         <p>There's a learning curve. Warden responds best to <em>actionable requests</em>, not conversation. The next few screens cover the essentials. You can also read the standalone guides:</p>
         <div class="topics">
           <a href="/help/not-a-chatbot.html" target="_blank">Not a chatbot</a>
@@ -2321,14 +4625,13 @@
     {
       title: 'The agents',
       body: `
-        <h2>One orchestrator, several sub-agents.</h2>
-        <p>The orchestrator is the model you're chatting with. When a request falls in a sub-agent's lane, the orchestrator delegates and the sub-agent reports back as a chat message.</p>
+        <h2>Atlas is the seat, several specialists on call.</h2>
+        <p>Atlas is the model you're chatting with — it does the work itself (browser, desktop, files, shell, web) and runs multi-part tasks its own way: it calls the specialists one piece at a time and checks each result. A specialist reports back as a chat message when it lands.</p>
         <ul>
-          <li><strong>Atlas</strong> — browser + research (URLs, screenshots, fetch HTML).</li>
-          <li><strong>Byte</strong> — compute (python3 / bash / node).</li>
-          <li><strong>Dexter</strong> — time + scheduling.</li>
-          <li><strong>Iris</strong> — email (read; send if enabled).</li>
+          <li><strong>Vulkan</strong> — coding, scripting, building, heavy bash.</li>
+          <li><strong>Iris</strong> — email (read; send if enabled) + scheduling (reminders, calendar) + work management (tasks, projects, blockers, financials).</li>
           <li><strong>Artemis</strong> — read-only auditor / reviewer.</li>
+          <li><strong>Sentry</strong> — security scans of this PC.</li>
           <li><strong>The Council</strong> — three Artemis seats deliberate in parallel.</li>
         </ul>
         <p>Read the <a href="/help/agents.html" target="_blank">agents deep-dive →</a></p>`,
@@ -2412,6 +4715,11 @@
     const next = cur === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
     try { localStorage.setItem('dockbox-theme', next); } catch {}
+    // Keep an embedded Alpha Stack webapp in theme sync with Warden.
+    try {
+      const f = $('alphaStackFrame');
+      if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'as-theme', theme: next }, '*');
+    } catch {}
   }
 
   // ============================================================= Notifications (SSE + polling)
@@ -2481,6 +4789,55 @@
 
     // Rail nav
     qsa('.rail-btn[data-view]').forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
+
+    // Mobile "More" bottom sheet (visible only ≤720px via responsive.css).
+    // Rows are generated from the rail's own buttons (+ group labels), so the
+    // sheet always mirrors the rail. Footer actions (audit/settings/add page)
+    // proxy to their real buttons so we don't duplicate behavior.
+    (function initNavSheet() {
+      const sheet = $('navSheet');
+      if (!sheet) return;
+      const body = sheet.querySelector('.navsheet-body');
+      const PRIMARY = ['chat', 'alphastack', 'talk'];
+      const svgOf = (btn) => { const s = btn.querySelector('svg'); return s ? s.outerHTML : ''; };
+      qsa('.rail-nav > *').forEach(el => {
+        if (el.classList.contains('rail-group-label')) {
+          const h = document.createElement('div');
+          h.className = 'navsheet-group';
+          h.textContent = el.textContent;
+          body.appendChild(h);
+          return;
+        }
+        if (!el.classList.contains('rail-btn') || !el.dataset.view) return;
+        if (PRIMARY.includes(el.dataset.view)) return; // already bottom tabs
+        const row = document.createElement('button');
+        row.className = 'navsheet-row';
+        row.dataset.view = el.dataset.view;
+        row.innerHTML = `<span class="navsheet-ic">${svgOf(el)}</span><span class="navsheet-text">${el.textContent.trim()}</span>`;
+        body.appendChild(row);
+      });
+      const actionMap = { btnAudit: 'Run Audit', btnSettings: 'Settings', btnAddPage: 'Add Page' };
+      qsa('.rail-footer .rail-btn').forEach(el => {
+        if (!actionMap[el.id]) return;
+        const row = document.createElement('button');
+        row.className = 'navsheet-row';
+        row.dataset.action = el.id;
+        row.innerHTML = `<span class="navsheet-ic">${svgOf(el)}</span><span class="navsheet-text">${actionMap[el.id]}</span>`;
+        body.appendChild(row);
+      });
+      $('btnNavMore')?.addEventListener('click', () => sheet.classList.toggle('open'));
+      sheet.addEventListener('click', (e) => {
+        const row = e.target.closest('.navsheet-row');
+        if (row) {
+          sheet.classList.remove('open');
+          if (row.dataset.view) switchView(row.dataset.view);
+          else if (row.dataset.action) $(row.dataset.action)?.click();
+          return;
+        }
+        if (!e.target.closest('.navsheet')) sheet.classList.remove('open'); // backdrop
+      });
+    })();
+
     $('btnSettings').addEventListener('click', openSettings);
     $('btnAddPage').addEventListener('click', openAddPage);
     $('btnAudit').addEventListener('click', openAuditModal);
@@ -2490,9 +4847,13 @@
     $('btnRestart').addEventListener('click', restartServer);
     $('btnSwitchUser').addEventListener('click', openSwitchUser);
     $('btnNewThought').addEventListener('click', newThought);
+    const clearConv = $('btnClearConversation');
+    if (clearConv) clearConv.addEventListener('click', clearConversation);
     // Mobile-only relocated buttons. Hidden on desktop via CSS.
     const ntMobile = $('btnNewThoughtMobile');
     if (ntMobile) ntMobile.addEventListener('click', newThought);
+    const clearConvMobile = $('btnClearConversationMobile');
+    if (clearConvMobile) clearConvMobile.addEventListener('click', clearConversation);
     const settingsMobile = $('btnSettingsMobile');
     if (settingsMobile) settingsMobile.addEventListener('click', openSettings);
 
@@ -2537,18 +4898,6 @@
       ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
     });
 
-    // Live activity panel — collapse toggle (persisted)
-    const ppHeader = $('progressPanelHeader');
-    if (ppHeader) {
-      ppHeader.addEventListener('click', toggleProgressPanel);
-      try {
-        if (localStorage.getItem('warden-progress-expanded') === '1') {
-          const panel = $('progressPanel');
-          if (panel) { panel.classList.remove('collapsed'); ppHeader.setAttribute('aria-expanded', 'true'); }
-        }
-      } catch {}
-    }
-
     // Tasks
     $('btnNewTask').addEventListener('click', showTaskForm);
     $('btnCancelTask').addEventListener('click', hideTaskForm);
@@ -2563,6 +4912,113 @@
     $('btnAddApiKey').addEventListener('click', openApiKeyDrawer);
     $('btnRefreshSkills').addEventListener('click', () => { refreshSkills(); refreshMcp(); });
     $('btnRefreshActivity').addEventListener('click', refreshActivity);
+    $('btnRefreshFriends').addEventListener('click', refreshFriends);
+    $('btnFriendsTunnelUp').addEventListener('click', friendsTunnelUp);
+    $('btnFriendsCopyLink').addEventListener('click', friendsCopyLink);
+    $('btnFriendsInvite').addEventListener('click', friendsInvite);
+    $('view-friends')?.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-fact]');
+      if (b) friendsAction(b.dataset.fact, b.dataset.id);
+    });
+
+    // Social (BBS) — the dial-in terminal: clicks delegate on [data-act] rows,
+    // the command-bar input handles its own Enter/Esc while a prompt is open,
+    // and one document-level keydown maps keys by screen (never while typing).
+    $('view-social')?.addEventListener('click', (e) => {
+      const hit = e.target.closest('[data-act]');
+      if (hit) runAct(hit.dataset.act, hit.dataset.arg);
+    });
+    $('bbsInput')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); handlePromptSubmit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancelPrompt(); }
+    });
+    // file-area upload — hidden picker opened by [U]; any file type, base64 over the wire
+    $('bbsUpload')?.addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!f) return;
+      try {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        let bin = '';
+        for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 8192));
+        $('bbsStatus').textContent = 'UPLOADING ' + f.name + '…';
+        const r = await postJson('/api/friends/bbs/file-upload', { name: f.name, data_base64: btoa(bin) });
+        $('bbsStatus').textContent = (r && r.ok) ? 'UPLOADED: ' + r.name : 'FAILED: ' + ((r && r.error) || 'unknown');
+      } catch (err) { $('bbsStatus').textContent = 'FAILED: ' + err.message; }
+      await refreshSocial();
+    });
+    document.addEventListener('keydown', onBbsKey);
+    loadBotnet();
+
+    // Human presence heartbeat — tells the host whether the human is looking at
+    // the window; the BotNet sweep pauses while they are.
+    let PRESENCE_WATCHING = null;
+    let PRESENCE_LAST_ACTIVITY = Date.now();
+    function computePresence() {
+      return document.visibilityState === 'visible' && document.hasFocus() && (Date.now() - PRESENCE_LAST_ACTIVITY < 30000);
+    }
+    function presenceTick() {
+      const w = computePresence();
+      // POST on every change, and keep re-asserting `watching: true` each tick so
+      // the host's stale-window (45s) never lapses while the human is still there.
+      if (w !== PRESENCE_WATCHING || w === true) {
+        PRESENCE_WATCHING = w;
+        postJson('/api/presence', { watching: w }).catch(() => {});
+      }
+    }
+    ['mousemove','keydown','click','touchstart','scroll'].forEach(ev => window.addEventListener(ev, () => { PRESENCE_LAST_ACTIVITY = Date.now(); }, { passive: true }));
+    ['focus','blur','visibilitychange','pageshow','pagehide'].forEach(ev => window.addEventListener(ev, presenceTick));
+    setInterval(presenceTick, 15000);
+    presenceTick();
+
+    // MARM canvas — search/filters are debounced; deletes delegated on the view.
+    $('btnMarmRefresh')?.addEventListener('click', refreshMarm);
+    $('marmSearch')?.addEventListener('input', () => {
+      clearTimeout(marmSearchTimer);
+      marmSearchTimer = setTimeout(loadMarmMemories, 300);
+    });
+    $('marmProjectFilter')?.addEventListener('change', loadMarmMemories);
+    $('marmRoleFilter')?.addEventListener('change', loadMarmMemories);
+    $('btnMarmRecall')?.addEventListener('click', marmRecall);
+    $('marmRecallQuery')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') marmRecall(); });
+    $('btnMarmAddMemoryToggle')?.addEventListener('click', () => {
+      const f = $('marmAddMemoryForm');
+      f.style.display = f.style.display === 'none' ? 'block' : 'none';
+    });
+    $('btnMarmAddMemory')?.addEventListener('click', marmAddMemory);
+    $('btnMarmCompStatus')?.addEventListener('click', () => marmCompaction('status'));
+    $('btnMarmCompCandidates')?.addEventListener('click', () => marmCompaction('candidates'));
+    $('btnMarmCompReview')?.addEventListener('click', () => marmCompaction('review'));
+    $('btnMarmNotebookAdd')?.addEventListener('click', marmNotebookAdd);
+    $('btnMarmSessionAdd')?.addEventListener('click', marmSessionAdd);
+    $('btnMarmAddLog')?.addEventListener('click', marmAddLog);
+    $('view-marm')?.addEventListener('click', (e) => {
+      const del2 = e.target.closest('.marm-del');
+      if (del2) { deleteMarmItem(del2.dataset.kind, del2.dataset.id); return; }
+      const comp = e.target.closest('.marm-comp');
+      if (comp) {
+        const act = comp.dataset.compAction;
+        let extra = null;
+        if (act === 'stage') {
+          const ta = document.querySelector('.marm-comp-summary[data-cid="' + CSS.escape(comp.dataset.compId) + '"]');
+          const suggested = ta ? ta.value.trim() : '';
+          if (!suggested) { alert('Write the summary first, then Stage.'); return; }
+          extra = { summaries: [{ candidate_id: comp.dataset.compId, suggested_summary: suggested }] };
+        } else {
+          extra = { candidate_id: comp.dataset.compId };
+        }
+        marmCompaction(act, extra);
+        return;
+      }
+      const sum = e.target.closest('.marm-summary');
+      if (sum) { marmShowSummary(sum.dataset.name); return; }
+      const sd = e.target.closest('.marm-session-del');
+      if (sd) {
+        del('/api/marm/sessions', { names: [sd.dataset.name] })
+          .then(() => { loadMarmSessions(); renderMarmOverview(); })
+          .catch((err) => alert('Session delete failed: ' + err.message));
+      }
+    });
     const btnSec = $('btnRefreshSecurity'); if (btnSec) btnSec.addEventListener('click', refreshSecurity);
     const btnClear = $('btnClearOculusLogs'); if (btnClear) btnClear.addEventListener('click', clearOculusLogs);
 
@@ -2601,6 +5057,28 @@
       }
     });
     $('btnRefreshLogs').addEventListener('click', refreshProcessLogs);
+    $('btnAlphaStackRefresh').addEventListener('click', async () => {
+      await refreshAlphaStack();
+      const frame = $('alphaStackFrame');
+      if (frame.getAttribute('src')) frame.setAttribute('src', frame.getAttribute('src')); // force a reload
+    });
+    $('btnTrainingAudit').addEventListener('click', () => startTrainingStep('audit', { days: parseInt($('trainingDays').value, 10) || 3 }));
+    $('btnTrainingModify').addEventListener('click', () => startTrainingStep('modify', {}));
+    $('trainingFailSearch').addEventListener('input', e => { TRAINING_FILTER.q = e.target.value.trim(); renderTrainingFailures(); });
+    $('btnTrainingTrain').addEventListener('click', () => {
+      if (confirm('Train 1 epoch? This clears VRAM and takes a long time.'))
+        startTrainingStep('train', {});
+    });
+    qsa('#view-training .tr-tab').forEach(b => b.addEventListener('click', () => setTrainingTab(b.dataset.trtab)));
+    $('botSelect').addEventListener('change', e => { BOT.slug = e.target.value; refreshBot(true); });
+    $('botBase').addEventListener('change', paintBotBaseNote);
+    $('btnBotSave').addEventListener('click', onBotSave);
+    $('btnBotGenerate').addEventListener('click', onBotGenerate);
+    $('btnBotTrain').addEventListener('click', onBotTrain);
+    $('btnTrainingStop').addEventListener('click', () => {
+      if (confirm('Stop the running training step? An aborted train leaves a partial adapter.'))
+        stopTraining();
+    });
 
     // Make openHelp / openAuditModal callable from inline onclick handlers
     window.openHelp = openHelp;

@@ -9,13 +9,13 @@
  *  - THINKING: from the moment an owner message arrives until Warden's next
  *    reply is delivered, the chat shows the native "typing…" indicator, so
  *    the phone gets the same "it's working" feel as the dashboard. The
- *    orchestrator's task-announcement message arrives mid-turn as its own
+ *    seat's task-announcement message arrives mid-turn as its own
  *    bubble (same double-message pattern as the dashboard).
  *  - MEDIA IN: voice notes are transcribed locally (Whisper) and fed to the
  *    agent as text; photos and documents are downloaded into
  *    WORKSPACE_ROOT/telegram-inbox/ and referenced by path so the agent can
  *    actually open them.
- *  - TEXT OUT: plain text (the orchestrator speaks, it doesn't format),
+ *  - TEXT OUT: plain text (the seat speaks, it doesn't format),
  *    chunked under Telegram's 4096 limit on paragraph boundaries, with 429
  *    retry-after honoured and one retry on transient network errors.
  *  - RESILIENCE: long-polling wrapped in an auto-restart loop with
@@ -171,7 +171,10 @@ export class TelegramChannel implements Channel {
   private wireHandlers(): void {
     this.bot.command('start', async (ctx) => {
       const chatId = String(ctx.chat.id);
-      const name = ctx.from?.first_name || 'owner';
+      const from = ctx.from;
+      const name = [from?.first_name, from?.last_name].filter(Boolean).join(' ')
+        || from?.username
+        || 'owner';
       if (!this.ownerChatId) {
         this.pair(chatId, name);
         await ctx.reply(`Paired. This device is now Warden's owner — just talk to me like you do on the dashboard.`);
@@ -180,7 +183,7 @@ export class TelegramChannel implements Channel {
       if (this.isOwner(chatId)) {
         await ctx.reply(`Already paired and listening.`);
       } else {
-        await ctx.reply(`This is a private assistant and it's already paired to its owner.`);
+        await ctx.reply(`This is a private assistant and it's already paired to its owner. To re-point it here, set this chat id (${chatId}) in the dashboard Telegram settings and save.`);
       }
     });
 
@@ -190,7 +193,12 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message', async (ctx) => {
       const chatId = String(ctx.chat.id);
-      const name = ctx.from?.first_name || 'user';
+      const from = ctx.from;
+      // Full display name so the agent can tell who is speaking in a group —
+      // "First Last", else username, else a non-generic fallback.
+      const name = [from?.first_name, from?.last_name].filter(Boolean).join(' ')
+        || from?.username
+        || 'Telegram user';
       if (!this.ownerChatId) {
         await ctx.reply(`Not paired yet — send /start to claim this bot.`);
         return;
@@ -301,33 +309,46 @@ export class TelegramChannel implements Channel {
     if (!chatId) return;
     this.stopTyping(); // a reply is going out — thinking is over
 
-    // [Image: <path>] refs → send as Telegram photos (with the surrounding
-    // text as the caption) so alert frames show up on the phone. Path is
-    // repo-relative; resolve from the Warden cwd.
+    // [Image: <path>] refs → send as Telegram photos; [File: <path>] refs →
+    // send as documents (so attach_file/auto-attach deliver real files, not
+    // the literal tag text). The remaining text is the caption.
     const imgRe = /\[Image:\s*([^\]]+)\]/gi;
-    const images: string[] = [];
-    let mm: RegExpExecArray | null;
-    while ((mm = imgRe.exec(text)) !== null) images.push(mm[1].trim());
-    const caption = text.replace(imgRe, '').trim();
+    const fileRe = /\[File:\s*([^\]]+)\]/gi;
+    const collect = (re: RegExp): string[] => {
+      const out: string[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) out.push(m[1].trim());
+      return out;
+    };
+    const images = collect(imgRe);
+    const files = collect(fileRe);
+    const caption = text.replace(imgRe, '').replace(fileRe, '').trim();
 
-    if (images.length > 0) {
-      for (const rel of images) {
-        const abs = path.isAbsolute(rel) ? rel : path.resolve(process.cwd(), rel);
-        // Security frames are stored under groups/owner/attachments, but the
-        // Oculus image tag is repo-relative (attachments/...). If the root
-        // path is missing, fall back to the owner group folder.
-        let finalAbs = abs;
-        if (!fs.existsSync(finalAbs)) {
-          const groupAbs = path.resolve(WORKSPACE_ROOT, 'groups', 'owner', rel);
-          if (fs.existsSync(groupAbs)) finalAbs = groupAbs;
-        }
-        if (!fs.existsSync(finalAbs)) { warn(`sendPhoto: image not found: ${abs}`); continue; }
+    // Media paths arrive absolute (attach_file) or repo/group-relative
+    // (Oculus security frames). Try repo cwd, the owner group folder, and
+    // WORKSPACE_ROOT itself — attach_file tags are relative to the runner's
+    // cwd, which IS WORKSPACE_ROOT.
+    const resolveMedia = (rel: string): string | null => {
+      const candidates = path.isAbsolute(rel)
+        ? [rel]
+        : [
+            path.resolve(process.cwd(), rel),
+            path.resolve(WORKSPACE_ROOT, 'groups', 'owner', rel),
+            path.resolve(WORKSPACE_ROOT, rel),
+          ];
+      for (const c of candidates) if (fs.existsSync(c)) return c;
+      return null;
+    };
+
+    if (images.length > 0 || files.length > 0) {
+      // Send each media item with retry; the caption rides on the first one.
+      let captionUsed = false;
+      const sendWithRetry = async (send: (cap?: string) => Promise<unknown>, label: string, abs: string): Promise<void> => {
         let attempt = 0;
         for (;;) {
           try {
-            await this.bot.api.sendPhoto(Number(chatId), new InputFile(finalAbs), {
-              caption: caption.slice(0, 1024) || undefined,
-            });
+            await send(captionUsed ? undefined : caption.slice(0, 1024) || undefined);
+            captionUsed = true;
             break;
           } catch (err: any) {
             const retryAfter = err instanceof GrammyError ? err.parameters?.retry_after : undefined;
@@ -337,13 +358,29 @@ export class TelegramChannel implements Channel {
               continue;
             }
             if (attempt < 1) { attempt++; await new Promise((r) => setTimeout(r, 1500)); continue; }
-            warn(`sendPhoto failed permanently: ${err?.message ?? err}`);
+            warn(`${label} failed permanently: ${err?.message ?? err} (${abs})`);
             break;
           }
         }
+      };
+      for (const rel of images) {
+        const abs = resolveMedia(rel);
+        if (!abs) { warn(`sendPhoto: image not found: ${rel}`); continue; }
+        await sendWithRetry(
+          (cap) => this.bot.api.sendPhoto(Number(chatId), new InputFile(abs), { caption: cap }),
+          'sendPhoto', abs,
+        );
+      }
+      for (const rel of files) {
+        const abs = resolveMedia(rel);
+        if (!abs) { warn(`sendDocument: file not found: ${rel}`); continue; }
+        await sendWithRetry(
+          (cap) => this.bot.api.sendDocument(Number(chatId), new InputFile(abs), { caption: cap }),
+          'sendDocument', abs,
+        );
       }
       // Any caption text beyond Telegram's 1024-char limit → follow-up text.
-      if (caption.length > 1024) {
+      if (captionUsed && caption.length > 1024) {
         for (const chunk of chunkText(caption.slice(1024))) {
           try { await this.bot.api.sendMessage(Number(chatId), chunk, { link_preview_options: { is_disabled: true } }); }
           catch (err: any) { warn(`caption follow-up failed: ${err?.message ?? err}`); }

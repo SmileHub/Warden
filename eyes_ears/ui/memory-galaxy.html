@@ -1,0 +1,1966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Memory Galaxy — The Brain</title>
+<style>
+  :root {
+    --glass: rgba(8, 12, 28, 0.62);
+    --glass-border: rgba(160, 190, 255, 0.22);
+    --text: rgba(236, 242, 255, 0.94);
+    --text-dim: rgba(150, 175, 220, 0.58);
+    --accent: #9ad8ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%; overflow: hidden; background: #020308; color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #scene { position: fixed; inset: 0; }
+  .panel {
+    position: fixed; z-index: 10;
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    box-shadow: 0 12px 48px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+  .search { top: 22px; left: 22px; width: 310px; padding: 12px; }
+  .search input {
+    width: 100%; background: transparent; border: none; outline: none; color: var(--text);
+    font-size: 14px; padding: 8px 6px;
+  }
+  .search input::placeholder { color: var(--text-dim); }
+  #results { margin-top: 8px; max-height: 260px; overflow-y: auto; display: none; }
+  #results .row {
+    padding: 8px 10px; border-radius: 9px; cursor: pointer; font-size: 13px;
+    display: flex; justify-content: space-between; gap: 10px;
+  }
+  #results .row:hover { background: rgba(140, 180, 255, 0.14); }
+  #results .row .deg { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  /* Compact chip — the FULL details open in a separate popup window
+     (openDetailWindow); this stays behind as a tiny anchor/fallback for
+     when a separate window can't open. */
+  .node-panel {
+    top: 12px; right: 12px; width: 195px; max-width: calc(100% - 24px);
+    max-height: calc(100% - 24px); overflow-y: auto; padding: 10px 30px 8px 10px; display: none;
+  }
+  .node-panel h2 { font-size: 13px; font-weight: 600; margin-bottom: 4px; letter-spacing: 0.2px; word-break: break-word; }
+  .node-panel .mini { font-size: 10px; color: var(--text-dim); margin-bottom: 6px; }
+  .node-panel h3 {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 1.1px;
+    color: var(--text-dim); margin: 8px 0 4px;
+  }
+  .np-open {
+    margin-top: 8px; padding: 5px 8px; border-radius: 7px; cursor: pointer;
+    font-size: 10px; color: var(--accent); background: rgba(0, 255, 255, 0.06);
+    border: 1px solid rgba(0, 255, 255, 0.2); text-align: center;
+  }
+  .np-open:hover { background: rgba(0, 255, 255, 0.14); }
+  .conn {
+    display: flex; justify-content: space-between; padding: 4px 6px;
+    border-radius: 6px; cursor: pointer; font-size: 11px;
+  }
+  .conn:hover { background: rgba(140, 180, 255, 0.11); }
+  .conn .w { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 10px; }
+  .close-btn {
+    position: absolute; top: 14px; right: 14px; width: 28px; height: 28px; border-radius: 50%;
+    background: rgba(255,255,255,0.08); border: none; color: var(--text);
+    cursor: pointer; font-size: 15px; line-height: 1;
+  }
+  .close-btn:hover { background: rgba(255,255,255,0.16); }
+  .hint {
+    bottom: 18px; left: 50%; transform: translateX(-50%);
+    padding: 9px 18px; font-size: 12px; color: var(--text-dim); pointer-events: none;
+    letter-spacing: 0.3px;
+    transition: opacity 1.2s ease;
+  }
+  .hint.gone { opacity: 0; }
+</style>
+</head>
+<body>
+  <div id="scene"></div>
+
+  <div class="panel search">
+    <input id="search" type="text" placeholder="Search the brain…" autocomplete="off" />
+    <div id="results"></div>
+  </div>
+
+  <div class="panel node-panel" id="nodePanel">
+    <button class="close-btn" id="closePanel" title="Close">×</button>
+    <h2 id="npName"></h2>
+    <div class="mini" id="npMini"></div>
+    <h3>Branches</h3>
+    <div id="npConns"></div>
+    <div class="np-open" id="npOpen" title="Open full details in a separate window">⧉ Open in window</div>
+  </div>
+
+  <div class="panel hint" id="hint">Drift the brain — hover to trace a branch · click a star to recall its memories · search to fly</div>
+  <script>
+    // The hint is only useful for the first look — fade it out after 10s.
+    setTimeout(() => {
+      const h = document.getElementById('hint');
+      if (h) { h.classList.add('gone'); setTimeout(() => h.remove(), 1500); }
+    }, 10000);
+  </script>
+
+  <!-- Fullscreen expand — usable in the small center slot AND standalone.
+       Inside the panels.html iframe this needs allowfullscreen (set on the
+       iframe); standalone it's just the page itself. -->
+  <div id="fsBtn" title="Fullscreen" style="
+    position:fixed; right:14px; bottom:14px; z-index:1000;
+    padding:6px 12px; border-radius:8px; cursor:pointer; user-select:none;
+    font-size:11px; letter-spacing:1.5px; text-transform:uppercase;
+    color:rgba(0,255,255,0.55); background:rgba(0,10,20,0.55);
+    border:1px solid rgba(0,255,255,0.25);
+    transition:color .15s, border-color .15s, background .15s;
+  " onmouseover="this.style.color='#00ffff';this.style.borderColor='rgba(0,255,255,0.6)'" onmouseout="this.style.color='rgba(0,255,255,0.55)';this.style.borderColor='rgba(0,255,255,0.25)'">⛶ Expand</div>
+  <script>
+    (function(){
+      var btn = document.getElementById('fsBtn');
+      var expanded = false;
+      btn.addEventListener('click', function(){
+        if (window.parent && window.parent !== window) {
+          // Embedded in panels.html: expand ONLY this panel — the galaxy
+          // iframe fills the window; every other panel stays laid out
+          // underneath. No OS-level fullscreen of the whole voice window.
+          expanded = !expanded;
+          btn.textContent = expanded ? '⤢ Exit' : '⛶ Expand';
+          btn.title = expanded ? 'Collapse the galaxy' : 'Expand the galaxy';
+          scanBtnVis(expanded);
+          window.parent.postMessage({__pm:true, type:'panel_expand', panel:'hologram', expand:expanded}, '*');
+          return;
+        }
+        // Standalone in a real browser — native fullscreen.
+        if (document.fullscreenElement) { document.exitFullscreen(); return; }
+        document.documentElement.requestFullscreen().catch(function(){});
+      });
+      // The scan drawer belongs to the expanded view — the small center
+      // slot stays clean, so the ⚙ button only exists while expanded.
+      function scanBtnVis(on) {
+        document.getElementById('scanBtn').style.display = on ? 'block' : 'none';
+        if (!on) document.getElementById('scanDrawer').style.display = 'none';
+      }
+      document.addEventListener('fullscreenchange', function () {
+        scanBtnVis(!!document.fullscreenElement);
+      });
+    })();
+  </script>
+
+  <div id="bootError" style="
+    display:none; position:fixed; inset:0; z-index:9999;
+    background:#020308; color:#e8f0ff; font-family:system-ui,sans-serif;
+    padding:40px; overflow:auto; white-space:pre-wrap; font-size:14px; line-height:1.5;
+  "></div>
+
+  <script>
+    window.addEventListener('error', function(e) {
+      var el = document.getElementById('bootError');
+      if (!el) return;
+      el.style.display = 'block';
+      el.textContent += '[error] ' + (e.message || e) + '\n  at ' + (e.filename||'') + ':' + (e.lineno||'') + '\n\n';
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      var el = document.getElementById('bootError');
+      if (!el) return;
+      el.style.display = 'block';
+      el.textContent += '[rejection] ' + (e.reason && e.reason.message ? e.reason.message : e.reason) + '\n\n';
+    });
+  </script>
+
+  <script src="./marm-memory-map/bundle.js"></script>
+  <script>
+    // ── iframe postMessage bridge shim (same pattern as the other panels;
+    //    see chat.html / agents.html for the full note) ──
+    // pywebview injects window.pywebview.api only into the top-level window.
+    // When this page runs as an iframe inside panels.html, file:// origins
+    // are cross-origin, so the host can't assign onto our window — instead
+    // every api call is postMessaged up and dispatched on the real bridge.
+    // The MARM client below uses window.pywebview.api.marm_api to reach the
+    // MCP server through the Python-side proxy when embedded; standalone
+    // (opened directly in a browser) window.pywebview stays undefined and
+    // the direct-fetch path runs instead.
+    if (!window.pywebview && window.parent && window.parent !== window) {
+      var _pmPending = {};
+      window.addEventListener('message', function(ev) {
+        var d = ev.data;
+        if (!d || !d.__pm || !d.id || !_pmPending[d.id]) return;
+        var p = _pmPending[d.id]; delete _pmPending[d.id]; clearTimeout(p.timer);
+        if (d.error) p.reject(new Error(d.error)); else p.resolve(d.result);
+      });
+      window.pywebview = { api: new Proxy({}, {
+        get: function(_, method) {
+          return function() {
+            var args = Array.prototype.slice.call(arguments);
+            return new Promise(function(resolve, reject) {
+              var id = 'mg-' + Math.random().toString(36).slice(2);
+              var timer = setTimeout(function() {
+                delete _pmPending[id]; reject(new Error('bridge timeout: ' + method));
+              }, 30000);
+              _pmPending[id] = { resolve: resolve, reject: reject, timer: timer };
+              window.parent.postMessage({ __pm: true, id: id, method: method, args: args }, '*');
+            });
+          };
+        }
+      }) };
+    }
+  </script>
+
+  <!-- ── Scan management drawer (expand view) ──
+       Include/exclude dirs, files and patterns; which model classifies;
+       run / pause the scan. Served by /api/memory/scan-config. The ⚙ button
+       appears when the panel is expanded (the small center slot stays clean);
+       the drawer slides over the right edge. -->
+  <div id="scanBtn" title="Manage scan" style="display:none; position:fixed; right:14px; bottom:52px; z-index:1000;
+    padding:6px 12px; border-radius:8px; cursor:pointer; user-select:none;
+    font-size:11px; letter-spacing:1.5px; text-transform:uppercase;
+    color:rgba(0,255,255,0.55); background:rgba(0,10,20,0.55);
+    border:1px solid rgba(0,255,255,0.25);
+    transition:color .15s, border-color .15s, background .15s;
+  " onmouseover="this.style.color='#00ffff';this.style.borderColor='rgba(0,255,255,0.6)'" onmouseout="this.style.color='rgba(0,255,255,0.55)';this.style.borderColor='rgba(0,255,255,0.25)'">⚙ Scan</div>
+  <div id="scanDrawer" style="display:none; position:fixed; top:0; right:0; bottom:0; width:380px; max-width:92vw;
+    z-index:2000; overflow-y:auto; box-sizing:border-box; padding:20px 22px 90px;
+    background:rgba(2,8,18,0.94); border-left:1px solid rgba(0,255,255,0.22);
+    font-family:system-ui,sans-serif; font-size:13px; color:#c8e2ef;
+  ">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+      <div style="font-size:15px; font-weight:700; color:#e8f6ff; letter-spacing:1px;">MEMORY SCAN</div>
+      <div id="scanClose" style="cursor:pointer; color:#7fb2c8; padding:2px 8px; font-size:16px;"
+        onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#7fb2c8'">✕</div>
+    </div>
+    <div id="scanStatus" style="font-size:11px; letter-spacing:1px; color:#7fb2c8; margin-bottom:18px;"></div>
+
+    <div class="scanSec">CLASSIFIER MODEL</div>
+    <input id="scanModel" placeholder="granite4.1:30b (default)" style="width:100%; box-sizing:border-box;">
+    <div class="scanNote">Ollama model that classifies facts into the tree.</div>
+
+    <div class="scanSec">AUTO-SCAN</div>
+    <div style="display:flex; align-items:center; gap:14px; margin-bottom:10px;">
+      <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
+        <input type="checkbox" id="scanPaused" style="accent-color:#00c8ff; width:15px; height:15px;">
+        <span>Paused — no automatic scans</span>
+      </label>
+    </div>
+    <div style="display:flex; gap:10px;">
+      <div id="scanRun" class="scanAct" style="background:#0a2a33; border-color:#00c8ff;">Run scan now</div>
+      <div id="scanStop" class="scanAct" style="background:#331414; border-color:#ff6a6a; display:none;">Stop scan</div>
+    </div>
+    <div class="scanNote">Runs only when the GPU is idle; "Run now" frees the GPU itself.</div>
+
+    <div class="scanSec">INCLUDE DIRS</div>
+    <div class="scanNote">Extra folders scanned like ~/.claude memories (*.md, one fact per file).</div>
+    <div id="list-includeDirs" class="scanList"></div>
+    <div class="scanAdd"><input data-list="includeDirs" placeholder="/home/you/notes  —  Enter to add"><div class="scanAddBtn" data-list="includeDirs">Add</div></div>
+
+    <div class="scanSec">EXCLUDE DIRS</div>
+    <div class="scanNote">Never scan paths containing one of these.</div>
+    <div id="list-excludeDirs" class="scanList"></div>
+    <div class="scanAdd"><input data-list="excludeDirs" placeholder="-opt-Other-Project  —  Enter to add"><div class="scanAddBtn" data-list="excludeDirs">Add</div></div>
+
+    <div class="scanSec">EXCLUDE FILES</div>
+    <div class="scanNote">Never scan files with one of these exact names.</div>
+    <div id="list-excludeFiles" class="scanList"></div>
+    <div class="scanAdd"><input data-list="excludeFiles" placeholder="scratch-notes.md  —  Enter to add"><div class="scanAddBtn" data-list="excludeFiles">Add</div></div>
+
+    <div class="scanSec">EXCLUDE PATTERNS</div>
+    <div class="scanNote">Wildcard filters (* = anything, ? = one char) matched against full paths.</div>
+    <div id="list-excludePatterns" class="scanList"></div>
+    <div class="scanAdd"><input data-list="excludePatterns" placeholder="*/secrets/*.md  —  Enter to add"><div class="scanAddBtn" data-list="excludePatterns">Add</div></div>
+
+    <div style="position:sticky; bottom:0; margin-top:22px; padding-top:14px;
+      background:linear-gradient(transparent, rgba(2,8,18,0.96) 30%);">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div id="scanSave" class="scanAct" style="background:#0a2a33; border-color:#00c8ff;">Save changes</div>
+        <span id="scanSaved" style="color:#58e07a; font-size:12px; opacity:0; transition:opacity .3s;">Saved ✓</span>
+      </div>
+    </div>
+  </div>
+  <style>
+    #scanDrawer .scanSec { font-size:11px; letter-spacing:2px; color:#5fb7d4; margin:22px 0 8px; font-weight:700; }
+    #scanDrawer .scanSec:first-of-type { margin-top:14px; }
+    #scanDrawer .scanNote { font-size:11px; color:#6d8ba0; margin:6px 0 8px; line-height:1.45; }
+    #scanDrawer input { background:#061420; color:#d5ecf7; border:1px solid #1e3a4a;
+      border-radius:6px; padding:8px 10px; font-size:13px; outline:none; font-family:inherit; }
+    #scanDrawer input:focus { border-color:#00c8ff; }
+    #scanDrawer .scanList { display:flex; flex-wrap:wrap; gap:6px; }
+    #scanDrawer .scanList:empty::after { content:'— none —'; color:#41586a; font-size:11px; }
+    #scanDrawer .chip { display:inline-flex; align-items:center; gap:6px; background:#0a2233;
+      border:1px solid #1e4a5f; border-radius:12px; padding:4px 8px 4px 10px; font-size:12px;
+      color:#a8d4e8; max-width:100%; }
+    #scanDrawer .chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:240px; }
+    #scanDrawer .chip b { cursor:pointer; color:#ff8a8a; font-weight:700; padding:0 3px; }
+    #scanDrawer .chip b:hover { color:#ff5050; }
+    #scanDrawer .scanAdd { display:flex; gap:8px; margin-top:8px; }
+    #scanDrawer .scanAdd input { flex:1; min-width:0; }
+    #scanDrawer .scanAddBtn, #scanDrawer .scanAct { cursor:pointer; user-select:none; text-align:center;
+      border:1px solid; border-radius:7px; padding:8px 14px; font-size:12px; letter-spacing:1px;
+      color:#cdeef9; transition:filter .12s; }
+    #scanDrawer .scanAddBtn:hover, #scanDrawer .scanAct:hover { filter:brightness(1.25); }
+    #scanDrawer .scanAct:active, #scanDrawer .scanAddBtn:active { transform:scale(.98); }
+  </style>
+  <script>
+    (function () {
+      var btn = document.getElementById('scanBtn');
+      var drawer = document.getElementById('scanDrawer');
+      var cfg = { model:'', paused:false, includeDirs:[], excludeDirs:[], excludeFiles:[], excludePatterns:[] };
+      var running = false;
+      var dirty = false;
+      var LISTS = ['includeDirs', 'excludeDirs', 'excludeFiles', 'excludePatterns'];
+
+      // Same reach-Warden pattern as the rest of the page: host proxy when
+      // embedded (file:// fetch is blocked), direct fetch standalone.
+      var WARDEN = 'http://127.0.0.1:3200';
+      function api(path, method, body) {
+        if (window.pywebview && window.pywebview.api &&
+            typeof window.pywebview.api.warden_api === 'function') {
+          return window.pywebview.api.warden_api(path, method, body ? JSON.stringify(body) : '')
+            .then(function (t) { return t ? JSON.parse(t) : {}; });
+        }
+        return fetch(WARDEN + path, {
+          method: method || 'GET',
+          headers: body ? { 'Content-Type': 'application/json' } : undefined,
+          body: body ? JSON.stringify(body) : undefined
+        }).then(function (r) { return r.json(); });
+      }
+
+      function markDirty() { dirty = true; }
+      function renderList(key) {
+        var box = document.getElementById('list-' + key);
+        box.textContent = '';
+        cfg[key].forEach(function (v, i) {
+          var chip = document.createElement('span');
+          chip.className = 'chip';
+          var t = document.createElement('span'); t.textContent = v; t.title = v;
+          var x = document.createElement('b'); x.textContent = '✕'; x.title = 'Remove';
+          x.addEventListener('click', function () { cfg[key].splice(i, 1); renderList(key); markDirty(); });
+          chip.appendChild(t); chip.appendChild(x);
+          box.appendChild(chip);
+        });
+      }
+      function addEntry(key, val) {
+        val = (val || '').trim();
+        if (!val || cfg[key].indexOf(val) !== -1) return;
+        cfg[key].push(val);
+        renderList(key);
+        markDirty();
+      }
+
+      function paintStatus() {
+        var el = document.getElementById('scanStatus');
+        var parts = [];
+        parts.push(running ? '● Scan running' : '○ Scan idle');
+        if (cfg.paused) parts.push('paused');
+        el.textContent = parts.join('  ·  ');
+        el.style.color = running ? '#58e07a' : '#7fb2c8';
+        document.getElementById('scanRun').style.display = running ? 'none' : '';
+        document.getElementById('scanStop').style.display = running ? '' : 'none';
+      }
+
+      function loadConfig() {
+        return api('/api/memory/scan-config').then(function (d) {
+          cfg = {
+            model: d.model || '', paused: !!d.paused,
+            includeDirs: d.includeDirs || [], excludeDirs: d.excludeDirs || [],
+            excludeFiles: d.excludeFiles || [], excludePatterns: d.excludePatterns || []
+          };
+          running = !!d.running;
+          dirty = false;
+          document.getElementById('scanModel').value = cfg.model;
+          document.getElementById('scanPaused').checked = cfg.paused;
+          LISTS.forEach(renderList);
+          paintStatus();
+        }).catch(function () {
+          document.getElementById('scanStatus').textContent = 'Warden unreachable';
+        });
+      }
+
+      function save() {
+        cfg.model = document.getElementById('scanModel').value.trim();
+        cfg.paused = document.getElementById('scanPaused').checked;
+        return api('/api/memory/scan-config', 'POST', cfg).then(function (d) {
+          running = !!d.running;
+          dirty = false;
+          var ok = document.getElementById('scanSaved');
+          ok.style.opacity = 1;
+          setTimeout(function () { ok.style.opacity = 0; }, 1600);
+          paintStatus();
+        });
+      }
+
+      btn.addEventListener('click', function () {
+        var open = drawer.style.display === 'none';
+        drawer.style.display = open ? 'block' : 'none';
+        if (open) loadConfig();
+      });
+      document.getElementById('scanClose').addEventListener('click', function () {
+        drawer.style.display = 'none';
+      });
+      document.getElementById('scanModel').addEventListener('input', markDirty);
+      document.getElementById('scanPaused').addEventListener('change', markDirty);
+
+      document.querySelectorAll('#scanDrawer .scanAddBtn').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var inp = document.querySelector('#scanDrawer input[data-list="' + b.dataset.list + '"]');
+          addEntry(b.dataset.list, inp.value); inp.value = ''; inp.focus();
+        });
+      });
+      document.querySelectorAll('#scanDrawer .scanAdd input').forEach(function (inp) {
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') { addEntry(inp.dataset.list, inp.value); inp.value = ''; }
+        });
+      });
+      document.getElementById('scanRun').addEventListener('click', function () {
+        if (dirty) save();
+        api('/api/memory/classify', 'POST', {}).then(function () {
+          running = true; paintStatus();
+        });
+      });
+      document.getElementById('scanStop').addEventListener('click', function () {
+        api('/api/memory/scan-config', 'POST', { stop: true }).then(paintStatus);
+      });
+      document.getElementById('scanSave').addEventListener('click', save);
+
+      // Live running/paused state while the drawer is open (config edits stay
+      // local until Save — a poll overwriting the in-progress edits would be
+      // maddening, so only the run state refreshes).
+      setInterval(function () {
+        if (drawer.style.display === 'none') return;
+        api('/api/memory/scan-config').then(function (d) {
+          if (dirty) return; // never clobber in-progress edits
+          running = !!d.running; cfg.paused = !!d.paused;
+          document.getElementById('scanPaused').checked = cfg.paused;
+          paintStatus();
+        }).catch(function () {});
+      }, 3000);
+    })();
+  </script>
+  <script>
+    // THREE, EffectComposer, RenderPass, UnrealBloomPass, OutputPass,
+    // OrbitControls and RoomEnvironment are globals from bundle.js
+    (async function () {
+
+    if (typeof THREE === 'undefined') {
+      var el = document.getElementById('bootError');
+      el.style.display = 'block';
+      el.textContent = 'THREE is not defined.\n\nbundle.js failed to load.\n\nRequired structure:\n\n  memory-galaxy.html\n  marm-memory-map/\n    └── bundle.js\n\nOpen the HTML from the same folder that contains the marm-memory-map directory.';
+      return;
+    }
+    if (typeof EffectComposer === 'undefined' || typeof OrbitControls === 'undefined' || typeof RoomEnvironment === 'undefined') {
+      var el = document.getElementById('bootError');
+      el.style.display = 'block';
+      el.textContent = 'Three.js addons missing.\nEffectComposer / OrbitControls / RoomEnvironment not found on window.\nThe bundle may be incomplete or failed to execute.';
+      return;
+    }
+
+    // ---------- The brain: taxonomy + fact index ----------
+    // The STRUCTURE comes from Warden (data/memory-tree.json, served at
+    // :3200/api/memory-tree) — a knowledge tree of the user and the machine,
+    // user-side weighted (routines, family, people, projects, preferences
+    // are the point of the system). The DETAILS come from the same call:
+    // the memory-tree log classifier files durable facts as
+    // "memory tree — <path>: <fact>" and records each one in Warden's
+    // memory_tree_facts index at file time, so every star lights from ONE
+    // request — no per-node MARM probing, no rate limits, no semantic
+    // misses. The classifier files new facts → the activity ring flares
+    // → the page re-fetches the index (debounced) and counts update.
+
+    // Deterministic RNG
+    let seed = 1337;
+    function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+    // ---------- Label cosmetics ----------
+    // Node titles should read like proper nouns, not raw extractor output.
+    // MARM's NER emits lowercase fragments ("granite", "network manager"),
+    // stray wrapping quotes and trailing punctuation. Strip the noise, then
+    // title-case fully-lowercase names — short vowel-starved tokens go CAPS
+    // (iwd → IWD, mcp → MCP, but linux → Linux). Idempotent, so cached and
+    // fresh labels both converge to the same rendering.
+    const SMALL_WORDS = new Set(['a', 'an', 'the', 'of', 'in', 'on', 'at', 'by',
+      'for', 'to', 'and', 'or', 'vs', 'with', 'from', 'into', 'over', 'under']);
+    function prettyLabel(raw) {
+      let l = String(raw == null ? '' : raw)
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s"'`]+/, '')
+        .replace(/[\s"'`]+$/, '')
+        .replace(/[\s:,;.]+$/, '')
+        .trim();
+      if (!l) return '';
+      if (l === l.toLowerCase() && /[a-z]/.test(l)) {
+        if (!l.includes(' ') && l.length <= 5 && (l.match(/[aeiouy]/g) || []).length <= 1) {
+          return l.toUpperCase();
+        }
+        return l.split(' ').map((w, i) =>
+          SMALL_WORDS.has(w) && i > 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)
+        ).join(' ');
+      }
+      return l;
+    }
+
+    // Taxonomy fetch. Embedded in the Qt WebEngine voice window, fetch()
+    // from a file:// iframe to :3200 is blocked — route through the host's
+    // warden_api proxy (jarvis_window.py, via the panels.html postMessage
+    // bridge; returns the raw response body string, '' on error).
+    // Standalone (normal browser) it's a direct fetch — status-server sends
+    // Access-Control-Allow-Origin: *.
+    const WARDEN_BASE = 'http://127.0.0.1:3200';
+    async function fetchTaxonomy() {
+      let text = '';
+      if (window.pywebview && window.pywebview.api &&
+          typeof window.pywebview.api.warden_api === 'function') {
+        text = await window.pywebview.api.warden_api('/api/memory-tree', 'GET', '');
+      } else {
+        const r = await fetch(WARDEN_BASE + '/api/memory-tree');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        text = await r.text();
+      }
+      const data = JSON.parse(text);
+      if (!data || !Array.isArray(data.roots) || !data.roots.length) {
+        throw new Error('taxonomy has no roots');
+      }
+      return data;  // { roots, facts }
+    }
+
+    // Flatten the taxonomy into render nodes: every node carries its full
+    // path ("User > Preferences > Desktop"), its MARM recall query (defaults
+    // to the path), its parent, its depth and its root index (branch color).
+    function buildTree(roots) {
+      const out = [];
+      const walk = (nd, parentIdx, depth, prefix, rootIdx) => {
+        const p = prefix ? prefix + ' > ' + nd.n : nd.n;
+        const idx = out.length;
+        out.push({
+          id: idx, label: nd.n, path: p, query: nd.q || p,
+          parent: parentIdx, depth, rootIdx,
+          children: [], mention_count: 0, memories: null
+        });
+        if (parentIdx != null) out[parentIdx].children.push(idx);
+        (nd.c || []).forEach(ch => walk(ch, idx, depth + 1, p, rootIdx));
+      };
+      roots.forEach((r, ri) => walk(r, null, 0, '', ri));
+      return out;
+    }
+
+    // Distribute the server's fact index over the tree. A fact filed at a
+    // path belongs to its exact node and rolls up every ancestor — a root
+    // always reads as the sum of its branch. Pure data, no painting, so it
+    // can run at boot before the star geometry exists.
+    function distributeFacts(facts) {
+      const byPath = new Map();
+      for (let i = 0; i < NU; i++) byPath.set(nodes[i].path, i);
+      for (let i = 0; i < NU; i++) { nodes[i].memories = []; nodes[i].mention_count = 0; }
+      for (const f of facts) {
+        const idx = byPath.get(String(f.path || ''));
+        if (idx == null) continue;  // path no longer in the taxonomy
+        const m = { fact: f.fact, ts: f.ts, path: f.path };
+        for (let i = idx; i != null; i = nodes[i].parent) {
+          const nd = nodes[i];
+          if (nd.memories.length < 12) nd.memories.push(m);
+          nd.mention_count++;
+        }
+      }
+    }
+
+    // ---------- Build the brain from the taxonomy ----------
+    // No demo fallback — the tree IS the map. If Warden is unreachable the
+    // page can't render anything meaningful anyway.
+    let nodes;
+    let bootFacts = [];
+    try {
+      const tax = await fetchTaxonomy();
+      nodes = buildTree(tax.roots);
+      bootFacts = Array.isArray(tax.facts) ? tax.facts : [];
+    } catch (e) {
+      var bel = document.getElementById('bootError');
+      bel.style.display = 'block';
+      bel.textContent = 'Memory tree unavailable.\n\n' + (e && e.message || e) +
+        '\n\nWarden serves the taxonomy at http://127.0.0.1:3200/api/memory-tree' +
+        ' — check warden.service.';
+      return;
+    }
+
+    // The nucleus: the center of the brain. Every root branches off it.
+    const NU = nodes.length;
+    nodes.push({
+      id: NU, label: 'Memory Nucleus', path: '', query: '',
+      parent: null, depth: -1, rootIdx: -1,
+      children: [], mention_count: 4096, memories: null
+    });
+    nodes[NU].children = nodes.filter(n => n.depth === 0).map(n => n.id);
+    distributeFacts(bootFacts);
+
+    // Edges: parent→child streams + root→nucleus spokes. adj[][] drives the
+    // edge rendering, hover highlighting and the branch lists.
+    const adj = nodes.map(() => []);
+    nodes.forEach((n, i) => {
+      if (n.parent != null) {
+        adj[n.parent].push({ j: i, weight: 0.6 });
+        adj[i].push({ j: n.parent, weight: 0.6 });
+      }
+      if (n.depth === 0) {
+        adj[i].push({ j: NU, weight: 0.85 });
+        adj[NU].push({ j: i, weight: 0.85 });
+      }
+      n.degree = adj[i].length;
+    });
+    const N = nodes.length;  // tree nodes + nucleus
+
+    // Debug handle (matches the window.memoryMap convention below).
+    window.__galaxyGraph = { source: 'memory tree',
+      labels: nodes.slice(0, NU).map(n => n.path),
+      mentions: nodes.slice(0, NU).map(n => n.mention_count) };
+
+
+    // ---------- Knowledge-tree layout ----------
+    // Roots sit on a Fibonacci sphere around the nucleus (the center of the
+    // brain); branches fan outward with depth — each child's direction is
+    // its own sphere direction pulled toward its branch root's, so a branch
+    // reads as one organ of the brain rather than an undifferentiated star
+    // cloud. shSeed re-deals the per-star jitter (the periodic glide);
+    // branch STRUCTURE never moves.
+    const ROOT_N = nodes.reduce((s, n) => s + (n.depth === 0 ? 1 : 0), 0);
+    function fibDir(k, M) {
+      const ga = Math.PI * (3 - Math.sqrt(5));
+      const y = 1 - (2 * k + 1) / M;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = ga * k;
+      return new THREE.Vector3(Math.cos(th) * r, y, Math.sin(th) * r).normalize();
+    }
+    // deterministic per-star jitter hash: (node, seed, channel) -> [0,1)
+    function jit(i, s, ch) {
+      let x = (i * 374761393 + s * 668265263 + ch * 2246822519) >>> 0;
+      x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+      return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+    }
+    const DEPTH_R = [74, 118, 152];
+    function branchDir(i) {
+      const nd = nodes[i];
+      const rootDir = fibDir(nd.rootIdx, ROOT_N);
+      if (nd.depth === 0) return rootDir;
+      if (nd.depth === 1) return rootDir.clone().lerp(fibDir(i, NU), 0.42).normalize();
+      return branchDir(nd.parent).lerp(fibDir(i, NU), 0.5).normalize();
+    }
+    function position(i, shSeed) {
+      if (i === NU) return new THREE.Vector3(0, 0, 0);
+      const nd = nodes[i];
+      const R = DEPTH_R[Math.min(nd.depth, DEPTH_R.length - 1)];
+      const amp = nd.depth === 0 ? 5 : 7;
+      const dir = nd.depth === 0 ? fibDir(nd.rootIdx, ROOT_N) : branchDir(i);
+      return dir.clone().multiplyScalar(R).add(new THREE.Vector3(
+        (jit(i, shSeed, 1) - 0.5) * amp,
+        (jit(i, shSeed, 2) - 0.5) * amp,
+        (jit(i, shSeed, 3) - 0.5) * amp
+      ));
+    }
+    const positions = nodes.map((_, i) => position(i, 0));
+    positions[NU] = new THREE.Vector3(0, 0, 0);
+
+    // ---------- Auto-shuffle ----------
+    // The memory map is a living system — new concepts appear, new connections
+    // get made — so instead of one frozen arrangement drifting into dead
+    // empty space, the whole map periodically GLIDES to a fresh deal:
+    // clusters keep their members and their visual distinctness, but trade
+    // anchor spots. The nucleus never moves. Manual: memoryMap.shuffle().
+    const SHUFFLE_INTERVAL = 36;   // seconds between auto-shuffles
+    const SHUFFLE_DURATION = 4.2;  // glide length, seconds
+    let shuffleSeed = 0;
+    let shuffleT0 = -1;            // clock time the current glide started
+    let nextShuffleAt = SHUFFLE_INTERVAL;
+    const fromPos = positions.map(p => p.clone());
+    const toPos = positions.map(p => p.clone());
+
+    function beginShuffle(now) {
+      shuffleSeed++;
+      for (let i = 0; i < nodes.length; i++) {
+        fromPos[i].copy(positions[i]);
+        toPos[i].copy(position(i, shuffleSeed));
+      }
+      toPos[NU].set(0, 0, 0);
+      shuffleT0 = now;
+    }
+
+    // ---------- Scene ----------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x020308);
+    scene.fog = new THREE.FogExp2(0x020308, 0.0015);
+
+    const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 0.1, 6000);
+    camera.position.set(0, 42, 235);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 0.95;
+    document.getElementById('scene').appendChild(renderer.domElement);
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.03).texture;
+
+    // Controlled bloom — soft neural glow, not white-out. The radius is kept
+    // WIDE on purpose: UnrealBloomPass blurs through a halving mip chain,
+    // and a tight radius leaves the deepest (1/32) mips barely blurred — the
+    // upscaled composite then ends in hard-edged SQUARES where each glow
+    // stops instead of fading out. Wide radius + modest strength = round,
+    // soft falloff. The explicit setSize below also rebuilds the bloom
+    // buffers at the real canvas size — if this iframe booted before it was
+    // laid out, the constructor's innerWidth/Height were stale, which is the
+    // other classic square-bloom cause (bloom covering a wrong square region).
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(innerWidth, innerHeight),
+      0.38,   // strength — modest; the starfield shaders are already additive
+      0.85,   // radius — wide so the mip-chain blurs stay round to the edge
+      0.8     // threshold — only bright cores bloom
+    );
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+    if (composer.setPixelRatio) composer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    composer.setSize(innerWidth, innerHeight);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.048;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.32;
+    controls.minDistance = 24;
+    controls.maxDistance = 700;
+
+    // ---------- Textures ----------
+    function makeGlowTexture() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 128;
+      const ctx = c.getContext('2d');
+      const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+      g.addColorStop(0.0, 'rgba(255,255,255,1)');
+      g.addColorStop(0.22, 'rgba(255,255,255,0.88)');
+      g.addColorStop(0.55, 'rgba(255,255,255,0.25)');
+      g.addColorStop(1.0, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 128, 128);
+      return new THREE.CanvasTexture(c);
+    }
+    const glowTex = makeGlowTexture();
+
+    function makeFlareTexture() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 256;
+      const ctx = c.getContext('2d');
+      ctx.globalCompositeOperation = 'lighter';
+      // soft core
+      const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 42);
+      g.addColorStop(0, 'rgba(255,255,255,0.98)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 256, 256);
+      // anamorphic horizontal streak
+      const streak = (x0, y0, x1, y1, w, a) => {
+        const lg = ctx.createLinearGradient(x0, y0, x1, y1);
+        lg.addColorStop(0, `rgba(255,255,255,0)`);
+        lg.addColorStop(0.5, `rgba(255,255,255,${a})`);
+        lg.addColorStop(1, `rgba(255,255,255,0)`);
+        ctx.fillStyle = lg;
+        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        const len = Math.hypot(x1 - x0, y1 - y0);
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(Math.atan2(y1 - y0, x1 - x0));
+        ctx.fillRect(-len / 2, -w / 2, len, w);
+        ctx.restore();
+      };
+      streak(8, 128, 248, 128, 5.5, 0.85);   // main anamorphic
+      streak(8, 128, 248, 128, 1.8, 0.6);
+      streak(128, 12, 128, 244, 3.2, 0.55);  // vertical
+      streak(40, 40, 216, 216, 1.6, 0.35);
+      streak(216, 40, 40, 216, 1.6, 0.35);
+      return new THREE.CanvasTexture(c);
+    }
+    const flareTex = makeFlareTexture();
+
+    // ---------- Deep space backdrop ----------
+    const starGroup = new THREE.Group();
+    scene.add(starGroup);
+
+    function makeStars(count, rMin, rMax, size, opacity, palette) {
+      const pos = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+      const c = new THREE.Color();
+      for (let i = 0; i < count; i++) {
+        const r = rMin + rnd() * (rMax - rMin);
+        const th = rnd() * Math.PI * 2;
+        const ph = Math.acos(2 * rnd() - 1);
+        pos[i*3]   = r * Math.sin(ph) * Math.cos(th);
+        pos[i*3+1] = r * Math.cos(ph);
+        pos[i*3+2] = r * Math.sin(ph) * Math.sin(th);
+        c.set(palette[Math.floor(rnd() * palette.length)]).multiplyScalar(0.35 + rnd() * 0.45);
+        col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      const m = new THREE.PointsMaterial({
+        size, map: glowTex, vertexColors: true, transparent: true, opacity,
+        blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true, fog: false
+      });
+      const pts = new THREE.Points(g, m);
+      starGroup.add(pts);
+      return pts;
+    }
+
+    // Richer multi-layer starfield
+    const farStars = makeStars(3800, 900, 2100, 2.9, 0.58, [0xa8c4ff, 0x8ba8ff, 0xd0b8ff, 0x9aeeff, 0xffd6ec, 0xfff0d0]);
+    const midStars = makeStars(900, 320, 820, 1.85, 0.42, [0x9ab8ff, 0xb0c8ff, 0xe8f0ff, 0xc8d8ff]);
+    const nearDust = makeStars(400, 180, 420, 1.2, 0.28, [0x7a9cff, 0xa0b8ff, 0xd0e0ff]);
+
+    // Twinkling stars (shader)
+    function makeTwinkleStars(count, rMin, rMax, size, opacity) {
+      const pos = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+      const phase = new Float32Array(count);
+      const speed = new Float32Array(count);
+      const ssize = new Float32Array(count);
+      const palette = [0xa8c4ff, 0x8ba8ff, 0xd0b8ff, 0x9aeeff, 0xffd6ec, 0xfff0d0, 0xffffff];
+      const c = new THREE.Color();
+      for (let i = 0; i < count; i++) {
+        const r = rMin + rnd() * (rMax - rMin);
+        const th = rnd() * Math.PI * 2;
+        const ph = Math.acos(2 * rnd() - 1);
+        pos[i*3]   = r * Math.sin(ph) * Math.cos(th);
+        pos[i*3+1] = r * Math.cos(ph);
+        pos[i*3+2] = r * Math.sin(ph) * Math.sin(th);
+        c.set(palette[Math.floor(rnd() * palette.length)]).multiplyScalar(0.55 + rnd() * 0.45);
+        col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+        phase[i] = rnd() * Math.PI * 2;
+        speed[i] = 0.35 + rnd() * 1.7;
+        ssize[i] = 0.45 + rnd() * 1.2;
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+      g.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1));
+      g.setAttribute('aSpeed', new THREE.BufferAttribute(speed, 1));
+      g.setAttribute('aSize', new THREE.BufferAttribute(ssize, 1));
+      const m = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uMap: { value: glowTex },
+          uScale: { value: innerHeight * 0.5 * renderer.getPixelRatio() },
+          uSize: { value: size },
+          uOpacity: { value: opacity }
+        },
+        vertexShader: `
+          attribute vec3 aColor;
+          attribute float aPhase;
+          attribute float aSpeed;
+          attribute float aSize;
+          uniform float uTime;
+          uniform float uScale;
+          uniform float uSize;
+          varying vec3 vColor;
+          varying float vTw;
+          void main() {
+            vColor = aColor;
+            vTw = 0.28 + 0.72 * (0.5 + 0.5 * sin(uTime * aSpeed + aPhase));
+            vec4 mv = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = uSize * aSize * (0.55 + 0.9 * vTw) * (uScale / max(1.0, -mv.z));
+            gl_Position = projectionMatrix * mv;
+          }`,
+        fragmentShader: `
+          uniform sampler2D uMap;
+          uniform float uOpacity;
+          varying vec3 vColor;
+          varying float vTw;
+          void main() {
+            float a = texture2D(uMap, gl_PointCoord).a;
+            gl_FragColor = vec4(vColor * vTw * uOpacity * a, 1.0);
+          }`,
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+      });
+      const pts = new THREE.Points(g, m);
+      starGroup.add(pts);
+      return m;
+    }
+    const twinkleMat = makeTwinkleStars(1200, 450, 1900, 3.6, 0.92);
+
+    // Nebulae — richer, more cinematic washes
+    const NEBULAE = [
+      { color: 0x2e1a6e, pos: [-980, 420, -1100], size: 1250, op: 0.13 },
+      { color: 0x0e2a6a, pos: [1080, -340, -780], size: 1050, op: 0.11 },
+      { color: 0x0c4a4a, pos: [640, 740, 860], size: 1120, op: 0.10 },
+      { color: 0x52165a, pos: [-760, -640, 760], size: 980, op: 0.12 },
+      { color: 0x1a3a7a, pos: [220, -860, -1200], size: 1080, op: 0.10 },
+      { color: 0x3a2060, pos: [-400, 200, 900], size: 900, op: 0.09 },
+      { color: 0x1a4050, pos: [700, -100, -500], size: 850, op: 0.08 }
+    ];
+    const nebulaSprites = [];
+    NEBULAE.forEach(({ color, pos, size, op }) => {
+      const sm = new THREE.SpriteMaterial({
+        map: glowTex, color, transparent: true, opacity: op,
+        blending: THREE.AdditiveBlending, depthWrite: false, fog: false
+      });
+      const s = new THREE.Sprite(sm);
+      s.position.set(pos[0], pos[1], pos[2]);
+      s.scale.setScalar(size);
+      starGroup.add(s);
+      nebulaSprites.push({ s, base: op, phase: rnd() * Math.PI * 2, speed: 0.045 + rnd() * 0.07 });
+    });
+
+    // Wide central haze
+    const haze = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: 0x3a2f80, transparent: true, opacity: 0.055,
+      blending: THREE.AdditiveBlending, depthWrite: false, fog: false
+    }));
+    haze.scale.setScalar(1050);
+    starGroup.add(haze);
+    nebulaSprites.push({ s: haze, base: 0.055, phase: 1.8, speed: 0.04 });
+
+    // ---------- Concept stars: real starfield points, NOT glowing balls ----------
+    const nodeGroup = new THREE.Group();
+    scene.add(nodeGroup);
+    const nodeMeshes = []; // invisible hit targets only
+
+    // Star colors — realistic stellar sequence
+    const starPalette = [
+      0x9eb8ff, // blue-white
+      0xc8d8ff, // white
+      0xfff0e0, // warm white
+      0xffe0b0, // yellow
+      0xffc878, // orange
+      0xffa060, // red-orange
+      0xb0c8ff, // pale blue
+      0xe8d0ff  // soft violet-white
+    ];
+
+    // Nucleus (4096) excluded — it would flatten every tree star's scale.
+    // Facts were distributed at boot, so this already reflects the index;
+    // refreshFacts() recomputes it on every re-fetch.
+    let maxMentions = Math.max(1, ...nodes.slice(0, NU).map(n => n.mention_count));
+    function mentionFactor(mentions) {
+      return 0.3 + 0.7 * Math.log1p(mentions) / Math.log1p(maxMentions);
+    }
+    const WHITE = new THREE.Color(0xffffff);
+
+    // Build a single Points cloud for all concept stars
+    const starCount = nodes.length;
+    const starPos = new Float32Array(starCount * 3);
+    const starCol = new Float32Array(starCount * 3);
+    const starSize = new Float32Array(starCount);
+    const starPhase = new Float32Array(starCount);
+    const starSpeed = new Float32Array(starCount);
+
+    const hitTargets = [];
+
+    nodes.forEach((n, i) => {
+      const p = positions[i];
+      starPos[i*3] = p.x;
+      starPos[i*3+1] = p.y;
+      starPos[i*3+2] = p.z;
+
+      const mf = mentionFactor(n.mention_count);
+      const deg = n.degree;
+      // Roots sit bigger than leaves (degree = child count), and a star
+      // brightens/grows as MARM counts land on its node.
+      const baseSize = (i === NU) ? 10.0 : (3.2 + Math.pow(deg, 0.7) * 1.2 + mf * 1.9);
+      starSize[i] = baseSize;
+      starPhase[i] = rnd() * Math.PI * 2;
+      starSpeed[i] = 0.4 + rnd() * 1.2;
+
+      // One color per BRANCH (root) — each organ of the brain reads as a
+      // coherent stream, not confetti.
+      const c = new THREE.Color(starPalette[(n.rootIdx >= 0 ? n.rootIdx : 0) % starPalette.length]);
+      // Nucleus is warm galactic core
+      if (i === NU) c.set(0xffe8c0);
+      const bright = (i === NU) ? 1.0 : (0.5 + mf * 0.5);
+      starCol[i*3] = c.r * bright;
+      starCol[i*3+1] = c.g * bright;
+      starCol[i*3+2] = c.b * bright;
+
+      // Invisible hit sphere for interaction
+      const hitR = Math.max(baseSize * 3.5, 7);
+      const hit = new THREE.Mesh(
+        new THREE.SphereGeometry(hitR, 6, 5),
+        new THREE.MeshBasicMaterial({ visible: false })
+      );
+      hit.position.copy(p);
+      hit.userData = {
+        index: i,
+        hl: false,
+        isNucleus: i === NU,
+        baseSize,
+        baseColor: c.clone(),
+        twPhase: starPhase[i],
+        twSpeed: starSpeed[i]
+      };
+      nodeGroup.add(hit);
+      nodeMeshes.push(hit);
+      hitTargets.push(hit);
+    });
+
+    const starGeo = new THREE.BufferGeometry();
+    starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+    starGeo.setAttribute('aColor', new THREE.BufferAttribute(starCol, 3));
+    starGeo.setAttribute('aSize', new THREE.BufferAttribute(starSize, 1));
+    starGeo.setAttribute('aPhase', new THREE.BufferAttribute(starPhase, 1));
+    starGeo.setAttribute('aSpeed', new THREE.BufferAttribute(starSpeed, 1));
+
+    // Shader: real stars — tiny cores with optional cross flare, no big soft balls
+    const conceptStarMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uMap: { value: glowTex },
+        uFlare: { value: flareTex },
+        uScale: { value: innerHeight * 0.5 * renderer.getPixelRatio() },
+        uOpacity: { value: 0.95 }
+      },
+      vertexShader: `
+        attribute vec3 aColor;
+        attribute float aSize;
+        attribute float aPhase;
+        attribute float aSpeed;
+        uniform float uTime;
+        uniform float uScale;
+        varying vec3 vColor;
+        varying float vTw;
+        varying float vSize;
+        void main() {
+          vColor = aColor;
+          vTw = 0.75 + 0.25 * (0.5 + 0.5 * sin(uTime * aSpeed + aPhase));
+          vSize = aSize;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          // Small point size — these are stars, not orbs
+          gl_PointSize = aSize * (0.9 + 0.25 * vTw) * (uScale / max(40.0, -mv.z));
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform sampler2D uMap;
+        uniform float uOpacity;
+        varying vec3 vColor;
+        varying float vTw;
+        varying float vSize;
+        void main() {
+          // Soft core only — no big diffuse ball
+          vec2 uv = gl_PointCoord - 0.5;
+          float d = length(uv) * 2.0;
+          float core = exp(-d * d * 4.5);
+          float halo = exp(-d * d * 1.4) * 0.25;
+          float a = (core + halo) * vTw * uOpacity;
+          if (a < 0.01) discard;
+          gl_FragColor = vec4(vColor * (0.85 + 0.4 * core), a);
+        }`,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const conceptStars = new THREE.Points(starGeo, conceptStarMat);
+    nodeGroup.add(conceptStars);
+
+    // Galactic core: a tight cluster of extra stars around the nucleus (not one ball)
+    const coreCount = 80;
+    const corePos = new Float32Array(coreCount * 3);
+    const coreCol = new Float32Array(coreCount * 3);
+    const coreSize = new Float32Array(coreCount);
+    for (let i = 0; i < coreCount; i++) {
+      const r = Math.pow(rnd(), 0.6) * 22;
+      const th = rnd() * Math.PI * 2;
+      const ph = Math.acos(2 * rnd() - 1);
+      corePos[i*3]   = r * Math.sin(ph) * Math.cos(th);
+      corePos[i*3+1] = r * Math.cos(ph) * 0.6;
+      corePos[i*3+2] = r * Math.sin(ph) * Math.sin(th);
+      const warm = new THREE.Color().setHSL(0.08 + rnd() * 0.06, 0.55, 0.7 + rnd() * 0.25);
+      coreCol[i*3] = warm.r;
+      coreCol[i*3+1] = warm.g;
+      coreCol[i*3+2] = warm.b;
+      coreSize[i] = 0.8 + rnd() * 2.2;
+    }
+    const coreGeo = new THREE.BufferGeometry();
+    coreGeo.setAttribute('position', new THREE.BufferAttribute(corePos, 3));
+    coreGeo.setAttribute('aColor', new THREE.BufferAttribute(coreCol, 3));
+    coreGeo.setAttribute('aSize', new THREE.BufferAttribute(coreSize, 1));
+    coreGeo.setAttribute('aPhase', new THREE.BufferAttribute(new Float32Array(coreCount).map(() => rnd()*6.28), 1));
+    coreGeo.setAttribute('aSpeed', new THREE.BufferAttribute(new Float32Array(coreCount).map(() => 0.5+rnd()), 1));
+    const coreStars = new THREE.Points(coreGeo, conceptStarMat);
+    nodeGroup.add(coreStars);
+
+    // Dim point light at galactic center
+    const coreLight = new THREE.PointLight(0xffe0b0, 3500, 400, 1.8);
+    nodeGroup.add(coreLight);
+
+    // Ambient space lighting only
+    const ambient = new THREE.AmbientLight(0x12182a, 0.9);
+    scene.add(ambient);
+    const keyLight = new THREE.PointLight(0x8899cc, 4000, 1000, 1.6);
+    keyLight.position.set(200, 220, 160);
+    scene.add(keyLight);
+    const rim = new THREE.PointLight(0x5544aa, 2500, 800, 1.7);
+    rim.position.set(-220, -120, -160);
+    scene.add(rim);
+
+    // ---------- Edges: faint stellar streams / dust lanes ----------
+    const edgeGroup = new THREE.Group();
+    scene.add(edgeGroup);
+    const edgeLines = [];
+    const fadingEdges = [];  // freshly (re)linked streams ramping up to opacity
+
+    const EDGE_SEGS = 20;
+    const _edgeTmp = new THREE.Vector3();
+    // Refresh an edge to the CURRENT node positions — called for every edge
+    // each frame while a shuffle glides, so the stellar streams stay attached
+    // to their stars instead of detaching as fixed curves.
+    function updateEdgeGeometry(l) {
+      const ud = l.userData;
+      const va = positions[ud.a], vb = positions[ud.b];
+      ud.len = va.distanceTo(vb);
+      ud.curve.v0.copy(va);
+      ud.curve.v1.copy(va).lerp(vb, ud.midT).addScaledVector(ud.midDir, ud.len * ud.midScale);
+      ud.curve.v2.copy(vb);
+      const arr = l.geometry.attributes.position.array;
+      for (let s = 0; s <= EDGE_SEGS; s++) {
+        ud.curve.getPoint(s / EDGE_SEGS, _edgeTmp);
+        arr[s*3] = _edgeTmp.x; arr[s*3+1] = _edgeTmp.y; arr[s*3+2] = _edgeTmp.z;
+      }
+      l.geometry.attributes.position.needsUpdate = true;
+    }
+
+    function makeEdgeLine(a, b, weight, baseColor) {
+      const va = positions[a], vb = positions[b];
+      const curve = new THREE.QuadraticBezierCurve3(va.clone(), va.clone(), vb.clone());
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((EDGE_SEGS + 1) * 3), 3));
+      const m = new THREE.LineBasicMaterial({
+        color: baseColor, transparent: true, opacity: 0.03 + weight * 0.05,
+        blending: THREE.AdditiveBlending, depthWrite: false, fog: false
+      });
+      const l = new THREE.Line(g, m);
+      l.userData = {
+        a, b, weight, curve, baseOpacity: m.opacity,
+        baseColor: new THREE.Color(baseColor), len: 0,
+        midT: 0.32 + rnd() * 0.36,
+        midDir: new THREE.Vector3(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize(),
+        midScale: 0.13 + rnd() * 0.15
+      };
+      updateEdgeGeometry(l);
+      edgeGroup.add(l);
+      edgeLines.push(l);
+    }
+
+    for (let i = 0; i < adj.length; i++) {
+      for (const { j, weight } of adj[i]) {
+        if (i < j) makeEdgeLine(i, j, weight, j === NU ? 0xe0b870 : 0x90a8e8);
+      }
+    }
+
+    // Synaptic pulse particles traveling along edges
+    const PULSES = 90;
+    const pulses = [];
+    const puTmp = new THREE.Vector3();
+    const puPos = new Float32Array(PULSES * 3);
+    const puCol = new Float32Array(PULSES * 3);
+    const puGeo = new THREE.BufferGeometry();
+    puGeo.setAttribute('position', new THREE.BufferAttribute(puPos, 3));
+    puGeo.setAttribute('color', new THREE.BufferAttribute(puCol, 3));
+    const puStarlight = new THREE.Color(0xfff6e8);
+
+    function pulseColor(k) {
+      const c = pulses[k].e.userData.baseColor.clone().lerp(puStarlight, 0.5);
+      pulses[k].r = c.r; pulses[k].g = c.g; pulses[k].b = c.b;
+      puCol[k*3] = c.r; puCol[k*3+1] = c.g; puCol[k*3+2] = c.b;
+      puGeo.attributes.color.needsUpdate = true;
+    }
+
+    for (let k = 0; k < PULSES; k++) {
+      pulses.push({
+        e: edgeLines[Math.floor(rnd() * edgeLines.length)],
+        t: rnd(),
+        speed: 14 + rnd() * 32
+      });
+      pulseColor(k);
+    }
+
+    const puMat = new THREE.PointsMaterial({
+      size: 1.8, map: glowTex, vertexColors: true, transparent: true, opacity: 0.55,
+      blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true, fog: false
+    });
+    scene.add(new THREE.Points(puGeo, puMat));
+
+    // ---------- Fill-in: per-node memory counts from the fact index ----------
+    // Boot already distributed Warden's fact index over the tree (every
+    // star is lit on the first frame — no probe warm-up). This is the
+    // refresh path: re-pull the index, recompute counts, repaint. The
+    // classifier files new facts during dump periods → the activity ring
+    // flares → a debounced refresh lands here within seconds.
+    function paintSlot(i) {
+      const n = nodes[i];
+      const mf = mentionFactor(n.mention_count);
+      const size = (i === NU) ? 10.0 : (3.2 + Math.pow(n.degree, 0.7) * 1.2 + mf * 1.9);
+      // One color per BRANCH (root) — each organ of the brain reads as a
+      // coherent stream, not confetti.
+      const c = new THREE.Color(starPalette[(n.rootIdx >= 0 ? n.rootIdx : 0) % starPalette.length]);
+      if (i === NU) c.set(0xffe8c0);
+      const bright = (i === NU) ? 1.0 : (0.5 + mf * 0.5);
+      starGeo.attributes.aSize.array[i] = size;
+      starGeo.attributes.aColor.array[i*3] = c.r * bright;
+      starGeo.attributes.aColor.array[i*3+1] = c.g * bright;
+      starGeo.attributes.aColor.array[i*3+2] = c.b * bright;
+      starGeo.attributes.aSize.needsUpdate = true;
+      starGeo.attributes.aColor.needsUpdate = true;
+      const ud = nodeMeshes[i].userData;
+      ud.baseSize = size;
+      ud.baseColor = c.clone();
+    }
+
+
+    // Re-pull the whole fact index and repaint. One cheap HTTP call, no
+    // per-node MARM probes — every star lights from the same response.
+    let refreshing = false;
+    async function refreshFacts() {
+      if (refreshing) return false;
+      refreshing = true;
+      try {
+        const tax = await fetchTaxonomy();
+        distributeFacts(Array.isArray(tax.facts) ? tax.facts : []);
+        maxMentions = Math.max(1, ...nodes.slice(0, NU).map(n => n.mention_count));
+        for (let i = 0; i < NU; i++) paintSlot(i);
+        window.__galaxyGraph = { source: 'memory tree',
+          labels: nodes.slice(0, NU).map(n => n.path),
+          mentions: nodes.slice(0, NU).map(n => n.mention_count) };
+        return true;
+      } catch (e) {
+        return false;  // Warden momentarily unreachable — next cadence retries
+      } finally { refreshing = false; }
+    }
+    const REFRESH_INTERVAL_S = 15 * 60;  // fact-index re-fetch cadence
+    let nextAutoRefreshAt = REFRESH_INTERVAL_S; // boot already lit every star
+
+
+    // ---------- Interaction ----------
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let hovered = null;
+    let selected = null;
+    let flyTarget = null;
+    let flyLook = null;
+
+    ['pointerdown', 'wheel', 'keydown', 'touchstart'].forEach(ev =>
+      renderer.domElement.addEventListener(ev, () => { flyTarget = null; flyLook = null; }, { passive: true })
+    );
+
+    function owningNodeIndex(obj) {
+      let o = obj;
+      while (o && o.userData.index == null) o = o.parent;
+      return o ? o.userData.index : null;
+    }
+
+    function resetHighlight() {
+      edgeLines.forEach(l => {
+        l.material.opacity = l.userData.baseOpacity;
+        l.material.color.copy(l.userData.baseColor);
+      });
+      nodeMeshes.forEach((m) => { m.userData.hl = false; });
+      // reset star sizes/colors in the buffer
+      const sizes = starGeo.attributes.aSize;
+      const cols = starGeo.attributes.aColor;
+      for (let i = 0; i < nodes.length; i++) {
+        sizes.array[i] = nodeMeshes[i].userData.baseSize;
+        const c = nodeMeshes[i].userData.baseColor;
+        const bright = (i === NU) ? 1.0 : 0.75;
+        cols.array[i*3] = c.r * bright;
+        cols.array[i*3+1] = c.g * bright;
+        cols.array[i*3+2] = c.b * bright;
+      }
+      sizes.needsUpdate = true;
+      cols.needsUpdate = true;
+    }
+
+    function highlightNode(idx) {
+      resetHighlight();
+      if (idx == null) return;
+      const connected = new Set();
+      for (const { j } of adj[idx]) connected.add(j);
+      connected.add(idx);
+      const sizes = starGeo.attributes.aSize;
+      const cols = starGeo.attributes.aColor;
+      nodeMeshes.forEach((m, i) => {
+        if (connected.has(i)) {
+          m.userData.hl = true;
+          sizes.array[i] = m.userData.baseSize * 1.8;
+          cols.array[i*3] = Math.min(1, cols.array[i*3] * 1.4 + 0.2);
+          cols.array[i*3+1] = Math.min(1, cols.array[i*3+1] * 1.4 + 0.2);
+          cols.array[i*3+2] = Math.min(1, cols.array[i*3+2] * 1.4 + 0.25);
+        }
+      });
+      sizes.needsUpdate = true;
+      cols.needsUpdate = true;
+      edgeLines.forEach(l => {
+        if (l.userData.a === idx || l.userData.b === idx) {
+          l.material.color.set(0xc8d8ff);
+          l.material.opacity = 0.22 + l.userData.weight * 0.18;
+        }
+      });
+    }
+
+    // Activity highlight API
+    const activeNodes = new Map();
+    const activeEdges = new Map();
+    let activityTimer = null;
+    const ACTIVITY_ATTACK  = 0.09;
+    const ACTIVITY_RELEASE = 0.28;
+    const ACTIVITY_BREATH  = 3.8;
+
+    function _stepLevel(st, dt) {
+      const tau = st.target ? ACTIVITY_ATTACK : ACTIVITY_RELEASE;
+      st.level += (st.target - st.level) * (1 - Math.exp(-dt / tau));
+      return st.level;
+    }
+    function _breath(t) {
+      return 0.76 + 0.24 * Math.sin(t * ACTIVITY_BREATH);
+    }
+
+    function highlightTopics(topics, options = {}) {
+      const list = topics == null ? [] : (Array.isArray(topics) ? topics : [topics]);
+      const intensity = Math.max(0.1, Math.min(1,
+        isFinite(options.intensity) ? options.intensity : 1));
+      const resolved = new Set();
+      list.forEach((topic) => {
+        if (typeof topic === 'number') { resolved.add(topic); return; }
+        const q = String(topic).trim().toLowerCase();
+        if (!q) return;
+        for (let i = 0; i < nodes.length; i++) {
+          if (nodes[i].label.toLowerCase().includes(q)) resolved.add(i);
+        }
+      });
+      activeNodes.forEach((st, i) => { if (!resolved.has(i)) st.target = 0; });
+      activeEdges.forEach(st => { st.target = 0; });
+      resolved.forEach(i => {
+        const st = activeNodes.get(i);
+        if (st) { st.target = 1; st.intensity = intensity; }
+        else activeNodes.set(i, { level: 0, target: 1, intensity });
+      });
+      edgeLines.forEach(l => {
+        if (resolved.has(l.userData.a) && resolved.has(l.userData.b)) {
+          const st = activeEdges.get(l);
+          if (st) { st.target = 1; st.intensity = intensity; }
+          else activeEdges.set(l, { level: 0, target: 1, intensity });
+        }
+      });
+      if (activityTimer != null) { clearTimeout(activityTimer); activityTimer = null; }
+      const duration = Number(options && options.duration);
+      if (isFinite(duration) && duration > 0) {
+        activityTimer = setTimeout(clearActivity, duration);
+      }
+      return resolved.size;
+    }
+
+    function clearActivity() {
+      if (activityTimer != null) { clearTimeout(activityTimer); activityTimer = null; }
+      activeNodes.forEach(st => { st.target = 0; });
+      activeEdges.forEach(st => { st.target = 0; });
+    }
+
+    window.memoryMap = {
+      highlightTopics: highlightTopics,
+      clearActivity: clearActivity,
+      shuffle: () => beginShuffle(clock.getElapsedTime()),
+      refresh: refreshFacts,
+      // Debug/demo handle: fire a brain-scan flare by taxonomy path or free
+      // query — memoryMap.flare('User > Preferences') or
+      // memoryMap.flare('what router did we buy', { recall: true }).
+      flare: (q, opts = {}) => {
+        const outward = !opts.recall;   // default: a write filing in
+        const dur = isFinite(opts.duration) ? opts.duration : 3;
+        if (typeof q === 'number') { brainFlare(q, 1, dur, outward, outward); return 1; }
+        const s = String(q || '').trim().toLowerCase();
+        if (!s) return 0;
+        const idx = nodes.findIndex(nd => nd.path && nd.path.toLowerCase() === s);
+        if (idx >= 0) { brainFlare(idx, 1, dur, outward, outward); return 1; }
+        const regions = regionsForQuery(s);
+        regions.forEach(rg => brainFlare(rg.i, rg.intensity, dur, outward, outward));
+        return regions.length;
+      }
+    };
+
+    // ---------- Brain-scan: live write/recall flares ----------
+    // The galaxy polls Warden's memory-activity ring — facts the classifier
+    // files, distiller writes, and every MARM recall the assistant makes —
+    // and lights up the region each event touches, brain-scan style. A WRITE
+    // flares the node's whole pathway with fast white-gold pulses shot FROM
+    // the nucleus outward (a fact being filed); a RECALL flares the matching
+    // regions with branch-colored pulses draining back TO the nucleus (a
+    // region being read out). Events in one poll are staggered so a filed
+    // batch sweeps across the brain instead of strobing everything at once.
+
+    const ACT_POLL_MS = 2000;         // visible cadence
+    const ACT_POLL_HIDDEN_MS = 12000; // the voice window isn't showing the galaxy
+    let actLastTs = -1;               // -1 = baseline on first successful poll
+    let actPollBusy = false;
+    let actTimer = null;
+
+    async function fetchActivity() {
+      let text = '';
+      if (window.pywebview && window.pywebview.api &&
+          typeof window.pywebview.api.warden_api === 'function') {
+        text = await window.pywebview.api.warden_api('/api/memory-tree/activity', 'GET', '');
+      } else {
+        const r = await fetch(WARDEN_BASE + '/api/memory-tree/activity');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        text = await r.text();
+      }
+      const data = JSON.parse(text);
+      return { events: Array.isArray(data.events) ? data.events : [], running: !!data.running };
+    }
+
+    // The pathway from the nucleus down to a node: [NU, root, …, idx]. Roots'
+    // parent is null, so the nucleus caps every chain manually.
+    function chainTo(idx) {
+      const chain = [];
+      for (let i = idx; i != null; i = nodes[i].parent) chain.unshift(i);
+      chain.unshift(NU);
+      return chain;
+    }
+
+    // The edge object connecting two adjacent node indices, if the graph has one.
+    function edgeBetween(a, b) {
+      for (const l of edgeLines) {
+        if ((l.userData.a === a && l.userData.b === b) ||
+            (l.userData.a === b && l.userData.b === a)) return l;
+      }
+      return null;
+    }
+
+    // Send a dedicated signal pulse down one edge, recycled from the ambient
+    // pool. Edges are stored a→b with a<b; a is the parent on tree edges but
+    // the CHILD on nucleus spokes (NU is the highest index) — hence the rev
+    // logic below instead of assuming direction.
+    function injectPulse(edge, outward, hot) {
+      let k = -1;
+      for (let p = 0; p < PULSES; p++) {
+        if (!pulses[p].e || pulses[p].t > 0.85) { k = p; break; }
+      }
+      if (k < 0) return;
+      const p = pulses[k];
+      const ud = edge.userData;
+      const aIsParent = !!nodes[ud.b] && nodes[ud.b].parent === ud.a;
+      p.e = edge;
+      p.t = 0;
+      p.rev = outward ? !aIsParent : aIsParent;
+      p.speed = 60 + rnd() * 30;   // signal pulses are fast — a shot, not a drift
+      const c = hot ? new THREE.Color(0xffedc4) : ud.baseColor.clone().lerp(puStarlight, 0.6);
+      p.r = c.r; p.g = c.g; p.b = c.b;
+      puCol[k*3] = c.r; puCol[k*3+1] = c.g; puCol[k*3+2] = c.b;
+      puGeo.attributes.color.needsUpdate = true;
+    }
+
+    // Light one node's whole pathway — THE brain-scan flare. `outward` shoots
+    // the pulses nucleus→leaf (a write being filed), otherwise leaf→nucleus
+    // (a region being read out); `hot` tints them white-gold instead of the
+    // branch color. Hops are staged ~110 ms apart so the flare RIPPLES down
+    // the branch instead of snapping on, and every hop's glow self-expires
+    // (st.until) so overlapping flares never cancel each other.
+    function brainFlare(idx, intensity, durationS, outward, hot) {
+      if (idx == null || idx < 0 || idx > NU) return;
+      const chain = idx === NU ? [NU] : chainTo(idx);
+      chain.forEach((i, hop) => {
+        // The node itself burns brightest; glow fades half a hop per step
+        // toward the nucleus, which still breathes (it's in every pathway).
+        const k = hop === 0 ? 0.25 : Math.pow(0.55, chain.length - 1 - hop);
+        const inten = Math.max(0.1, intensity * (0.3 + 0.7 * k));
+        setTimeout(() => {
+          const until = clock.getElapsedTime() + durationS;
+          const st = activeNodes.get(i);
+          if (st) {
+            st.target = 1;
+            st.intensity = Math.max(st.intensity || 0, inten);
+            st.until = Math.max(st.until || 0, until);
+          } else {
+            activeNodes.set(i, { level: 0, target: 1, intensity: inten, until });
+          }
+          if (hop > 0) {
+            const edge = edgeBetween(chain[hop - 1], i);
+            if (edge) {
+              const est = activeEdges.get(edge);
+              if (est) {
+                est.target = 1;
+                est.intensity = Math.max(est.intensity || 0, inten * 0.9);
+                est.until = Math.max(est.until || 0, until);
+              } else {
+                activeEdges.set(edge, { level: 0, target: 1, intensity: inten * 0.9, until });
+              }
+              injectPulse(edge, outward, hot);
+            }
+          }
+        }, hop * 110);
+      });
+    }
+
+    // Map a free-text recall query onto the regions it touches: exact label
+    // hits count most, then whole words inside multi-word labels, then
+    // anywhere in the path. Top few regions flare, score-scaled.
+    const QUERY_STOP = new Set(['the','and','for','with','that','this','from','are','was','were',
+      'you','your','what','when','where','how','why','who','about','into','has','have','had','not',
+      'but','all','can','could','will','would','should','its','their','there','them','then','than',
+      'some','just','also','been','being','does','did','doing','any','too','very','which','while',
+      'because','through','during','before','after','again','once','out','off','over','under',
+      'between','against','here','each','other','more','most','such','only','same','now','warden',
+      'memory','system','said','tell','know','need','want','make','made','thing','stuff']);
+    function regionsForQuery(q) {
+      const words = String(q || '').toLowerCase().split(/[^a-z0-9&']+/)
+        .filter(w => w.length > 2 && !QUERY_STOP.has(w));
+      if (!words.length) return [];
+      const hits = [];
+      for (let i = 0; i < NU; i++) {
+        const n = nodes[i];
+        const label = n.label.toLowerCase();
+        const p = n.path.toLowerCase();
+        let score = 0;
+        for (const w of words) {
+          if (label === w) score += 3;
+          else if (label.split(/[^a-z]+/).some(lw => lw === w)) score += 2.5;
+          else if (label.includes(w) || w.includes(label)) score += 1.5;
+          else if (p.includes(w)) score += 1;
+        }
+        if (score > 0) hits.push([i, score]);
+      }
+      if (!hits.length) return [];
+      hits.sort((a, b) => b[1] - a[1]);
+      const maxScore = hits[0][1];
+      return hits.slice(0, 6).map(([i, s]) =>
+        ({ i, intensity: Math.min(1, 0.45 + 0.55 * (s / maxScore)) }));
+    }
+
+    // A write flare means the classifier just filed facts — re-fetch the
+    // index (debounced a few seconds so a filed batch costs ONE fetch).
+    let factsRefreshAt = -1;
+    function queueFactRefresh() {
+      factsRefreshAt = clock.getElapsedTime() + 4;
+    }
+    function runFactRefresh() {
+      if (factsRefreshAt < 0) return;
+      if (clock.getElapsedTime() < factsRefreshAt) return;
+      factsRefreshAt = -1;
+      void refreshFacts();
+    }
+
+    // New ring events → flares. Baselines on the first poll (anything already
+    // in the ring predates this view — no history replay), then dedupes on ts.
+    function onActivityEvents(events) {
+      if (!events.length) return;
+      if (actLastTs < 0) {
+        actLastTs = Math.max(0, ...events.map(e => Number(e.ts) || 0));
+        return;
+      }
+      const fresh = events.filter(e => (Number(e.ts) || 0) > actLastTs);
+      if (!fresh.length) return;
+      actLastTs = Math.max(actLastTs, ...fresh.map(e => Number(e.ts) || 0));
+      // Cap + stagger: a big filed batch sweeps region by region.
+      fresh.slice(-24).forEach((ev, n) => {
+        setTimeout(() => {
+          if (document.visibilityState === 'hidden') return;
+          if (ev.kind === 'write') {
+            const pl = String(ev.path || '').toLowerCase();
+            const idx = pl ? nodes.findIndex(nd => nd.path && nd.path.toLowerCase() === pl) : -1;
+            if (idx >= 0 && idx < NU) {
+              brainFlare(idx, 1, 3.4, true, true);
+              queueFactRefresh();
+            } else {
+              // Distiller write / unknown path — keyword-map the fact text.
+              const regions = regionsForQuery(ev.fact || ev.path || ev.query);
+              regions.forEach(rg => {
+                brainFlare(rg.i, rg.intensity, 3, true, true);
+                queueFactRefresh();
+              });
+            }
+          } else {
+            // A region being read out — branch-colored, draining inward.
+            const regions = regionsForQuery(ev.query || ev.fact || '');
+            regions.forEach(rg => brainFlare(rg.i, rg.intensity, 2.6, false, false));
+          }
+        }, n * 240);
+      });
+    }
+
+    async function activityTick() {
+      if (actPollBusy) return;
+      actPollBusy = true;
+      try {
+        const data = await fetchActivity();
+        onActivityEvents(data.events);
+      } catch (e) { /* Warden momentarily unreachable — next tick retries */ }
+      const hidden = document.visibilityState === 'hidden';
+      runFactRefresh();
+      actPollBusy = false;
+      actTimer = setTimeout(activityTick, hidden ? ACT_POLL_HIDDEN_MS : ACT_POLL_MS);
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && actTimer != null) {
+        clearTimeout(actTimer);
+        actTimer = null;
+        activityTick();
+      }
+    });
+    activityTick();
+
+    function onPointerMove(e) {
+      mouse.x = (e.clientX / innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(nodeMeshes, true);
+      const idx = hits.length ? owningNodeIndex(hits[0].object) : null;
+      if (idx !== hovered) {
+        hovered = idx;
+        highlightNode(selected != null ? selected : idx);
+        document.body.style.cursor = idx != null ? 'pointer' : 'default';
+      }
+    }
+    renderer.domElement.addEventListener('pointermove', onPointerMove);
+
+    // Drag-vs-click guard: OrbitControls owns the pointer for camera motion,
+    // so a "click" that follows a drag is camera movement, not intent. Only
+    // a click that landed within a few px of its pointerdown selects a star.
+    let downX = 0, downY = 0;
+    renderer.domElement.addEventListener('pointerdown', (e) => {
+      downX = e.clientX; downY = e.clientY;
+    }, { passive: true });
+    renderer.domElement.addEventListener('click', (e) => {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+      mouse.x = (e.clientX / innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(nodeMeshes, true);
+      if (hits.length) selectNode(owningNodeIndex(hits[0].object));
+    });
+
+    // Full node details open in a SEPARATE window (pywebview popup via the
+    // host bridge when embedded; window.open when running standalone in a
+    // normal browser). The tiny in-page chip stays as a fallback. The body is
+    // the node's ACTUAL recalled memories from MARM — the point of the map:
+    // click a star, read what Warden knows there.
+    function openDetailWindow(idx) {
+      const n = nodes[idx];
+      if (!n) return;
+      const esc = s => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      let mini, body;
+      if (idx === NU) {
+        mini = n.children.length + ' branches of the brain';
+        body = '<h3>Branches of the brain</h3>' + n.children.map(j =>
+          `<div class="row"><span>${esc(nodes[j].label)}</span><span class="w">${nodes[j].children.length}</span></div>`).join('');
+      } else {
+        mini = (n.children.length ? n.children.length + (n.children.length === 1 ? ' branch · ' : ' branches · ') : '') +
+          n.mention_count + (n.mention_count === 1 ? ' memory' : ' memories');
+        const memRow = (m) => {
+          const content = String(m.fact || m.content || '').slice(0, 400);
+          const meta = 'filed ' + String(m.ts || '').slice(0, 10);
+          return `<div class="mem"><div class="mc">${esc(content)}</div><div class="mm">${esc(meta)}</div></div>`;
+        };
+        if (!n.memories || !n.memories.length) {
+          body = '<div style="color:#7d8db3;font-size:12px;">nothing filed here yet — the memory-tree classifier has not found facts for this branch.</div>';
+        } else {
+          body = `<div class="mini" style="margin-bottom:6px">${n.mention_count} filed here${n.mention_count > n.memories.length ? ' — showing the latest ' + n.memories.length : ''}</div>` +
+            n.memories.map(memRow).join('');
+        }
+      }
+      const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(n.label)}</title><style>
+        html,body { background:#020308; height:100%; }
+        body { margin:0; color:#e8f0ff; font-family:system-ui,sans-serif; overflow:hidden; }
+        .card { position:absolute; inset:7px; border-radius:15px; padding:20px 18px;
+          background:linear-gradient(165deg, rgba(13,22,41,.97), rgba(3,5,12,.98));
+          border:1px solid rgba(78,201,255,.3);
+          box-shadow:0 0 26px rgba(78,201,255,.2), inset 0 0 46px rgba(78,201,255,.05);
+          overflow-y:auto; }
+        .card::-webkit-scrollbar { width:4px; }
+        .card::-webkit-scrollbar-thumb { background:rgba(78,201,255,.35); border-radius:3px; }
+        h1 { font-size:17px; font-weight:600; margin:2px 30px 8px 0; word-break:break-word;
+          color:#dff1ff; text-shadow:0 0 14px rgba(78,201,255,.35); }
+        .mini { color:#7d8db3; font-size:11px; letter-spacing:.4px; margin-bottom:16px; }
+        h3 { font-size:10px; text-transform:uppercase; letter-spacing:1.4px; color:#5d6f96;
+          margin:14px 0 8px; }
+        .row { display:flex; justify-content:space-between; gap:10px; padding:7px 11px;
+          border-radius:9px; font-size:13px; }
+        .row:hover { background:rgba(78,201,255,.11); }
+        .w { color:#4ec9ff; font-variant-numeric:tabular-nums; }
+        .mem { padding:9px 11px; border-radius:9px; font-size:12.5px; line-height:1.45; }
+        .mem:hover { background:rgba(78,201,255,.11); }
+        .mc { color:#cfe0f5; word-break:break-word; }
+        .mm { color:#5d6f96; font-size:10px; margin-top:4px; letter-spacing:.4px; }
+        .x { position:absolute; top:12px; right:12px; width:24px; height:24px; line-height:24px;
+          text-align:center; border-radius:50%; font-size:14px; color:#7d8db3; cursor:pointer;
+          background:rgba(140,180,255,.08); border:none; }
+        .x:hover { background:rgba(255,120,120,.18); color:#ffb3b3; }
+        .drag { position:fixed; bottom:12px; left:0; right:0; text-align:center;
+          font-size:10px; color:#41527a; letter-spacing:.5px; pointer-events:none; }
+      </style></head><body>
+        <div class="card">
+          <button class="x" id="x" title="Close">✕</button>
+          <h1>${esc(n.label)}</h1>
+          <div class="mini">${esc(mini)}${idx !== NU ? ' · ' + esc(n.path) : ''}</div>
+          ${body}
+        </div>
+        <div class="drag">drag anywhere to move this window</div>
+        <script>
+          document.getElementById('x').onclick = () => {
+            if (window.pywebview && window.pywebview.api &&
+                typeof window.pywebview.api.close_memory_window === 'function') {
+              try { window.pywebview.api.close_memory_window(); } catch (e) { /* ignore */ }
+            }
+          };
+        <\/script>
+      </body></html>`;
+      if (window.pywebview && window.pywebview.api &&
+          typeof window.pywebview.api.open_memory_window === 'function') {
+        window.pywebview.api.open_memory_window(n.label, doc).catch(() => {});
+      } else {
+        const w = window.open('', '_blank', 'width=420,height=560');
+        if (w) { w.document.write(doc); w.document.close(); }
+      }
+    }
+
+    function selectNode(idx) {
+      selected = idx;
+      highlightNode(idx);
+      const n = nodes[idx];
+      document.getElementById('npName').textContent = n.label;
+      document.getElementById('npMini').textContent = idx === NU
+        ? n.children.length + ' branches of the brain'
+        : (n.children.length ? n.children.length + (n.children.length === 1 ? ' branch · ' : ' branches · ') : '') +
+          n.mention_count + (n.mention_count === 1 ? ' memory' : ' memories');
+      const list = document.getElementById('npConns');
+      list.innerHTML = '';
+      n.children.forEach(j => {
+        const row = document.createElement('div');
+        row.className = 'conn';
+        row.title = nodes[j].path;
+        row.innerHTML = `<span>${nodes[j].label}</span><span class="w">${nodes[j].mention_count}</span>`;
+        row.addEventListener('click', () => selectNode(j));
+        list.appendChild(row);
+      });
+      document.getElementById('nodePanel').style.display = 'block';
+      openDetailWindow(idx);
+      flyTo(positions[idx]);
+    }
+
+    document.getElementById('npOpen').addEventListener('click', () => {
+      if (selected != null) openDetailWindow(selected);
+    });
+
+    document.getElementById('closePanel').addEventListener('click', () => {
+      selected = null;
+      document.getElementById('nodePanel').style.display = 'none';
+      resetHighlight();
+      flyTo(new THREE.Vector3(0, 0, 0));
+    });
+
+    // Search
+    const searchEl = document.getElementById('search');
+    const resultsEl = document.getElementById('results');
+    searchEl.addEventListener('input', () => {
+      const q = searchEl.value.trim().toLowerCase();
+      resultsEl.innerHTML = '';
+      if (!q) {
+        resultsEl.style.display = 'none';
+        window.memoryMap.clearActivity();
+        return;
+      }
+      const matches = nodes
+        .map((n, i) => ({ n, i }))
+        .filter(x => x.i !== NU && x.n.path.toLowerCase().includes(q))
+        .sort((a, b) => b.n.mention_count - a.n.mention_count)
+        .slice(0, 12);
+      window.memoryMap.highlightTopics(q);
+      if (!matches.length) { resultsEl.style.display = 'none'; return; }
+      resultsEl.style.display = 'block';
+      matches.forEach(({ n, i }) => {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.title = n.path;
+        row.innerHTML = `<span>${n.label}</span><span class="deg">${n.mention_count}</span>`;
+        row.addEventListener('click', () => {
+          window.memoryMap.clearActivity();
+          selectNode(i);
+          resultsEl.style.display = 'none';
+          searchEl.value = '';
+        });
+        resultsEl.appendChild(row);
+      });
+    });
+
+    function flyTo(target) {
+      if (target.lengthSq() < 1) {
+        flyTarget = new THREE.Vector3(0, 42, 235);
+      } else {
+        flyTarget = target.clone().multiplyScalar(1.35).add(new THREE.Vector3(0, 32, 0));
+      }
+      flyLook = target.clone();
+    }
+
+    // ---------- Animate ----------
+    const clock = new THREE.Clock();
+    let lastT = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+      const dt = Math.min(t - lastT, 0.05);
+      lastT = t;
+
+      // Auto-shuffle: fire on schedule, then glide every star, hit target and
+      // edge to its fresh deal (ease in-out; clusters move as whole blobs).
+      if (shuffleT0 < 0 && t >= nextShuffleAt) beginShuffle(t);
+      if (shuffleT0 >= 0) {
+        const rawK = Math.min(1, (t - shuffleT0) / SHUFFLE_DURATION);
+        if (rawK >= 1) {
+          shuffleT0 = -1;
+          nextShuffleAt = t + SHUFFLE_INTERVAL;
+        }
+        const k = rawK < 0.5 ? 2 * rawK * rawK : 1 - Math.pow(-2 * rawK + 2, 2) / 2;
+        for (let i = 0; i < nodes.length; i++) {
+          positions[i].lerpVectors(fromPos[i], toPos[i], k);
+          starPos[i*3]   = positions[i].x;
+          starPos[i*3+1] = positions[i].y;
+          starPos[i*3+2] = positions[i].z;
+          nodeMeshes[i].position.copy(positions[i]);
+        }
+        starGeo.attributes.position.needsUpdate = true;
+        for (let ei = 0; ei < edgeLines.length; ei++) updateEdgeGeometry(edgeLines[ei]);
+      }
+
+      // Fact-index cadence: re-fetch /api/memory-tree periodically and
+      // brighten the tree as the classifier files more facts.
+      if (t >= nextAutoRefreshAt) {
+        nextAutoRefreshAt = t + REFRESH_INTERVAL_S;
+        void refreshFacts();
+      }
+
+      // Freshly (re)linked streams ramp up to their base opacity
+      for (let fi = fadingEdges.length - 1; fi >= 0; fi--) {
+        const l = fadingEdges[fi];
+        const k = Math.min(1, (t - l.userData.fadeInAt) / 2.4);
+        l.material.opacity = l.userData.baseOpacity * (k < 1 ? k * k : 1);
+        if (k >= 1) fadingEdges.splice(fi, 1);
+      }
+
+      // Update twinkle shader
+      twinkleMat.uniforms.uTime.value = t;
+
+      // Concept Stars — update shader time + activity sizing
+      conceptStarMat.uniforms.uTime.value = t;
+
+      const sizes = starGeo.attributes.aSize;
+      const cols = starGeo.attributes.aColor;
+      let sizeDirty = false;
+      let colDirty = false;
+
+      nodeMeshes.forEach((m, i) => {
+        const ud = m.userData;
+        const st = activeNodes.get(i);
+        let act = 0;
+        if (st) {
+          // Brain-scan flares carry their own expiry (st.until, seconds on the
+          // scene clock) so many flares can overlap without one global timer
+          // cancelling the others.
+          if (st.until != null && t > st.until) st.target = 0;
+          act = _stepLevel(st, dt) * st.intensity * _breath(t);
+          if (st.target === 0 && st.level < 0.005) activeNodes.delete(i);
+        }
+        // A slot that just claimed a new concept blooms in from a dim mote
+        let spawn = 1;
+        if (ud.spawnAt != null) {
+          const raw = Math.min(1, (t - ud.spawnAt) / 1.8);
+          if (raw >= 1) ud.spawnAt = null;
+          else spawn = 1 - Math.pow(1 - raw, 3);
+        }
+        const targetSize = ud.baseSize * (ud.hl ? 1.7 : 1) * (1 + act * 0.9) * spawn;
+        if (Math.abs(sizes.array[i] - targetSize) > 0.02) {
+          sizes.array[i] = targetSize;
+          sizeDirty = true;
+        }
+        if (act > 0.05 || spawn < 1) {
+          const c = ud.baseColor;
+          const br = 0.25 + 0.75 * spawn;
+          cols.array[i*3]   = Math.min(1, c.r * br + act * 0.4);
+          cols.array[i*3+1] = Math.min(1, c.g * br + act * 0.4);
+          cols.array[i*3+2] = Math.min(1, c.b * br + act * 0.5);
+          colDirty = true;
+        }
+      });
+      if (sizeDirty) sizes.needsUpdate = true;
+      if (colDirty) cols.needsUpdate = true;
+
+      // Active edges
+      activeEdges.forEach((st, l) => {
+        if (st.until != null && t > st.until) st.target = 0;
+        const lvl = _stepLevel(st, dt);
+        if (st.target === 0 && lvl < 0.005) {
+          l.material.color.copy(l.userData.baseColor);
+          l.material.opacity = l.userData.baseOpacity;
+          activeEdges.delete(l);
+          return;
+        }
+        const glow = lvl * st.intensity * _breath(t);
+        l.material.color.copy(l.userData.baseColor).lerp(WHITE, Math.min(1, glow * 0.5));
+        l.material.opacity = Math.min(0.55, l.userData.baseOpacity + 0.28 * glow);
+      });
+
+      // Deep field drift
+      starGroup.rotation.y += dt * 0.0018;
+      farStars.material.opacity = 0.58;
+      midStars.material.opacity = 0.42;
+      nebulaSprites.forEach(nb => {
+        nb.s.material.opacity = nb.base * (0.92 + 0.08 * Math.sin(t * nb.speed + nb.phase));
+      });
+
+      // Synaptic pulses (p.rev = travel b→a — the brain-scan signal pulses
+      // use it so writes ripple nucleus→leaf and recalls drain leaf→nucleus)
+      for (let k = 0; k < PULSES; k++) {
+        const p = pulses[k];
+        if (!p.e) { puPos[k*3] = puPos[k*3+1] = puPos[k*3+2] = 0; continue; }
+        p.t += (dt * p.speed) / Math.max(1, p.e.userData.len);
+        if (p.t > 1) {
+          // Finished (or an injected signal pulse that completed) — rejoin the
+          // ambient pool: random edge, ambient speed, forward direction.
+          p.e = edgeLines[Math.floor(Math.random() * edgeLines.length)] || null;
+          p.t = 0;
+          p.rev = false;
+          p.speed = 14 + Math.random() * 32;
+          if (p.e) pulseColor(k);
+        }
+        p.e.userData.curve.getPoint(p.rev ? 1 - p.t : p.t, puTmp);
+        puPos[k*3]   = puTmp.x;
+        puPos[k*3+1] = puTmp.y;
+        puPos[k*3+2] = puTmp.z;
+        const crest = Math.pow(Math.sin(Math.PI * p.t), 0.65);
+        puCol[k*3] = p.r * crest; puCol[k*3+1] = p.g * crest; puCol[k*3+2] = p.b * crest;
+      }
+      puGeo.attributes.position.needsUpdate = true;
+      puGeo.attributes.color.needsUpdate = true;
+
+      // Camera fly
+      if (flyTarget && flyLook) {
+        camera.position.lerp(flyTarget, 0.055);
+        controls.target.lerp(flyLook, 0.055);
+        if (camera.position.distanceTo(flyTarget) < 2.5 && controls.target.distanceTo(flyLook) < 2.5) {
+          flyTarget = null; flyLook = null;
+        }
+      }
+      controls.update();
+      composer.render();
+    }
+    animate();
+
+    // Boot already distributed the fact index — every star is lit from the
+    // first frame; refreshFacts() re-pulls on the cadence above.
+
+    console.info('[memoryMap] ready — window.memoryMap.highlightTopics(topics, { intensity, duration }) / window.memoryMap.clearActivity()');
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      twinkleMat.uniforms.uScale.value = innerHeight * 0.5 * renderer.getPixelRatio();
+    });
+    })();
+  </script>
+</body>
+</html>

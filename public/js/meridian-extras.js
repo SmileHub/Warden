@@ -46,9 +46,9 @@
 
   var VIEWS = [
     ['home', 'Home'], ['chat', 'Chat'], ['logs', 'Logs'], ['talk', 'Talk'],
-    ['email', 'Email'], ['sms', 'SMS'], ['projects', 'Projects'],
+    ['email', 'Email'], ['projects', 'Projects'],
     ['calendar', 'Calendar'], ['files', 'Files'], ['automater', 'Schedules'],
-    ['heartbeat', 'Heartbeat'], ['alarms', 'Alarms'], ['vault', 'Vault'],
+    ['heartbeat', 'Heartbeat'], ['alarms', 'Alarms'],
     ['apikeys', 'API Keys'], ['accounts', 'Connected Accounts'], ['actions', 'Quick Actions']
   ];
 
@@ -404,7 +404,7 @@
      Sender name comes from the .msg-meta span app.js renders.
      ============================================================ */
 
-  var CREW_INITIALS = { atlas: 'A', byte: 'B', dexter: 'D', iris: 'I', artemis: 'Ar' };
+  var CREW_INITIALS = { atlas: 'A', dexter: 'D', iris: 'I', artemis: 'Ar' };
 
   function tagCrew(el) {
     if (!el || el.nodeType !== 1 || !el.classList) return;
@@ -412,7 +412,7 @@
     if (el.dataset.crew) return;
     var span = el.querySelector('.msg-meta span');
     var name = span ? (span.textContent || '').trim().toLowerCase() : '';
-    var m = name.match(/^(atlas|byte|dexter|iris|artemis)\b/);
+    var m = name.match(/^(atlas|dexter|iris|artemis)\b/);
     if (m) {
       el.dataset.crew = m[1];
       el.dataset.crewInitial = CREW_INITIALS[m[1]];

@@ -1,8 +1,8 @@
 /**
- * Orchestrator inbox for async sub-agent results.
+ * Seat inbox for async sub-agent results.
  *
  * Background jobs push their full results here instead of messaging the user
- * directly. The orchestrator drains unread items at turn end (or immediately
+ * directly. The seat drains unread items at turn end (or immediately
  * for urgent ones, injected mid-turn), digests them in its own voice, and can
  * chain follow-up tasks. Raw outputs stay retrievable via read_job_result.
  *
@@ -20,6 +20,10 @@ export interface InboxItem {
     read: boolean;
     finishedAt: number;
     activityLog?: { t: number; tool: string; args: string; result?: string }[];
+    // Supervisor completion verdict stamped before push (see runCompletionVerdict
+    // in index.ts). Absent when the verdict call was skipped or errored.
+    verdict?: 'confirmed' | 'failed' | 'unverifiable';
+    verdictReason?: string;
 }
 
 const items = new Map<string, InboxItem>();
@@ -43,6 +47,19 @@ export function unreadUrgent(): InboxItem[] {
 export function markRead(jobId: string): void {
     const item = items.get(jobId);
     if (item) item.read = true;
+}
+
+/** Re-queue a result after it was drained but its digest turn errored — used
+ * once per item (guarded by the caller) so an erroring digest can re-run
+ * instead of losing the result, without risking a re-digest loop. */
+export function markUnread(jobId: string): void {
+    const item = items.get(jobId);
+    if (item) {
+        item.read = false;
+        const toWake = waiters;
+        waiters = [];
+        for (const wake of toWake) wake();
+    }
 }
 
 export function get(jobId: string): InboxItem | undefined {

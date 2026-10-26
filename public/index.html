@@ -31,101 +31,117 @@
 <body>
 <div class="app" id="app">
 
-  <!-- Left rail: vertical icon nav -->
+  <!-- Left sidebar: labeled, grouped navigation -->
   <nav class="rail" aria-label="Primary">
-    <div class="rail-logo" title="Warden">J</div>
-        <div class="rail-nav">
-      <!-- Communicate -->
-      <div class="rail-group-label">Comms</div>
+    <div class="rail-logo">
+      <div class="mark">W</div>
+      <div class="word">WARDEN<small>COMMAND DECK</small></div>
+    </div>
+    <div class="rail-nav">
+      <div class="rail-group-label">Communicate</div>
       <button class="rail-btn active" data-view="chat" data-tip="Chat">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-        <span class="rail-tip">Chat</span>
+        <span class="rail-label">Chat</span>
+      </button>
+      <button class="rail-btn" data-view="marm" data-tip="MARM Memory">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a4 4 0 00-4 4v1a4 4 0 00-3 6.5A4 4 0 0012 21a4 4 0 007-6.5A4 4 0 0016 8V7a4 4 0 00-4-4z"/><circle cx="12" cy="12" r="2"/></svg>
+        <span class="rail-label">MARM</span>
+      </button>
+      <button class="rail-btn rail-btn-red" data-view="alphastack" data-tip="Alpha Stack">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l4-6 4 3 5-8 5 5"/><path d="M3 21h18"/></svg>
+        <span class="rail-label">Alpha Stack</span>
       </button>
       <button class="rail-btn" data-view="talk" data-tip="Talk">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-        <span class="rail-tip">Talk</span>
+        <span class="rail-label">Talk</span>
       </button>
       <button class="rail-btn" data-view="email" data-tip="Email">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-        <span class="rail-tip">Email</span>
+        <span class="rail-label">Email</span>
       </button>
-      <button class="rail-btn" data-view="sms" data-tip="SMS">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-        <span class="rail-tip">SMS</span>
-      </button>
-      <!-- Organize -->
-      <div class="rail-group-label">Org</div>
+
+      <div class="rail-group-label">Organize</div>
       <button class="rail-btn" data-view="projects" data-tip="Projects">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        <span class="rail-tip">Projects</span>
+        <span class="rail-label">Projects</span>
       </button>
       <button class="rail-btn" data-view="calendar" data-tip="Calendar">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-        <span class="rail-tip">Calendar</span>
+        <span class="rail-label">Calendar</span>
       </button>
-      <!-- Automate -->
-      <div class="rail-group-label">Auto</div>
+
+      <div class="rail-group-label">Automate</div>
       <button class="rail-btn" data-view="tasks" data-tip="Scheduled Tasks">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        <span class="rail-tip">Scheduled Tasks</span>
+        <span class="rail-label">Scheduled Tasks</span>
       </button>
       <button class="rail-btn" data-view="heartbeat" data-tip="Heartbeat">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        <span class="rail-tip">Heartbeat</span>
+        <span class="rail-label">Heartbeat</span>
       </button>
       <button class="rail-btn" data-view="alarms" data-tip="Alarms">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
-        <span class="rail-tip">Alarms</span>
+        <span class="rail-label">Alarms</span>
       </button>
-      <!-- Configure -->
-      <div class="rail-group-label">Config</div>
-      <button class="rail-btn" data-view="vault" data-tip="Vault">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-        <span class="rail-tip">Vault</span>
-      </button>
+
+      <div class="rail-group-label">Configure</div>
       <button class="rail-btn" data-view="apikeys" data-tip="API Keys">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
-        <span class="rail-tip">API Keys</span>
+        <span class="rail-label">API Keys</span>
       </button>
       <button class="rail-btn" data-view="accounts" data-tip="Accounts">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-        <span class="rail-tip">Accounts</span>
+        <span class="rail-label">Accounts</span>
       </button>
       <button class="rail-btn" data-view="actions" data-tip="Actions">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        <span class="rail-tip">Actions</span>
+        <span class="rail-label">Actions</span>
       </button>
-      <!-- System -->
+      <button class="rail-btn" data-view="friends" data-tip="Friends">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span class="rail-label">Friends</span>
+      </button>
+      <button class="rail-btn" data-view="social" data-tip="BotNet">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M6 8h12"/><path d="M6 13l2 2 3-3"/></svg>
+        <span class="rail-label">BotNet</span>
+      </button>
+
       <div class="rail-group-label">System</div>
       <button class="rail-btn" data-view="skills" data-tip="Skills">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        <span class="rail-tip">Skills</span>
+        <span class="rail-label">Skills</span>
       </button>
       <button class="rail-btn" data-view="activity" data-tip="Agent Activity">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        <span class="rail-tip">Agent Activity</span>
-      </button>
-      <button class="rail-btn" data-view="security" data-tip="Oculus">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        <span class="rail-tip">Oculus</span>
+        <span class="rail-label">Agent Activity</span>
       </button>
       <button class="rail-btn" data-view="logs" data-tip="Process Logs">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        <span class="rail-tip">Process Logs</span>
+        <span class="rail-label">Process Logs</span>
+      </button>
+      <button class="rail-btn" data-view="training" data-tip="Training">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10L12 5 2 10l10 5 10-5z"/><path d="M6 12v5c0 1.7 2.7 3 6 3s6-1.3 6-3v-5"/></svg>
+        <span class="rail-label">Training</span>
+      </button>
+      <!-- Mobile-only: opens the bottom More sheet with every other view.
+           Hidden on desktop by responsive.css. -->
+      <button class="rail-btn" id="btnNavMore" data-tip="More">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+        <span class="rail-label">More</span>
       </button>
     </div>
     <div class="rail-footer">
       <button class="rail-btn" id="btnAudit" data-tip="Run Audit">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-        <span class="rail-tip">Run Audit</span>
+        <span class="rail-label">Run Audit</span>
       </button>
       <button class="rail-btn" id="btnSettings" data-tip="Settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span class="rail-tip">Settings</span>
+        <span class="rail-label">Settings</span>
       </button>
       <button class="rail-btn" id="btnAddPage" data-tip="Add Dashboard Page (Beta)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
-        <span class="rail-tip">Add Page</span>
+        <span class="rail-label">Add Page</span>
       </button>
     </div>
   </nav>
@@ -180,6 +196,7 @@
             <span class="chip" id="chipIdea">root</span>
             <span class="spacer" style="flex:1"></span>
             <button class="btn btn-ghost btn-sm" id="btnNewThought" title="Start a fresh thought (clears cursor)">New Thought</button>
+            <button class="btn btn-ghost btn-sm" id="btnClearConversation" title="Delete the stored conversation log and start completely fresh">Clear Conversation</button>
           </div>
 
           <div class="messages" id="messages">
@@ -190,16 +207,13 @@
             </div>
           </div>
 
-          <div class="progress-panel collapsed" id="progressPanel">
-            <button class="progress-panel-header" id="progressPanelHeader" type="button" aria-expanded="false">
-              <span class="live-dot"></span>
-              <span class="progress-summary" id="progressSummary">No live activity</span>
-              <span class="progress-count" id="progressCount"></span>
-              <span class="progress-chevron" aria-hidden="true">▾</span>
-            </button>
-            <div class="progress-panel-body" id="progressBody">
-              <ul class="progress-list" id="progressList"></ul>
+          <div class="oversight" id="oversight">
+            <div class="oversight-head">
+              <span class="live-dot" id="oversightDot"></span>
+              <span class="oversight-title">Oversight</span>
+              <span class="oversight-count mono" id="oversightCount"></span>
             </div>
+            <div class="oversight-rows" id="oversightRows"></div>
           </div>
 
           <div class="composer">
@@ -210,10 +224,11 @@
               <!-- Mobile-only: relocated from the chat header (which wraps and
                    creates blank space on phone). Hidden on desktop via CSS. -->
               <button class="btn btn-ghost btn-sm" id="btnNewThoughtMobile" title="Start a fresh thought (clears cursor)">New Thought</button>
+              <button class="btn btn-ghost btn-sm" id="btnClearConversationMobile" title="Delete the stored conversation log and start completely fresh">Clear Conversation</button>
               <span class="spacer"></span>
             </div>
             <div class="composer-input-row">
-              <textarea id="chatInput" rows="1" placeholder="Message Warden — be specific, ask for action. Enter to send, Shift+Enter for newline."></textarea>
+              <textarea id="chatInput" rows="1" placeholder="Message Warden"></textarea>
               <button class="btn btn-primary" id="btnSend" title="Send">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                 Send
@@ -437,6 +452,77 @@
         </div>
       </section>
 
+      <!-- ===== Friends view ===== -->
+      <section class="view" id="view-friends">
+        <div class="chat-meta-row">
+          <span class="chip">friends</span>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost btn-sm" id="btnRefreshFriends">Refresh</button>
+        </div>
+        <div style="overflow-y:auto;padding:14px;flex:1;min-height:0">
+
+          <div class="section-divider">Tunnel (Tailscale)</div>
+          <div class="mono" id="friendsTunnel" style="font-size:12px">Loading…</div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-primary btn-sm" id="btnFriendsTunnelUp">Start tunnel</button>
+            <span class="spacer"></span>
+            <button class="btn btn-ghost btn-sm" id="btnFriendsCopyLink">Copy my link</button>
+          </div>
+          <div class="status mono" id="friendsTunnelStatus"></div>
+
+          <div class="section-divider" style="margin-top:20px">Your link</div>
+          <div class="mono" id="friendsLink" style="font-size:12px;word-break:break-all">—</div>
+
+          <div class="section-divider" style="margin-top:20px">Add a friend</div>
+          <div class="row">
+            <input type="text" id="friendsInviteInput" placeholder="paste a friend's link (http://…:3200)" spellcheck="false" style="flex:1">
+            <button class="btn btn-primary btn-sm" id="btnFriendsInvite">Add friend</button>
+          </div>
+          <div class="status mono" id="friendsInviteStatus"></div>
+
+          <div class="section-divider" style="margin-top:20px">Pending requests</div>
+          <div class="mono" id="friendsRequests" style="font-size:12px">None</div>
+
+          <div class="section-divider" style="margin-top:20px">Friends</div>
+          <div class="mono" id="friendsList" style="font-size:12px">None</div>
+
+          <div class="section-divider" style="margin-top:20px">Inbox (DMs, rooms, files)</div>
+          <div class="mono" id="friendsInbox" style="font-size:12px">Empty</div>
+
+          <div class="section-divider" style="margin-top:20px">Blocked</div>
+          <div class="mono" id="friendsBlocked" style="font-size:12px">None</div>
+
+          <div class="section-divider" style="margin-top:20px">Offense log</div>
+          <div class="mono" id="friendsOffenses" style="font-size:12px">None</div>
+
+        </div>
+      </section>
+
+      <!-- ===== Social view — the mesh BBS, a late-80s dial-in terminal ===== -->
+      <section class="view" id="view-social">
+        <div class="bbs-case">
+          <div class="bbs-crt" id="bbsCrt">
+            <div class="bbs-screen" id="bbsScreen">
+              <pre class="bbs-frame" id="bbsFrame" tabindex="-1"></pre>
+              <div class="bbs-status" id="bbsStatus">—</div>
+              <div class="bbs-command" id="bbsCommand">
+                <span class="bbs-keys" id="bbsKeys"></span>
+                <input type="text" id="bbsInput" placeholder=">" spellcheck="false" autocomplete="off">
+              </div>
+            </div>
+          </div>
+          <div class="bbs-bezel">
+            <span class="bbs-brand">WARDEN ▓ TRM-87</span>
+            <span class="bbs-bezel-spec">2400 BAUD · NODE LINK · HALF DUPLEX</span>
+            <span class="bbs-led-label">MODEM</span>
+            <span class="bbs-led on" id="bbsLed"></span>
+            <span class="bbs-led-label">PWR</span>
+            <span class="bbs-led on led-pwr"></span>
+          </div>
+          <input type="file" id="bbsUpload" style="display:none">
+        </div>
+      </section>
+
       <!-- ===== Activity view ===== -->
       <section class="view" id="view-activity">
         <div class="chat-meta-row">
@@ -454,17 +540,212 @@
         </div>
       </section>
 
-      <!-- ===== Oculus view (AWARENESS event log) ===== -->
-      <section class="view" id="view-security">
+      <!-- ===== Training view ===== -->
+      <!-- ===== Alpha Stack view — embeds the stack's own webapp (127.0.0.1:8765) ===== -->
+      <section class="view" id="view-alphastack">
         <div class="chat-meta-row">
-          <span class="chip">oculus events</span>
+          <span class="chip">alpha stack</span>
+          <span class="chip" id="alphaStackStatus">…</span>
           <span class="spacer"></span>
-          <button class="btn btn-ghost btn-sm" id="btnClearOculusLogs">Clear logs</button>
-          <button class="btn btn-ghost btn-sm" id="btnRefreshSecurity">Refresh</button>
+          <button class="btn btn-ghost btn-sm" id="btnAlphaStackRefresh">Refresh</button>
+        </div>
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column">
+          <iframe id="alphaStackFrame" title="Alpha Stack webapp" style="flex:1;width:100%;border:0;display:none;background:var(--bg,#111)"></iframe>
+          <div id="alphaStackFallback" class="dim mono" style="font-size:12px;padding:14px;overflow-y:auto"></div>
+        </div>
+      </section>
+
+      <!-- ===== MARM view — the memory dash, native elements (no iframe) ===== -->
+      <section class="view" id="view-marm">
+        <div class="chat-meta-row">
+          <span class="chip">marm memory</span>
+          <span class="chip" id="marmHealth">…</span>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost btn-sm" id="btnMarmRefresh">Refresh</button>
         </div>
         <div style="overflow-y:auto;padding:14px;flex:1;min-height:0">
-          <div class="section-divider">Awareness events</div>
-          <div class="activity-list" id="securityList"></div>
+          <div class="marm-stats" id="marmStats"></div>
+
+          <div class="section-divider">Ask memory (semantic)</div>
+          <div class="chat-meta-row" style="padding:0 0 8px 0">
+            <input id="marmRecallQuery" type="search" placeholder="What do you remember about…" style="flex:1;min-width:120px">
+            <button class="btn btn-ghost btn-sm" id="btnMarmRecall">Recall</button>
+          </div>
+          <div class="marm-recall" id="marmRecallOut" style="display:none"></div>
+
+          <div class="section-divider">Memories</div>
+          <div class="chat-meta-row" style="padding:0 0 8px 0">
+            <input id="marmSearch" type="search" placeholder="Search memories…" style="flex:1;min-width:120px">
+            <select id="marmProjectFilter"><option value="">all projects</option></select>
+            <select id="marmRoleFilter">
+              <option value="active">active</option>
+              <option value="all">all</option>
+              <option value="compacted">compacted</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" id="btnMarmAddMemoryToggle">+ add</button>
+          </div>
+          <div class="marm-form" id="marmAddMemoryForm" style="display:none">
+            <textarea id="marmNewContent" rows="3" placeholder="Memory content…"></textarea>
+            <div class="chat-meta-row" style="padding:0">
+              <input id="marmNewSession" placeholder="session (default: main)" style="flex:1">
+              <input id="marmNewProject" placeholder="project (optional)" style="flex:1">
+              <input id="marmNewContext" placeholder="context type (general)" style="flex:1">
+              <button class="btn btn-ghost btn-sm" id="btnMarmAddMemory">Save memory</button>
+            </div>
+          </div>
+          <div class="activity-list" id="marmMemoryList"></div>
+
+          <div class="section-divider">Compaction</div>
+          <div class="chat-meta-row" style="padding:0 0 8px 0">
+            <span class="chip" id="marmCompactionStatus">idle</span>
+            <span class="spacer"></span>
+            <button class="btn btn-ghost btn-sm" id="btnMarmCompStatus">Status</button>
+            <button class="btn btn-ghost btn-sm" id="btnMarmCompCandidates">Candidates</button>
+            <button class="btn btn-ghost btn-sm" id="btnMarmCompReview">Staged</button>
+          </div>
+          <div class="activity-list" id="marmCompactionOut"></div>
+
+          <div class="section-divider">Notebook</div>
+          <div class="chat-meta-row" style="padding:0 0 8px 0">
+            <input id="marmNotebookName" placeholder="entry name" style="flex:1">
+            <input id="marmNotebookData" placeholder="content" style="flex:2">
+            <button class="btn btn-ghost btn-sm" id="btnMarmNotebookAdd">Add entry</button>
+          </div>
+          <div class="activity-list" id="marmNotebookList"></div>
+
+          <div class="section-divider">Sessions</div>
+          <div class="chat-meta-row" style="padding:0 0 8px 0">
+            <input id="marmNewSessionName" placeholder="new session name" style="flex:1">
+            <button class="btn btn-ghost btn-sm" id="btnMarmSessionAdd">Create</button>
+          </div>
+          <div class="activity-list" id="marmSessionList"></div>
+          <div class="marm-recall" id="marmSummaryOut" style="display:none"></div>
+
+          <div class="section-divider">Recent log entries</div>
+          <div class="marm-form" id="marmAddLogForm">
+            <div class="chat-meta-row" style="padding:0 0 6px 0">
+              <input id="marmNewLogEntry" placeholder="YYYY-MM-DD-topic-summary" style="flex:2">
+              <input id="marmNewLogSession" placeholder="session (optional)" style="flex:1">
+              <button class="btn btn-ghost btn-sm" id="btnMarmAddLog">Log it</button>
+            </div>
+          </div>
+          <div class="activity-list" id="marmLogList"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-training">
+        <div class="view-header tr-header">
+          <div class="tr-title">
+            <span class="view-title">Training</span>
+            <span class="tr-sub" id="trainingSub">Audit logs → modify SFT data → train one epoch</span>
+          </div>
+          <span class="spacer"></span>
+          <span class="tr-status" id="trainingStatus" data-state="idle">idle</span>
+          <button class="btn btn-danger btn-sm" id="btnTrainingStop" disabled>Stop</button>
+        </div>
+        <div class="tr-tabs" role="tablist">
+          <button class="tr-tab active" data-trtab="loop" role="tab">Training loop</button>
+          <button class="tr-tab" data-trtab="bot" role="tab">Custom chatbot</button>
+        </div>
+        <div class="tr-body" data-trpanel="loop">
+          <!-- pipeline: one card per step, the step's button lives in its card -->
+          <div class="tr-pipe">
+            <div class="tr-step" id="trainingStepAudit" data-step="audit">
+              <div class="tr-step-head"><span class="tr-step-n">1</span><span class="tr-step-name">Audit</span><span class="tr-step-state" data-role="state"></span></div>
+              <div class="tr-step-desc">Scan Warden logs and classify failures into a catalog.</div>
+              <div class="tr-step-actions">
+                <select class="select" id="trainingDays" title="Audit window">
+                  <option value="1">1 day</option>
+                  <option value="3" selected>3 days</option>
+                  <option value="7">7 days</option>
+                </select>
+                <button class="btn btn-primary btn-sm" id="btnTrainingAudit">Audit logs</button>
+              </div>
+            </div>
+            <div class="tr-step" id="trainingStepModify" data-step="modify">
+              <div class="tr-step-head"><span class="tr-step-n">2</span><span class="tr-step-name">Modify</span><span class="tr-step-state" data-role="state"></span></div>
+              <div class="tr-step-desc">Turn the newest catalog into corrected SFT part rows.</div>
+              <div class="tr-step-actions"><button class="btn btn-ghost btn-sm" id="btnTrainingModify">Modify training data</button></div>
+            </div>
+            <div class="tr-step" id="trainingStepTrain" data-step="train">
+              <div class="tr-step-head"><span class="tr-step-n">3</span><span class="tr-step-name">Train</span><span class="tr-step-state" data-role="state"></span></div>
+              <div class="tr-step-desc">Run one LoRA epoch over the updated dataset.</div>
+              <div class="tr-step-actions"><button class="btn btn-ghost btn-sm" id="btnTrainingTrain">Train (1 epoch)</button></div>
+            </div>
+          </div>
+
+          <div class="section-divider">Newest catalog</div>
+          <div class="tr-stats" id="trainingStats"><div class="dim">No catalogs yet — run the audit.</div></div>
+
+          <!-- Hook for Artemis-flagged trainable errors (populated when the
+               backend exposes them; hidden until then). -->
+          <div id="trainingFlaggedErrors" class="tr-flagged hidden"></div>
+
+          <div class="tr-section-head">
+            <div class="section-divider">Failures</div>
+            <span class="spacer"></span>
+            <input class="input tr-search" id="trainingFailSearch" type="search" placeholder="Filter failures…">
+          </div>
+          <div class="tr-classes" id="trainingClassFilter"></div>
+          <div class="tr-fails" id="trainingCatalogs"><div class="dim">No catalogs yet.</div></div>
+
+          <div class="tr-cols">
+            <div class="tr-col">
+              <div class="section-divider">Step log <span class="tr-logstep" id="trainingLogStep"></span></div>
+              <pre class="audit-log tr-log" id="trainingTail"></pre>
+            </div>
+            <div class="tr-col tr-col-narrow">
+              <div class="section-divider">Catalog history</div>
+              <div class="tr-history" id="trainingHistory"><div class="dim">—</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Custom chatbot: intake form → granite writes persona pairs → LoRA on a granite base -->
+        <div class="tr-body hidden" data-trpanel="bot">
+          <div class="bot-pick">
+            <select class="select" id="botSelect" title="Saved chatbots"><option value="">+ New chatbot</option></select>
+            <span class="bot-model dim mono" id="botTrained"></span>
+          </div>
+
+          <div class="section-divider bot-step"><span class="tr-step-n">1</span>Intake<span class="bot-ready" id="botReady"></span></div>
+          <div class="bot-progress" id="botProgress"></div>
+          <div class="bot-form">
+            <label class="bot-field"><span>Name</span>
+              <input class="input" id="botName" maxlength="60" placeholder="What the chatbot is called"></label>
+            <label class="bot-field"><span>Base model</span>
+              <select class="select" id="botBase"><option value="">Checking…</option></select>
+              <span class="bot-base-note dim mono" id="botBaseNote"></span></label>
+            <label class="bot-field bot-wide"><span>Works for</span>
+              <input class="input" id="botOwner" placeholder="The business, team, or person it represents"></label>
+            <label class="bot-field bot-wide"><span>What it is</span>
+              <textarea id="botWhatItIs" rows="2" placeholder="One line on what kind of assistant it is"></textarea></label>
+            <label class="bot-field bot-wide"><span>What it does</span>
+              <textarea id="botWhatItDoes" rows="3" placeholder="The jobs it handles and the questions it answers"></textarea></label>
+            <label class="bot-field bot-wide"><span>Who it does it for</span>
+              <textarea id="botWhoFor" rows="2" placeholder="The people who talk to it and what they need"></textarea></label>
+            <label class="bot-field bot-wide"><span>Personality &amp; tone</span>
+              <textarea id="botPersonality" rows="2" placeholder="How it sounds: voice, warmth, formality, humor"></textarea></label>
+            <label class="bot-field bot-wide"><span>Outside its scope</span>
+              <textarea id="botHandoff" rows="2" placeholder="What it does when asked for something it doesn't handle"></textarea></label>
+          </div>
+
+          <div class="section-divider bot-step"><span class="tr-step-n">2</span>Pairs</div>
+          <div class="bot-actions">
+            <select class="select" id="botCount" title="How many pairs granite writes">
+              <option value="50">50 pairs</option>
+              <option value="100" selected>100 pairs</option>
+              <option value="200">200 pairs</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="btnBotGenerate">Save &amp; generate pairs</button>
+            <button class="btn btn-ghost btn-sm" id="btnBotSave">Save intake</button>
+            <span class="spacer"></span>
+            <button class="btn btn-primary btn-sm" id="btnBotTrain" disabled>Train chatbot →</button>
+          </div>
+          <div class="bot-pairs" id="botPairs"><div class="bot-empty">No pairs yet — fill in the intake and generate.</div></div>
+
+          <div class="section-divider">Step log <span class="tr-logstep" id="botLogStep"></span></div>
+          <pre class="audit-log tr-log" id="botTail"></pre>
         </div>
       </section>
 
@@ -474,7 +755,7 @@
           <span class="chip">process logs</span>
           <span class="spacer"></span>
           <button class="btn btn-ghost btn-sm" id="btnRefreshLogs">Refresh</button>
-          <span class="dim mono" style="font-size:10px">tail -n 200 dockbox.log</span>
+          <span class="dim mono" style="font-size:10px">tail -n 200 warden.log</span>
         </div>
         <pre class="audit-log" id="processLogsContent" style="flex:1;min-height:0;max-height:none;border-radius:6px;margin:14px;">Loading...</pre>
       </section>
@@ -482,97 +763,6 @@
 
       <!-- Chat -->
 
-
-      <!-- SMS -->
-
-<!-- ==== ported view: sms ==== -->
-      <section class="view" id="view-sms">
-        <div class="sms-security-banner" id="smsSecurityBanner" style="display:none;padding:10px 16px;background:rgba(99,102,241,0.08);border-radius:10px;margin-bottom:16px;font-size:0.82rem;color:#6366f1;align-items:center;gap:8px">
-          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-          <span id="smsSecurityText">Read-Only Mode — Sending is disabled.</span>
-        </div>
-
-        <!-- Setup state (no accounts) -->
-        <div id="smsSetup" style="display:none">
-          <div style="display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 200px)">
-            <div style="max-width:460px;width:100%;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px 32px;box-shadow:0 1px 3px rgba(0,0,0,0.06)">
-              <div style="text-align:center;margin-bottom:28px">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:12px"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-                <h2 style="font-size:1.25rem;font-weight:700;color:var(--text);margin-bottom:6px">Connect Twilio SMS</h2>
-                <p style="color:var(--text3);font-size:0.88rem;line-height:1.5">Enter your Twilio credentials to send and receive SMS messages.</p>
-              </div>
-
-              <div style="margin-bottom:16px">
-                <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--text2);margin-bottom:5px;letter-spacing:0.01em">Account Name</label>
-                <input type="text" id="smsSetupName" placeholder="e.g. Business SMS" style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);box-sizing:border-box;transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
-              </div>
-              <div style="margin-bottom:16px">
-                <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--text2);margin-bottom:5px;letter-spacing:0.01em">Account SID</label>
-                <input type="text" id="smsSetupSid" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);box-sizing:border-box;font-family:monospace;transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
-              </div>
-              <div style="margin-bottom:16px">
-                <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--text2);margin-bottom:5px;letter-spacing:0.01em">Auth Token</label>
-                <input type="password" id="smsSetupToken" placeholder="Your auth token" style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);box-sizing:border-box;transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
-              </div>
-              <div style="margin-bottom:16px">
-                <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--text2);margin-bottom:5px;letter-spacing:0.01em">Phone Number</label>
-                <input type="text" id="smsSetupPhone" placeholder="+12025551234" style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);box-sizing:border-box;transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
-              </div>
-              <div style="margin-bottom:20px">
-                <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
-                  <input type="checkbox" id="smsSetupReadOnly" checked style="accent-color:var(--accent);width:16px;height:16px"> Read-only mode (disable sending)
-                </label>
-              </div>
-              <p id="smsSetupError" style="color:var(--danger);font-size:0.82rem;min-height:1.2em;margin-bottom:12px;text-align:center"></p>
-              <div style="display:flex;gap:10px">
-                <button onclick="UserDash.testSmsConnection()" style="flex:1;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);cursor:pointer;font-size:0.88rem;font-weight:500;transition:background 0.15s">Test Connection</button>
-                <button onclick="UserDash.saveSmsAccount()" style="flex:1;padding:10px 16px;border:none;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer;font-size:0.88rem;font-weight:600;box-shadow:0 2px 8px rgba(37,99,235,0.2);transition:background 0.15s">Save Account</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Active state (has accounts) -->
-        <div id="smsActive" style="display:none">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-            <div class="view-title" style="margin:0">SMS Messages</div>
-            <div style="display:flex;align-items:center;gap:8px">
-              <select id="smsAccountSelect" onchange="UserDash.loadSmsMessages()" style="padding:7px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.82rem;background:var(--surface);color:var(--text)"></select>
-              <button onclick="UserDash.refreshSms()" title="Refresh" style="width:34px;height:34px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text2);cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center">&#x21bb;</button>
-              <button onclick="UserDash.showSmsSettings()" title="Settings" style="width:34px;height:34px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text2);cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center">&#x2699;</button>
-            </div>
-          </div>
-
-          <!-- Compose -->
-          <div id="smsCompose" style="margin-bottom:20px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:12px">
-            <div style="display:flex;gap:8px;margin-bottom:10px">
-              <input type="text" id="smsComposeTo" placeholder="To: +1234567890" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
-            </div>
-            <div style="display:flex;gap:8px">
-              <input type="text" id="smsComposeBody" placeholder="Type a message..." style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:0.9rem;background:var(--bg);color:var(--text);transition:border-color 0.15s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'" onkeydown="if(event.key==='Enter')UserDash.sendSmsMessage()">
-              <button onclick="UserDash.sendSmsMessage()" id="smsSendBtn" style="padding:10px 20px;border:none;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer;font-size:0.88rem;font-weight:600;white-space:nowrap;box-shadow:0 2px 8px rgba(37,99,235,0.2);transition:background 0.15s">Send</button>
-            </div>
-            <p id="smsSendError" style="color:var(--danger);font-size:0.82rem;min-height:1em;margin-top:6px"></p>
-          </div>
-
-          <!-- Message list -->
-          <div id="smsMessageList" style="display:flex;flex-direction:column;gap:10px">
-            <p style="color:var(--text3);text-align:center;padding:32px">Loading messages...</p>
-          </div>
-        </div>
-
-        <!-- Settings modal (edit/delete account) -->
-        <div id="smsSettingsModal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.45);backdrop-filter:blur(4px);align-items:center;justify-content:center">
-          <div style="background:var(--surface);border-radius:16px;padding:32px;max-width:440px;width:90%;margin:auto;position:relative;box-shadow:0 16px 48px rgba(0,0,0,0.15)">
-            <h3 style="margin-bottom:20px;font-size:1.15rem;font-weight:700;color:var(--text)">SMS Account Settings</h3>
-            <div id="smsSettingsContent"></div>
-            <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end">
-              <button onclick="UserDash.deleteSmsAccount()" style="padding:9px 18px;border:1px solid var(--danger);border-radius:10px;background:transparent;color:var(--danger);cursor:pointer;font-size:0.85rem;font-weight:500;transition:background 0.15s">Delete Account</button>
-              <button onclick="document.getElementById('smsSettingsModal').style.display='none'" style="padding:9px 18px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);cursor:pointer;font-size:0.85rem;font-weight:500;transition:background 0.15s">Close</button>
-            </div>
-          </div>
-        </div>
-      </section>
 
       <!-- Projects -->
 
@@ -700,6 +890,15 @@
           <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
           <span>Set reminders and deadlines. Alarms play a sound and show a notification when they fire.</span>
         </div>
+        <div class="alarm-cal-section">
+          <h3 class="alarm-cal-heading">Upcoming from your calendar</h3>
+          <div id="alarm-calendar-list" class="alarm-cal-list"></div>
+        </div>
+        <div class="alarm-cal-section">
+          <h3 class="alarm-cal-heading">Scheduled reminders</h3>
+          <div id="alarm-reminders-list" class="alarm-cal-list"></div>
+        </div>
+        <h3 class="alarm-cal-heading" style="margin-top:22px">Manual alarms</h3>
         <div id="alarm-list"></div>
       </div>
     </section>
@@ -895,50 +1094,7 @@ Write what you want the AI to do periodically. For example:
         </div>
       </section>
 
-      <!-- Vault -->
-
-<!-- ==== ported view: vault ==== -->
-      <section class="view" id="view-vault">
-        <div class="view-header">
-          <h2 class="view-title">Vault</h2>
-        </div>
-        <div class="view-body-padded" style="flex:1;display:flex;flex-direction:column;overflow:hidden;padding-bottom:0">
-        <div class="info-banner info-banner-subtle" style="flex-shrink:0">
-          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-          <span>Files with personal information removed. Restore to put back the original.</span>
-        </div>
-        <div class="vault-layout" style="flex:1;overflow:hidden">
-          <div class="vault-list" id="vaultList">
-            <div class="empty-state"><p class="empty-title">No scrubbed files yet</p></div>
-          </div>
-          <div class="vault-detail hidden" id="vaultDetail">
-            <div class="vault-detail-header">
-              <span class="vault-detail-title" id="vaultDetailTitle"></span>
-              <div class="vault-detail-actions">
-                <button class="btn btn-primary btn-sm" id="btnVaultRestore">Restore</button>
-                <button class="btn btn-danger btn-sm" id="btnVaultDelete">Remove</button>
-                <button class="btn btn-ghost btn-sm" id="btnVaultClose">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
-              </div>
-            </div>
-            <div class="vault-tabs">
-              <button class="vault-tab active" data-tab="scrubbed">Scrubbed</button>
-              <button class="vault-tab" data-tab="mapping">Mapping</button>
-            </div>
-            <div class="vault-dict-bar" id="vaultDictBar">
-              <input type="text" class="vault-dict-input" id="vaultDictInput" placeholder="Type word to add to scrub dictionary...">
-              <button class="btn btn-accent btn-sm" id="btnVaultDictAdd">Add</button>
-              <span class="vault-dict-hint">Select text in the preview to quick-add</span>
-            </div>
-            <div class="vault-detail-body">
-              <pre class="vault-content" id="vaultScrubbedContent"></pre>
-              <div class="vault-mapping hidden" id="vaultMappingContent"></div>
-            </div>
-          </div>
-        </div>
-        </div>
-      </section>
+      <!-- Vault view removed 2026-09-22 — local agent, no PII vault. -->
 
       <!-- Talk -->
 
@@ -1050,30 +1206,12 @@ Write what you want the AI to do periodically. For example:
           </div>
         </a>
         <a class="agent-tile" href="/help/agents.html" target="_blank">
-          <div class="agent-tile-icon" style="--accent: var(--warn);">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-          </div>
-          <div class="agent-tile-body">
-            <h3>Byte <small>compute</small></h3>
-            <p>Runs python3 / bash / node one-liners and hands back stdout.</p>
-          </div>
-        </a>
-        <a class="agent-tile" href="/help/agents.html" target="_blank">
-          <div class="agent-tile-icon" style="--accent: var(--violet);">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          </div>
-          <div class="agent-tile-body">
-            <h3>Dexter <small>time + scheduling</small></h3>
-            <p>Date/time questions and recurring or one-shot scheduled tasks.</p>
-          </div>
-        </a>
-        <a class="agent-tile" href="/help/agents.html" target="_blank">
           <div class="agent-tile-icon" style="--accent: var(--ok);">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
           </div>
           <div class="agent-tile-body">
-            <h3>Iris <small>email</small></h3>
-            <p>Inbox, unread counts, search, draft, and send (if enabled).</p>
+            <h3>Iris <small>email + scheduling</small></h3>
+            <p>Inbox, unread counts, search, draft, send, plus reminders and calendar scheduling.</p>
           </div>
         </a>
         <a class="agent-tile" href="/help/agents.html" target="_blank">
@@ -1139,13 +1277,13 @@ In parallel, delegate to Atlas: (1) screenshot example.com, AND
 
       <div class="help-section-label"><span>06</span> Settings worth knowing</div>
       <div class="settings-grid">
-        <div class="settings-tile"><h4>Orchestrator</h4><p>The model that replies to you. Pick a strong one.</p></div>
-        <div class="settings-tile"><h4>Per-agent models</h4><p>Atlas, Artemis, Byte, Dexter, Iris, Vulkan, Mercury, Oculus — each has its own model + ctx. No sharing, no fallback.</p></div>
+        <div class="settings-tile"><h4>Atlas</h4><p>The model that replies to you — Atlas IS the seat. Pick a strong one; it runs every turn.</p></div>
+        <div class="settings-tile"><h4>Per-agent models</h4><p>Artemis, Iris, Vulkan, Mercury — each has its own model + ctx. No sharing, no fallback.</p></div>
         <div class="settings-tile"><h4>Council Seats</h4><p>Skeptic / Pragmatist / Synthesist. Different models = different perspectives.</p></div>
         <div class="settings-tile"><h4>num_ctx overrides</h4><p>Per-agent. Blank = model default (native window).</p></div>
         <div class="settings-tile"><h4>Thinking</h4><p>On / Max / Off. Global default, no per-chat override.</p></div>
         <div class="settings-tile"><h4>Ollama URL</h4><p>Local daemon endpoint. Models populate all dropdowns.</p></div>
-        <div class="settings-tile"><h4>Servers</h4><p>Audio / Transcription, Video, Satellite, Whisper API fallback, and multiple named Ollama servers.</p></div>
+        <div class="settings-tile"><h4>Servers</h4><p>Audio / Transcription, Satellite, Whisper API fallback, and multiple named Ollama servers.</p></div>
       </div>
 
       <div class="help-section-label"><span>07</span> Audit</div>
@@ -1175,7 +1313,7 @@ In parallel, delegate to Atlas: (1) screenshot example.com, AND
         <div class="help-section-label"><span>↗</span> Deep dives</div>
         <div class="deepdive-grid">
           <a href="/help/not-a-chatbot.html" target="_blank"><span>Not a chatbot</span><small>what Warden is and isn't</small></a>
-          <a href="/help/agents.html" target="_blank"><span>Agents</span><small>Atlas, Byte, Dexter, Iris, Artemis</small></a>
+          <a href="/help/agents.html" target="_blank"><span>Agents</span><small>Atlas, Dexter, Iris, Artemis</small></a>
           <a href="/help/council.html" target="_blank"><span>The Council</span><small>three-seat deliberation</small></a>
           <a href="/help/atlas.html" target="_blank"><span>Asking Atlas</span><small>delegation patterns</small></a>
           <a href="/help/skills.html" target="_blank"><span>Skills</span><small>create, activate, manage</small></a>
@@ -1335,6 +1473,55 @@ In parallel, delegate to Atlas: (1) screenshot example.com, AND
 </div>
 
 <!-- ==== ported modal: projectItemModal ==== -->
+<!-- Project create/edit modal (restored from index-old-root; the userdash refactor
+     removed this modal, leaving the New/Edit Project buttons pointing at nothing) -->
+<div class="modal-overlay hidden" id="projectModal">
+  <div class="modal-backdrop"></div>
+  <div class="modal" role="dialog" aria-modal="true" style="max-width:520px">
+    <div class="modal-header">
+      <span class="modal-title" id="projectModalTitle">New Project</span>
+      <button class="modal-close" aria-label="Close dialog" onclick="UserDash.closeModal('projectModal')">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="projectEditId">
+      <div class="wt-field" id="projectGroupField">
+        <label class="wt-field-label">Group</label>
+        <select class="input" id="projectGroupJid" style="width:100%"></select>
+      </div>
+      <div class="wt-field">
+        <label class="wt-field-label">Name</label>
+        <input type="text" class="input" id="projectName" placeholder="Project name..." style="width:100%">
+      </div>
+      <div class="wt-field">
+        <label class="wt-field-label">Description</label>
+        <textarea class="input" id="projectDescription" placeholder="Project description..." style="width:100%;min-height:70px"></textarea>
+      </div>
+      <div class="wt-field-row" style="display:flex;gap:12px;flex-wrap:wrap">
+        <div class="wt-field" style="flex:1;min-width:120px">
+          <label class="wt-field-label">Project Code</label>
+          <input type="text" class="input" id="projectCode" placeholder="e.g. PRJ-001" style="width:100%">
+        </div>
+        <div class="wt-field" style="flex:1;min-width:120px">
+          <label class="wt-field-label">Status</label>
+          <select class="input" id="projectStatus" style="width:100%">
+            <option value="On Track">On Track</option>
+            <option value="At Risk">At Risk</option>
+            <option value="Blocked">Blocked</option>
+          </select>
+        </div>
+        <div class="wt-field" style="flex:1;min-width:120px">
+          <label class="wt-field-label">Due Date</label>
+          <input type="date" class="input" id="projectDueDate" style="width:100%">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer wt-modal-footer">
+      <button class="btn btn-ghost" onclick="UserDash.closeModal('projectModal')">Cancel</button>
+      <button class="btn btn-accent" id="btnSaveProject">Save Project</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay hidden" id="projectItemModal">
   <div class="modal-backdrop"></div>
   <div class="modal" role="dialog" aria-modal="true" style="max-width:420px">
@@ -1456,17 +1643,15 @@ In parallel, delegate to Atlas: (1) screenshot example.com, AND
       </div>
     </div>
 
-<!-- ==== ported modal: scrubModal ==== -->
-<div class="modal-overlay hidden" id="scrubModal">
-  <div class="modal-backdrop"></div>
-  <div class="modal" role="dialog" aria-modal="true">
-    <div class="modal-header">
-      <span class="modal-title">Removing Personal Information</span>
-    </div>
-    <div class="modal-body" id="scrubProgress">Initializing...</div>
+<!-- Mobile "More" navigation sheet (≤720px) — rows are built from the rail
+     buttons at init by app.js, so it always matches the rail's contents. -->
+<div id="navSheet" aria-hidden="true">
+  <div class="navsheet-backdrop"></div>
+  <div class="navsheet" role="dialog" aria-modal="true" aria-label="All views">
+    <div class="navsheet-handle"></div>
+    <div class="navsheet-body"></div>
   </div>
 </div>
-
 
 <script src="/js/pim.js"></script>
 <script src="/js/app.js"></script>

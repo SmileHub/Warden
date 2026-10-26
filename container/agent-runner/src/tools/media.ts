@@ -131,13 +131,25 @@ async function mediaControl(action: string): Promise<string> {
     if (!has('playerctl')) {
         return 'Error: playerctl is not installed. Install it to control media playback — on Arch: `sudo pacman -S playerctl`; on Debian/Raspberry Pi OS: `sudo apt install -y playerctl`. Then a running player (browser YouTube, Spotify, mpv, VLC) exposes play/pause/next here.';
     }
-    const verb = action === 'play_pause' ? 'play-pause' : action;
+    // `resume` is the verb models reach for (the youtube tool teaches it), but
+    // playerctl has no resume command — it's `play`. Map it or a pause-then-resume
+    // turn dead-ends on "Command not recognized" and the seat flails into a re-deal.
+    const verb = action === 'play_pause' ? 'play-pause' : action === 'resume' ? 'play' : action;
     try {
         const out = run(`playerctl ${verb} 2>&1`);
         // playerctl prints the status or the player name; a fresh status helps.
         let status = '';
-        try { status = run(`playerctl status 2>/dev/null`); } catch { /* no player */ }
-        return `Media ${verb}${status ? ` — ${status}` : ''}${out ? ` (${out})` : ''}.`;
+        try { status = run(`playerctl status 2>/dev/null`).trim(); } catch { /* no player */ }
+        // The confirmed post-state IS the fact. "Media play — Stopped." reads as
+        // a completed action with a decoration, and got reported as "it's playing"
+        // (2026-10-17: the seat claimed a restart succeeded off this string).
+        if (!status) {
+            return `${verb} was sent, but no player reported a status${out ? ` (playerctl said: ${out.trim()})` : ''}. Nothing is confirmed playing. This is the answer — report this state.`;
+        }
+        if (/^playing$/i.test(status)) {
+            return `Playing — the player reports Playing after ${verb}. This is the answer — report this state.`;
+        }
+        return `${verb} was sent, but the player reports ${status} — nothing is playing. This is the answer — report this state.`;
     } catch (err: any) {
         const msg = (err.message || '').toString();
         if (/no.*player|No players/i.test(msg)) return 'No media player is running right now — nothing to control.';
@@ -147,12 +159,12 @@ async function mediaControl(action: string): Promise<string> {
 
 registry.register({
     name: 'audio_volume',
-    description: "Control the SPEAKER (output) volume. action 'get' returns the current level, 'set' takes level (0-100), 'toggle_mute' mutes/unmutes the speaker. Use this for the user's speaker loudness — not the mic.",
+    description: '{"what":"SPEAKER (output) volume","scope":"how loud the user hears sound","mic_sensitivity":"mic_volume","actions":"get|set|toggle_mute"}',
     schema: {
         type: 'object',
         properties: {
-            action: { type: 'string', enum: ['get', 'set', 'toggle_mute'], description: "What to do: 'get' current volume, 'set' to level, or 'toggle_mute'." },
-            level: { type: 'number', description: "Target volume 0-100. Required when action='set', ignored otherwise." },
+            action: { type: 'string', enum: ['get', 'set', 'toggle_mute'], description: '{"what":"the operation","vals":"get|set|toggle_mute"}' },
+            level: { type: 'number', description: '{"what":"target speaker volume","range":"0-100","required_when":"action=set"}' },
         },
         required: ['action'],
     },
@@ -163,12 +175,12 @@ registry.register({
 
 registry.register({
     name: 'mic_volume',
-    description: "Control the MIC (input/capture) volume. action 'get' returns the current level, 'set' takes level (0-100), 'toggle_mute' mutes/unmutes the microphone. Use this for microphone sensitivity, not the speaker.",
+    description: '{"what":"MIC (input/capture) volume","scope":"microphone sensitivity","speaker_loudness":"audio_volume","actions":"get|set|toggle_mute"}',
     schema: {
         type: 'object',
         properties: {
-            action: { type: 'string', enum: ['get', 'set', 'toggle_mute'], description: "What to do: 'get' current mic level, 'set' to level, or 'toggle_mute'." },
-            level: { type: 'number', description: "Target volume 0-100. Required when action='set', ignored otherwise." },
+            action: { type: 'string', enum: ['get', 'set', 'toggle_mute'], description: '{"what":"the operation","vals":"get|set|toggle_mute"}' },
+            level: { type: 'number', description: '{"what":"target mic level","range":"0-100","required_when":"action=set"}' },
         },
         required: ['action'],
     },
@@ -179,11 +191,11 @@ registry.register({
 
 registry.register({
     name: 'media_control',
-    description: "Control media playback (play, pause, toggle, next track, previous track, stop) on a running media player — a browser YouTube tab, Spotify, mpv, VLC, etc. Anything exposing MPRIS. Returns the resulting playback status. If no player is running it says so.",
+    description: '{"what":"playback control on any running MPRIS player (Spotify, mpv, VLC)","returns":"resulting playback status","youtube_asks":"the youtube tool owns those"}',
     schema: {
         type: 'object',
         properties: {
-            action: { type: 'string', enum: ['play', 'pause', 'play_pause', 'next', 'previous', 'stop'], description: 'Playback action.' },
+            action: { type: 'string', enum: ['play', 'pause', 'resume', 'play_pause', 'next', 'previous', 'stop'], description: '{"what":"the playback operation","vals":"play|pause|resume|play_pause|next|previous|stop","resume":"continues a paused player (same as play)"}' },
         },
         required: ['action'],
     },

@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # Warden installer — single-user, host-native (no Docker).
 #
-# Deploys the project to /opt/warden, builds the Node backend, creates the
-# eyes_ears Python venv, and provisions a systemd --user service.
+# Deploys the project to /opt/Warden, builds the Node backend, creates the
+# eyes_ears Python venv (voice app), and provisions a systemd --user service.
 # Runtime data (notes, memory, uploads, groups) lives in $WORKSPACE_ROOT
-# (~/warden), separate from the code so a reinstall preserves it.
+# (~/Warden), separate from the code so a reinstall preserves it.
+#
+# The browser capability is OPTIONAL and needs nothing from this script to
+# boot: it's your real Chrome + the chrome-mcp-server extension + the
+# mcp-chrome-bridge native host, dialed on demand (see CLAUDE.md → Browser
+# capability). This script only provisions the bridge-repair drop-in.
+#
+# trading/ (Alpha Stack) is a machine-local environment — it is excluded
+# from the deploy sync and never part of a fresh install.
 #
 # Target: Linux (Arch/KDE Plasma primary). Run from the project root:
 #   ./install.sh
 #
 # Override the install/workspace locations:
-#   WARDEN_INSTALL_DIR=/opt/warden WARDEN_WORKSPACE=$HOME/warden ./install.sh
+#   WARDEN_INSTALL_DIR=/opt/Warden WARDEN_WORKSPACE=$HOME/Warden ./install.sh
 set -e
 
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_DIR="${WARDEN_INSTALL_DIR:-/opt/warden}"
-WORKSPACE_ROOT="${WARDEN_WORKSPACE:-$HOME/warden}"
+INSTALL_DIR="${WARDEN_INSTALL_DIR:-/opt/Warden}"
+WORKSPACE_ROOT="${WARDEN_WORKSPACE:-$HOME/Warden}"
 
 echo ""
 echo "  Warden · Personal AI Assistant"
@@ -30,30 +38,48 @@ echo ""
 read -r -p "  Type I UNDERSTAND to continue: " ACK
 [ "$ACK" = "I UNDERSTAND" ] || { echo "  Aborted."; exit 1; }
 
+# ── Model choice for Alpha Stack + MARM ──────────────────────────────
+# One answer feeds both: the alpha-stack analysis default (trading/
+# .alpha-stack/state.json settings.model + webapp/config.json
+# default_model) and MARM's concept-graph topic model (the service drop-in
+# MARM_TOPIC_MODEL). Any Ollama tag works — local (granite4.2:30b) or cloud
+# (kimi-k3:cloud). Not validated against `ollama list` here: models can be
+# pulled after install, and a bad tag fails loudly at call time anyway.
+read -r -p "  Ops model — heavy tools/integrations (Alpha Stack + MARM today, more later). Any Ollama tag, local or :cloud [granite4.2:30b]: " WARDEN_OPS_MODEL
+WARDEN_OPS_MODEL="${WARDEN_OPS_MODEL:-granite4.2:30b}"
+
 # ── Pre-flight ───────────────────────────────────────────────────────
 command -v node >/dev/null || { echo "  Node.js >= 20 required: https://nodejs.org"; exit 1; }
 [ "$(node -e 'console.log(process.versions.node.split(".")[0])')" -ge 20 ] || { echo "  Node.js >= 20 required (found $(node -v))"; exit 1; }
 command -v python3 >/dev/null || { echo "  python3 required (e.g. sudo pacman -S python)"; exit 1; }
 python3 -m venv --help >/dev/null 2>&1 || { echo "  python3-venv required (e.g. sudo pacman -S python; on Debian/Ubuntu: python3-venv)"; exit 1; }
 
-# System packages (chromium for the native browser tools, desktop control,
-# PIM stack, Python audio/ML headers, rsync for the deploy). Arch only; on
-# other distros install the equivalents by hand. Run this before the rsync
-# check — install-deps.sh installs rsync.
+# System packages (desktop control, PIM stack, Python audio/ML headers,
+# rsync for the deploy). Arch only; on other distros install the equivalents
+# by hand. Run this before the rsync check — install-deps.sh installs rsync.
 if command -v pacman >/dev/null && [ -f "$SOURCE_DIR/install-deps.sh" ]; then
     read -r -p "  Install system packages via install-deps.sh (sudo pacman)? [Y/n] " R
     [ "$R" = "n" ] || [ "$R" = "N" ] || bash "$SOURCE_DIR/install-deps.sh"
 fi
 command -v rsync >/dev/null || { echo "  rsync required (e.g. sudo pacman -S rsync)"; exit 1; }
-command -v chromium >/dev/null || command -v google-chrome >/dev/null || command -v google-chrome-stable >/dev/null \
-    || echo "  ! No chromium/google-chrome found — browser tools won't work until one is installed."
+# Browser capability (optional): the ONE path is the user's real Chrome +
+# the chrome-mcp-server extension + the mcp-chrome-bridge native host on
+# 12306. No system chromium, no CDP port, no headless fallback — and Warden
+# boots and runs fine with none of it present (the bridge is dialed on demand).
+command -v google-chrome >/dev/null || command -v google-chrome-stable >/dev/null \
+    || echo "  ! No Google Chrome found — browser tools need your real Chrome with the extension."
+command -v mcp-chrome-bridge >/dev/null \
+    || echo "  ! mcp-chrome-bridge not installed (browser tools will report the bridge down). Install: npm install -g mcp-chrome-bridge"
+[ -d "$SOURCE_DIR/chrome-mcp-server-1.0.0" ] \
+    || echo "  ! chrome-mcp-server-1.0.0/ extension folder missing — load it unpacked via chrome://extensions."
 
 # ── Deploy to $INSTALL_DIR ───────────────────────────────────────────
 # Sync the working tree (including uncommitted dev changes) into the install
 # dir. Preserve data that must survive a reinstall: the DB (store/), config
-# (data/), logs, and the Python venvs (reused below). dist/ and node_modules/
-# are rebuilt in place. If install.sh is already run from $INSTALL_DIR, the
-# rsync is a no-op self-sync.
+# (data/), logs, and the Python venvs (reused below). trading/ (Alpha Stack,
+# a machine-local environment) is excluded too — never copied, never deleted.
+# dist/ and node_modules/ are rebuilt in place. If install.sh is already run
+# from $INSTALL_DIR, the rsync is a no-op self-sync.
 echo "  Installing Warden to $INSTALL_DIR..."
 sudo mkdir -p "$INSTALL_DIR"
 sudo chown "$USER:$(id -gn)" "$INSTALL_DIR"
@@ -68,6 +94,7 @@ if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
     --exclude 'logs' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
+    --exclude 'trading' \
     "$SOURCE_DIR/" "$INSTALL_DIR/"
 fi
 cd "$INSTALL_DIR"
@@ -127,9 +154,6 @@ if [ ! -f "$ENV_FILE" ]; then
 ASSISTANT_NAME=Warden
 TZ=UTC
 
-# Dashboard admin password (required for dashboard login).
-ADMIN_PASSWORD=warden
-
 # LLM access — set ONE of these, or run Ollama locally (default URL below).
 #ANTHROPIC_API_KEY=
 #CLAUDE_CODE_OAUTH_TOKEN=
@@ -162,10 +186,9 @@ ADMIN_PASSWORD=warden
 #RADICALE_CAL_COLLECTION=warden-calendar
 #RADICALE_CARD_COLLECTION=warden-contacts
 
-# Browser tools (defaults shown)
-#BROWSER_CDP_PORT=9222
-#BROWSER_BIN=
-#BROWSER_HEADLESS=
+# Browser capability: needs NO config here. It is your real Chrome + the
+# chrome-mcp-server extension + the mcp-chrome-bridge native host (12306),
+# dialed on demand — see CLAUDE.md → Browser capability.
 ENVEOF
     echo "  Wrote config template to $ENV_FILE — edit it to add your keys."
 fi
@@ -263,6 +286,86 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now warden 2>/dev/null || true
 loginctl enable-linger "$USER" 2>/dev/null || true
+
+# NOTE: no browser-bridge repair drop-in is provisioned. The browser MCP
+# provider was removed (2026-10-15) and nothing should re-provision or
+# block-restart on its behalf — the gate at /mcp/browser fast-fails.
+
+# ── MARM semantic long-term recall (DEFAULT — opt out: INSTALL_MARM=0) ────
+# MARM (https://github.com/Lyellr88/marm-memory, by Lyellr88) gives the
+# orchestrator long-term semantic memory: the memory writeback mirrors every
+# distilled fact into it, and each incoming message auto-recalls the most
+# relevant memories into the orchestrator's prompt. DEFAULT-ON since
+# 2026-09-22; opt out with INSTALL_MARM=0. Every MARM path is still
+# fail-open — Warden runs identically if the server is absent.
+INSTALL_MARM="${INSTALL_MARM:-1}"
+if [ "$INSTALL_MARM" = "1" ]; then
+    # pipx/uv tool bins land here; make lookup work in a fresh shell.
+    PATH="$HOME/.local/bin:$PATH"
+    if ! command -v marm-memory >/dev/null; then
+        echo "  Installing marm-mcp-server via uv…"
+        if command -v uv >/dev/null; then
+            uv tool install marm-mcp-server \
+                || echo "  ! MARM install failed — Warden runs fine without it"
+        else
+            echo "  ! uv not on PATH — install uv, then re-run install.sh"
+        fi
+    fi
+    if command -v marm-memory >/dev/null; then
+        MARM_BIN="$(command -v marm-memory)"
+        cat > ~/.config/systemd/user/marm-memory.service <<MARMEOF
+[Unit]
+Description=MARM memory server (MCP over HTTP, 127.0.0.1:8001)
+Before=warden.service
+After=network.target
+
+[Service]
+# --profile trusted: rate limiting off (rpm 0) — loopback-only local
+# service; the default 80 rpm limiter throttled local bulk callers
+# (e.g. steve.py fact filing) into 429s.
+ExecStart=${MARM_BIN} http --profile trusted
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+MARMEOF
+        # Concept-graph topic model: explicit MARM_TOPIC_MODEL env overrides,
+        # otherwise the model prompt at the top of this script decides.
+        TOPIC_MODEL="${MARM_TOPIC_MODEL:-$WARDEN_OPS_MODEL}"
+        mkdir -p ~/.config/systemd/user/marm-memory.service.d
+        cat > ~/.config/systemd/user/marm-memory.service.d/topic-model.conf <<TMEOF
+[Service]
+Environment=MARM_TOPIC_MODEL=${TOPIC_MODEL}
+TMEOF
+        # Wire it into Warden via a drop-in so the main unit stays stock
+        # (and so deleting this drop-in fully reverts the wiring).
+        mkdir -p ~/.config/systemd/user/warden.service.d
+        cat > ~/.config/systemd/user/warden.service.d/marm.conf <<'DROPEOF'
+[Unit]
+Wants=marm-memory.service
+After=marm-memory.service
+DROPEOF
+        # Register the stdio side in the MCP config with the ABSOLUTE binary
+        # path — systemd --user PATH can miss ~/.local/bin. Upsert-only:
+        # skips entirely when INSTALL_MARM=0.
+        node "$INSTALL_DIR/scripts/register-marm.mjs" "$MARM_BIN" \
+            || echo "  ! could not register marm in data/mcp-servers.json"
+        systemctl --user daemon-reload
+        systemctl --user enable --now marm-memory 2>/dev/null || true
+        echo "  MARM memory server enabled on 127.0.0.1:8001 (starts with Warden)"
+    fi
+fi
+
+# ── Alpha Stack default model (dev boxes only — trading/ is excluded from
+#    the deploy sync, so a fresh install has no Alpha Stack to configure) ──
+# Applies the model prompt to the stack's own defaults; the Web UI's
+# Fast/Crawl toggle overrides per-run afterward.
+if [ -d "$INSTALL_DIR/trading" ]; then
+    node "$INSTALL_DIR/scripts/alpha-model.mjs" "$INSTALL_DIR/trading" "$WARDEN_OPS_MODEL" \
+        && echo "  Alpha Stack default model: $WARDEN_OPS_MODEL" \
+        || echo "  ! could not write the alpha-stack model default (set it in the webapp UI)"
+fi
 
 echo ""
 echo "  Done. Installed to $INSTALL_DIR"

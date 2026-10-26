@@ -1,15 +1,13 @@
 import fs from 'fs';
-import http from 'node:http';
 import path from 'path';
-import { spawn, execSync } from 'node:child_process';
-
-import { processImage } from './image.js';
+import crypto from 'crypto';
+import { spawn, execFileSync } from 'node:child_process';
 
 import {
   AGENT_TIMEOUT,
   ASSISTANT_NAME,
   DATA_DIR,
-  OLLAMA_CHAT_MODEL,
+  OLLAMA_URL,
   POLL_INTERVAL,
   TIMEZONE,
   WORKSPACE_ROOT,
@@ -19,7 +17,9 @@ import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
-import { runAgent, killCurrentAgent, CallbackMap, pushSupervisorNote, runSubAgentBackground, runSubAgentSync, setActivityPublisher } from './agent-spawn.js';
+import { runAgent, killCurrentAgent, cancelCurrentTurn, CallbackMap, runSubAgentBackground, setActivityPublisher, isForegroundTurnActive, getLiveJobs } from './agent-spawn.js';
+import { maybeClassifyMemoryTree } from './memory-tree.js';
+import { addTrainingFlag } from './training-flags.js';
 import {
   createTask,
   getAllTasks,
@@ -36,6 +36,8 @@ import {
   storeMessage,
   setRouterState,
   getRouterState,
+  readDefaultApps,
+  readPinnedTools,
   createProject,
   getProjectsByGroup,
   getProject,
@@ -68,16 +70,23 @@ import {
   getCalendarEvent,
   getCalendarEventByIcalUid,
   listCalendarEvents,
+  getFiredCalendarReminderIds,
+  markCalendarReminderFired,
   getTaskById,
   getSatelliteIp,
+  logSentryScan,
+  createAlarm,
+  getUserAlarms,
+  updateAlarm,
+  deleteAlarm as deleteAlarmDb,
 } from './db.js';
 import { decryptApiKey } from './encryption.js';
-import { fetchEmails, sendEmail, getEmailById } from './email.js';
+import { fetchEmails, sendEmail, getEmailById, downloadEmailAttachment } from './email.js';
 import { addMcpServer, removeMcpServer, McpServerConfig } from './mcp-registry.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { formatLocalTime } from './timezone.js';
 import { CronExpressionParser } from 'cron-parser';
-import { computeNextRun, buildDigestContext, startSchedulerLoop } from './task-scheduler.js';
+import { computeNextRun, buildDeterministicDigest, startSchedulerLoop } from './task-scheduler.js';
 import { runMemoryWriteback } from './memory-writeback.js';
 import { startCalendarSyncPoller } from './calendar-sync.js';
 import { startStatusServer, pushNotification, pushActivityLine, getCachedInboxEmails } from './status-server.js';
@@ -85,30 +94,39 @@ import { startLogCap } from './log-rotator.js';
 import { Channel, NewMessage, OWNER_JID, AgentInput, ScheduledTask } from './types.js';
 import { logger } from './logger.js';
 import { captureScreenshotFromSecurityApp, captureWebcamFromSecurityApp, readHostImage } from './capture.js';
-import { securityLog, awarenessLog, recordAwarenessEvent, queryAwarenessHostEvents } from './security-log.js';
+import {
+  myHostname,
+  myLink,
+  listFriends,
+  listFriendRequests,
+  listFriendMessages,
+  listFriendRoomMessages,
+  listFriendFiles,
+  askFriend,
+  assignFriendTask,
+  dmFriend,
+  broadcastToRoom,
+  shareFile,
+  getSelfProfile,
+  setSelfProfile,
+  bbsState,
+  bbsPost,
+  bbsDialState,
+  bbsFileSave,
+  bbsFiles,
+  bbsFileRead,
+  readFriendFile,
+  friendCollab,
+  sendPatch,
+  isHumanWatching,
+} from './friends.js';
+import { listBlocked, listOffenses, blockFriend, unblockFriend, deleteFriend } from './db.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
-// ---------------------------------------------------------------------------
-// BROWSER-AUTOMATION GUIDANCE (permanent instruction for the Warden agent)
-// ---------------------------------------------------------------------------
-// For any browser, media, screenshot, YouTube, or other web-content task,
-// ALWAYS drive the already-running Chrome browser via Playwright, which is
-// connected to the user's real Chrome profile on CDP port 9222
-// (127.0.0.1:9222 — sessions, cookies, and sign-ins are all intact).
-// Do NOT fall back to direct desktop automation tools such as xdotool or
-// wtype for these tasks: they frequently fail on this host due to input
-// group mismatch or timeout issues under the Wayland/KDE session.
-// Preferred entry points are the Playwright MCP tools (browser_navigate,
-// browser_click, browser_type, browser_snapshot, browser_take_screenshot,
-// browser_evaluate, etc.). If a Playwright action fails, retry with an
-// alternative Playwright approach (keyboard shortcut, browser_eval click,
-// direct URL) rather than switching to xdotool/wtype.
-// ---------------------------------------------------------------------------
-
 /**
- * Single-chat orchestrator (Warden).
+ * Single-user Warden host (the Atlas seat's chat loop).
  *
  * All inbound messages from every channel land in the `messages` table with
  * `chat_jid = OWNER_JID`. The message loop polls that single chat, builds an
@@ -125,11 +143,6 @@ let lastTimestamp = '';
 let lastAgentTimestamp = '';
 let messageLoopRunning = false;
 export let agentProcessing = false;
-let lastAwarenessEvent: string = '';
-
-// Oculus senders — background agents (Oculus) whose send_message output
-// should also be spoken over the voice client's SSE stream.
-const OCULUS_SENDERS = new Set(['Oculus']);
 
 const channels: Channel[] = [];
 
@@ -155,9 +168,106 @@ function saveState(): void {
 }
 
 const MERCURY_MEMORY_FILE = 'MERCURY_MEMORY.md';
-const MERCURY_RECENT_MESSAGES = 12;
+// The last N messages are ignored by the mercury summary WHOLESALE: they stay
+// verbatim in <chat_history> and are never compacted into the summary, so the
+// summary cannot duplicate turns the model is already reading live (2026-09-19:
+// with 12, fresh turns landed in the summary and got re-injected next to
+// themselves). Compaction only folds material OLDER than this window; RAG also
+// only retrieves from beyond it, so there is no dead zone between the two.
+const MERCURY_RECENT_MESSAGES = 30;
 const MERCURY_CONTEXT_TURNS = 8;
-const MERCURY_SUMMARY_EVERY = 15;
+
+// Mercury's I/O contract. Mercury shares the toolcall fine-tune with iris, so
+// the task is shaped the way Granite is strongest and the way that model is
+// already trained: STRUCTURED IN, STRUCTURED OUT. State goes in as JSON, the
+// merged state comes back as JSON, and `format` (below) constrains decoding on
+// the local path. Prose summarization was the old shape and was off
+// distribution for a tool-call fine-tune — it kept emitting JSON anyway.
+//
+// This prompt is the CANONICAL source: training/gen_mercury_sft.mjs extracts
+// it verbatim from this file, exactly as the iris rows extract theirs from the
+// agent-runner, so the fine-tune can never drift from what production sends.
+// Editing it here changes the next dataset. Keep the marker comments intact —
+// extraction anchors on them.
+// MERCURY_SYSTEM_PROMPT_START
+const MERCURY_SYSTEM_PROMPT = `You are Mercury: rolling conversation memory for Warden.
+
+CONTRACT: one compaction request → one JSON object. You merge the state you are given with new turns and return the merged state.
+
+INPUT
+- STATE: the memory you already hold, as JSON. It is empty on the first compaction.
+- TURNS: conversation turns that have scrolled out of the live window, oldest first. The most recent turns are kept verbatim elsewhere and are not shown to you.
+
+FIELDS
+- facts: durable statements about the user, the project, or the world.
+- decisions: choices that were made, each with the reason when the turns give one.
+- open: questions still unanswered and tasks still outstanding.
+- refs: file paths, URLs, and ids worth keeping.
+
+GUIDELINES
+- Carry every STATE item forward unless a turn supersedes it or resolves it.
+- Add what the TURNS establish, placing each item in the field that fits it.
+- Merge two items that say the same thing into one. Replace a superseded item with its current version.
+- Drop an open item once a turn answers it, and record the answer as a fact or a decision.
+- Compress the oldest material hardest: keep its conclusion, shed its detail.
+- Write each item as one standalone sentence that reads correctly on its own, with no pronouns pointing outside it.
+- Keep 40 items or fewer across all four fields.
+
+FORMAT
+Output one JSON object only.
+{"facts": [], "decisions": [], "open": [], "refs": []}`;
+// MERCURY_SYSTEM_PROMPT_END
+
+// Ollama `format` schema — the single biggest lever for holding a 3B to valid
+// structured output. Local path only; a cloud seat ignores it and relies on
+// the FORMAT block above plus the parser's tolerance.
+const MERCURY_FORMAT = {
+  type: 'object',
+  properties: {
+    facts: { type: 'array', items: { type: 'string' } },
+    decisions: { type: 'array', items: { type: 'string' } },
+    open: { type: 'array', items: { type: 'string' } },
+    refs: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['facts', 'decisions', 'open', 'refs'],
+};
+
+interface MercuryState { facts: string[]; decisions: string[]; open: string[]; refs: string[] }
+const MERCURY_FIELDS: (keyof MercuryState)[] = ['facts', 'decisions', 'open', 'refs'];
+const EMPTY_MERCURY_STATE: MercuryState = { facts: [], decisions: [], open: [], refs: [] };
+
+/** Coerce whatever the model returned into a MercuryState, dropping junk. */
+function parseMercuryState(raw: string): MercuryState | null {
+  if (!raw?.trim()) return null;
+  let text = raw.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  let obj: any;
+  try { obj = JSON.parse(text.slice(start, end + 1)); } catch { return null; }
+  if (!obj || typeof obj !== 'object') return null;
+  const out: MercuryState = { facts: [], decisions: [], open: [], refs: [] };
+  for (const f of MERCURY_FIELDS) {
+    const v = obj[f];
+    if (!Array.isArray(v)) continue;
+    out[f] = v.map((x: any) => String(x ?? '').trim()).filter(Boolean);
+  }
+  return MERCURY_FIELDS.some((f) => out[f].length > 0) ? out : null;
+}
+
+/** Render state as the text pinned into every prompt as <mercury_summary>. */
+function renderMercuryState(s: MercuryState): string {
+  const section = (title: string, items: string[]) =>
+    items.length ? `${title}:\n${items.map((i) => `- ${i}`).join('\n')}` : '';
+  return [
+    section('Facts', s.facts),
+    section('Decisions', s.decisions),
+    section('Open', s.open),
+    section('References', s.refs),
+  ].filter(Boolean).join('\n\n');
+}
 
 function mercuryMode(): 'off' | 'rag' | 'summary' | 'full' {
   const m = (getRouterState('mercury:mode') || 'full').toLowerCase();
@@ -171,7 +281,7 @@ function loadMercurySummary(clearAt = ''): string | undefined {
     const text = fs.readFileSync(path.join(root, MERCURY_MEMORY_FILE), 'utf-8').trim();
     if (!text) return undefined;
     // A context clear (New Thought / driving-force switch / idle auto-clear /
-    // clear_context tool) sets orchestrator:context_clear_at. The summary file
+    // clear_context tool) sets atlas:context_clear_at. The summary file
     // carries its own write timestamp on its first line; if it predates the
     // clear boundary, ignore it — otherwise pre-clear topics (e.g. an old
     // TaskPoints scope draft) keep bleeding into the fresh conversation even
@@ -212,18 +322,35 @@ function mercuryRetrieveRelevant(newMessages: NewMessage[], topK = MERCURY_CONTE
   const candidates = gated.slice(0, -MERCURY_RECENT_MESSAGES);
   if (candidates.length === 0) return [];
 
-  const scored = candidates.map((m) => {
+  // Evidence floor: a longer query collides with old turns on single keywords
+  // by chance (the "5 concrete examples" ask matched a day-old eyes_ears
+  // thread purely on the word "concrete" and the model replayed it as current).
+  // Require ≥2 DISTINCT keyword matches once the query carries 3+ keywords;
+  // shorter queries keep the ≥1 floor so single-topic recalls still work.
+  const minMatches = keywords.length >= 3 ? 2 : 1;
+
+  const scored = candidates.map((m, i) => {
     const words = tokenizeMercury(m.content || '');
+    const lower = (m.content || '').toLowerCase();
     let score = 0;
+    let matched = 0;
     for (const kw of keywords) {
-      if (words.includes(kw)) score += 1;
-      if ((m.content || '').toLowerCase().includes(kw)) score += 0.5;
+      const whole = words.includes(kw);
+      if (whole) matched += 1;
+      if (whole) score += 1;
+      if (lower.includes(kw)) score += 0.5;
     }
-    return { m, score };
+    // Recency prior: a position bonus (0 = oldest candidate, 1 = newest) breaks
+    // score ties toward recent turns. Without it the stable sort + topK slice
+    // favored the OLDEST equally-scoring messages — exactly how stale threads
+    // crowded out fresh ones. The bonus can lift a tie but never outrank a
+    // genuinely stronger keyword match.
+    const recency = candidates.length > 1 ? i / (candidates.length - 1) : 1;
+    return { m, score, matched, rank: score + recency };
   });
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => b.rank - a.rank);
   return scored
-    .filter((s) => s.score > 0)
+    .filter((s) => s.matched >= minMatches)
     .slice(0, topK)
     .map((s) => s.m)
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -236,30 +363,10 @@ function mercuryRetrieveRelevant(newMessages: NewMessage[], topK = MERCURY_CONTE
 function buildPrompt(newMessages: NewMessage[]): string {
   let prompt = '';
 
-  const mode = mercuryMode();
-  // Resolved once, up front, so both the Mercury summary/RAG injection and the
-  // <chat_history> gate share the same clear boundary this turn.
-  const clearAt = getRouterState('orchestrator:context_clear_at') || '';
-
-  // Mercury rolling memory — compacted context from older conversation turns.
-  if (mode === 'summary' || mode === 'full') {
-    const mercury = loadMercurySummary(clearAt);
-    if (mercury) {
-      prompt += `<mercury_summary>\n${mercury}\n</mercury_summary>\n\n`;
-    }
-  }
-
-  // Mercury RAG: pull older conversation snippets relevant to the current ask.
-  if (mode === 'rag' || mode === 'full') {
-    const relevant = mercuryRetrieveRelevant(newMessages, MERCURY_CONTEXT_TURNS, clearAt);
-    if (relevant.length > 0) {
-      const lines = relevant.map((m) => {
-        const role = m.is_bot_message ? ASSISTANT_NAME : (m.sender_name || 'User');
-        return `<message sender="${role}" history="relevant">${m.content}</message>`;
-      });
-      prompt += `<mercury_context count="${relevant.length}">\n${lines.join('\n')}\n</mercury_context>\n\n`;
-    }
-  }
+  // Resolved once, up front, so the <chat_history> gate shares the same clear
+  // boundary this turn. Long-term recall is injected by MARM auto-recall in the
+  // agent-runner, so the prompt leads straight into chat history below.
+  const clearAt = getRouterState('atlas:context_clear_at') || '';
 
   // Get recent conversation context including bot replies (not just user messages).
   // getMessagesForDashboard returns both sides of the conversation.
@@ -273,11 +380,8 @@ function buildPrompt(newMessages: NewMessage[]): string {
   const rawHistory = clearAt
     ? allHistory.filter((m) => (m.timestamp || '') > clearAt)
     : allHistory;
-  // Exclude background agent messages (Oculus security alerts and greetings) —
-  // they are stored for the user/dashboard, but the orchestrator must NOT see them
-  // in its history (otherwise it parrots/acknowledges them).
   const contextMessages = rawHistory
-    .filter((m) => !pendingIds.has(m.id) && m.sender_name !== 'Oculus')
+    .filter((m) => !pendingIds.has(m.id))
     .slice(-MERCURY_RECENT_MESSAGES);
 
   if (contextMessages.length > 0) {
@@ -325,19 +429,33 @@ function cleanAgentText(raw: string): string {
     .trim();
 }
 
+/** Set when the seat calls clear_context mid-turn; consumed by the next stored
+ *  reply so the boundary lands AFTER that reply (see deliverReply). */
+let pendingContextClear = false;
+
 /** Forward the bot's reply to every connected channel + persist to DB. */
 async function deliverReply(text: string): Promise<void> {
   const messageId = `bot-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const timestamp = new Date().toISOString();
   storeMessage({
     id: messageId,
     chat_jid: OWNER_JID,
     sender: 'assistant:local',
     sender_name: ASSISTANT_NAME,
     content: text,
-    timestamp: new Date().toISOString(),
+    timestamp,
     is_from_me: false,
     is_bot_message: true,
   });
+  // clear_context recorded its boundary at request time, but this turn's own
+  // reply was stored after it — so the next turn's <chat_history> would carry
+  // the clearing turn's reply back in and re-seed the conversation the user
+  // just cleared. Move the boundary past this one reply.
+  if (pendingContextClear) {
+    pendingContextClear = false;
+    setRouterState('atlas:context_clear_at', timestamp);
+    logger.info({ timestamp }, 'clear_context: boundary moved past the clearing turn reply');
+  }
   await Promise.allSettled(
     channels.map((ch) =>
       ch.sendMessage(OWNER_JID, text).catch((err) =>
@@ -348,96 +466,97 @@ async function deliverReply(text: string): Promise<void> {
 }
 
 /**
- * Oculus (situational-awareness agent) model resolution. Uses the dedicated
- * oculus:model router setting (dashboard Models card) — no fallback. A `local:`
- * prefix is stripped. seedPerAgentModelSettings() materializes oculus:model from
- * the orchestrator model on first boot, so this is never empty in normal use.
+ * Local calendar reminder loop. Fires one automated chat message per event at
+ * (or just after) its start_time, regardless of Google sync. Idempotent via the
+ * calendar_reminders table — survives restarts, fires exactly once per event.
  */
-function resolveAwarenessModel(): string {
-  // Oculus shares the Toolcall model (local:subagent_model).
-  return (getRouterState('local:subagent_model') || '').trim().replace(/^local:/, '');
-}
+function startCalendarReminderLoop(): void {
+  const TICK_MS = 30_000;
+  // Look back 2h on each tick so a restart (or a service down period) doesn't
+  // silently swallow a reminder whose start_time already passed.
+  const LOOKBACK_MS = 2 * 60 * 60 * 1000;
 
-/** Pull the current frame from the satellite security detector and save it to
- *  the desktop's owner attachments. Returns the [Image: ...] reference string. */
-async function fetchAndSaveSecurityFrame(): Promise<string | null> {
-  const ip = getSatelliteIp();
-  const url = `http://${ip}:8765/frame`;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`frame server returned ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (!buf || buf.length === 0) throw new Error('empty frame');
-    const groupDir = path.join(WORKSPACE_ROOT, 'groups', 'owner');
-    const processed = await processImage(buf, groupDir, '');
-    if (!processed) throw new Error('processImage failed');
-    return processed.content; // e.g. "[Image: attachments/xyz.jpg]"
-  } catch (err: any) {
-    logger.warn({ err, url }, 'fetchAndSaveSecurityFrame: failed to pull/save satellite frame');
-    return null;
-  }
-}
-
-/** Latest security frame reference fetched for the current Oculus run, so the
- *  host can attach it to Oculus's send_message even if the model forgets. */
-let latestOculusFrame: string | null = null;
-
-/** Spawn Oculus, the single background security/awareness agent (fire-and-forget).
- *  Never awaited. Pass the original awareness text so Oculus has full context.
- *
- *  eyes_open gates the IMAGE only. Text awareness events are always logged
- *  (arrivals/departures/face labels) while the eyes server runs; "eyes closed"
- *  means Oculus logs the text event with no image. "eyes open" means on a new
- *  (debounced) event the host fetches the frame so Oculus can look at it,
- *  describe it, log it, and move on. The detector reports eyes_open in the
- *  AWARENESS payload; if it's missing we default to text-only (eyes closed). */
-export function spawnOculusBackground(task: string, awarenessText?: string): void {
-  if (awarenessText) {
-    lastAwarenessEvent = awarenessText;
-  }
-  let eyesOpen = false;
-  if (awarenessText) {
-    const m = awarenessText.match(/data:\s*(\{.*\})/);
-    if (m) {
-      try { eyesOpen = !!JSON.parse(m[1]).eyes_open; } catch { /* default text-only */ }
-    }
-  }
-  const spawn = (prompt: string) =>
-    runSubAgentBackground({
-      agent: 'oculus',
-      prompt,
-      model: resolveAwarenessModel(),
-      sessionId: 'owner',
-      workspaceRoot: WORKSPACE_ROOT,
-      chatJid: OWNER_JID,
-      groupFolder: 'owner',
-      isMain: true,
-      timeoutMs: 90 * 1000, // short — don't let a stuck model linger
-      callbacks: buildAgentCallbacks({ awarenessText }),
-    } as any);
-
-  // Eyes closed: log the text event only — no image fetch, no description.
-  if (!eyesOpen) {
-    latestOculusFrame = null;
-    spawn(task);
-    return;
-  }
-  // Eyes open: wait ~2s for the person to settle, then pull the frame so Oculus
-  // can look at it + describe it. If the frame server is slow/down, Oculus still
-  // runs with text only rather than being blocked.
-  void new Promise((resolve) => setTimeout(resolve, 2000))
-    .then(() => fetchAndSaveSecurityFrame())
-    .then((imageTag) => {
-      latestOculusFrame = imageTag || null;
-      if (!imageTag) {
-        logger.warn('spawnOculusBackground: could not fetch security frame for Oculus');
+  const tick = () => {
+    try {
+      const fired = getFiredCalendarReminderIds();
+      const now = Date.now();
+      const events = listCalendarEvents();
+      for (const e of events) {
+        if (fired.has(e.id) || !e.start_time) continue;
+        const startMs = new Date(e.start_time).getTime();
+        if (Number.isNaN(startMs)) continue;
+        if (startMs <= now && startMs >= now - LOOKBACK_MS) {
+          const loc = e.location ? ` @ ${e.location}` : '';
+          const desc = e.description ? `\n${e.description}` : '';
+          const text = `⏰ Calendar: "${e.title}" starts now (${e.start_time})${loc}${desc}`;
+          deliverReply(text).catch((err) =>
+            logger.warn({ err, eventId: e.id }, 'calendar reminder delivery failed'),
+          );
+          markCalendarReminderFired(e.id);
+          logger.info({ eventId: e.id, title: e.title, start_time: e.start_time }, 'calendar reminder fired');
+        }
       }
-      const prompt = imageTag ? `${task}\n\nLatest security frame: ${imageTag}` : task;
-      spawn(prompt);
+    } catch (err) {
+      logger.warn({ err }, 'calendar reminder tick failed');
+    }
+    setTimeout(tick, TICK_MS);
+  };
+
+  tick();
+  logger.info('calendar reminder loop started');
+}
+
+/**
+ * Smoke-test a stdio MCP server candidate before persisting it: spawn the
+ * command, send a JSON-RPC initialize request, and wait (bounded) for any
+ * stdout response. `npm install` with no package, an npx package that 404s,
+ * or any other command that isn't a live MCP server exits or times out here
+ * instead of being saved and failing to connect on every runner spawn.
+ */
+async function smokeTestMcpServer(command: string, args: string[]): Promise<{ ok: true } | { ok: false; error: string }> {
+  const SMOKE_TIMEOUT_MS = 10_000;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: { ok: true } | { ok: false; error: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve(result);
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err: any) {
+      return resolve({ ok: false, error: `spawn failed: ${String(err?.message ?? err)}` });
+    }
+    const timer = setTimeout(() => {
+      finish({ ok: false, error: `\`${command}${args.length ? ' ' + args.join(' ') : ''}\` did not answer initialize within 10s — it is not saved as an MCP server.` });
+    }, SMOKE_TIMEOUT_MS);
+    child.on('error', (err) => {
+      finish({ ok: false, error: `\`${command}\` could not be launched: ${err.message}` });
     });
+    child.on('exit', (code, signal) => {
+      finish({ ok: false, error: `\`${command}${args.length ? ' ' + args.join(' ') : ''}\` exited before answering initialize (code ${code ?? 'null'}${signal ? `, ${signal}` : ''}) — it is not an MCP server and was not saved.` });
+    });
+    child.stdout!.on('data', () => {
+      // Any stdout at all means the process is alive and speaking MCP-ish;
+      // the full handshake check happens on the next runner boot connect.
+      finish({ ok: true });
+    });
+    try {
+      child.stdin!.write(JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'warden-smoke-test', version: '0.0.0' },
+        },
+      }) + '\n');
+    } catch {
+      // stdin closed already — the exit handler will report it
+    }
+  });
 }
 
 /**
@@ -450,7 +569,7 @@ export function spawnOculusBackground(task: string, awarenessText?: string): voi
  * Handlers return `{ ok: true, ... }` on success or `{ ok: false, error }`
  * on failure. The agent-runner parser surfaces the error to the agent.
  */
-export function buildAgentCallbacks(opts?: { awarenessText?: string }): CallbackMap {
+export function buildAgentCallbacks(): CallbackMap {
   return {
     send_message: async (args: any) => {
       try {
@@ -464,27 +583,27 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
           return { ok: true, skipped: true };
         }
 
-        // For Oculus security alerts, append the real pre-fetched security
-        // frame so Telegram sends the photo. Only swap when we actually have a
-        // frame — otherwise leave whatever [Image: ...] reference Oculus wrote
-        // in place so Telegram can still resolve and send it.
         let finalText = text;
-        if (senderName === 'Oculus' && latestOculusFrame) {
-          finalText = finalText.replace(/\s*\[Image:\s*[^\]]+\]/gi, '').trim();
-          finalText = `${finalText} ${latestOculusFrame}`;
-        }
         if (!finalText.trim()) return { ok: false, error: 'missing text' };
         const messageId = `bot-cb-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const timestamp = new Date().toISOString();
         storeMessage({
           id: messageId,
           chat_jid: OWNER_JID,
           sender: 'assistant:local',
           sender_name: senderName,
           content: finalText,
-          timestamp: new Date().toISOString(),
+          timestamp,
           is_from_me: false,
           is_bot_message: true,
         });
+        // Same boundary rule as deliverReply: the clearing turn's reply lands
+        // after clear_context's recorded time, so move the boundary past it.
+        if (pendingContextClear) {
+          pendingContextClear = false;
+          setRouterState('atlas:context_clear_at', timestamp);
+          logger.info({ timestamp }, 'clear_context: boundary moved past the clearing turn reply (send_message)');
+        }
 
         const targetChannel = typeof args?.channel === 'string'
           ? channels.find((c) => c.name === args.channel)
@@ -501,8 +620,8 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         );
 
         // Push a chat_complete notification so the voice client can speak the
-        // reply. The orchestrator's own runAgent reply also emits one, so a
-        // direct orchestrator reply may double-speak if the agent also calls
+        // reply. The seat's own runAgent reply also emits one, so a
+        // direct seat reply may double-speak if the agent also calls
         // send_message. The voice client deduplicates by content to handle this.
         pushNotification('owner', { type: 'chat_complete', message: finalText, from: OWNER_JID });
         return { ok: true, messageId };
@@ -541,6 +660,9 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
           created_at: now,
         };
         task.next_run = computeNextRun(task);
+        if (!task.next_run) {
+          return { ok: false, error: `could not compute a fire time from schedule_value "${scheduleValue}". For a relative once task use an ISO-8601 duration (e.g. "PT2M", "PT1H30M"); for an absolute time use a LOCAL timestamp "YYYY-MM-DDTHH:MM:SS" (no Z suffix).` };
+        }
         createTask(task);
         logger.info({ taskId, scheduleType, scheduleValue }, 'schedule_task callback: task created');
         return { ok: true, taskId };
@@ -600,6 +722,27 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         if (args?.schedule_type) updates.schedule_type = args.schedule_type;
         if (args?.schedule_value) updates.schedule_value = args.schedule_value;
         updateTask(id, updates);
+
+        // If the schedule changed, recompute next_run so the task actually
+        // fires at the new time. Without this, editing schedule_value left the
+        // old next_run in place and the reschedule silently didn't take. Skip
+        // for once tasks that already ran (last_run set → computeNextRun
+        // correctly returns null, meaning "done"); and skip when only the
+        // prompt was edited (no timing change).
+        const scheduleChanged = !!(args?.schedule_type || args?.schedule_value);
+        if (scheduleChanged) {
+          const current = getTaskById(id);
+          if (current && current.status === 'active' && !current.last_run) {
+            const nextRun = computeNextRun(current);
+            if (!nextRun) {
+              return {
+                ok: false,
+                error: `could not compute a fire time from schedule_value "${current.schedule_value}". For a relative once task use an ISO-8601 duration (e.g. "PT2M", "PT1H30M"); for an absolute time use a LOCAL timestamp "YYYY-MM-DDTHH:MM:SS" (no Z suffix).`,
+              };
+            }
+            updateTask(id, { next_run: nextRun });
+          }
+        }
         return { ok: true };
       } catch (err: any) {
         return { ok: false, error: String(err?.message ?? err) };
@@ -619,37 +762,48 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         const sinceMs = args?.since ? new Date(args.since).getTime() : NaN;
         const beforeMs = args?.before ? new Date(args.before).getTime() : NaN;
         const previewOnly = args?.preview_only === true;
-        // The agent doesn't supply an accountId. Try each enabled account until
-        // one connects, so a broken OAuth-linked account (dangling
-        // oauth_account_id — the oauth_accounts row was deleted but the
-        // email_accounts row still references it) no longer masks a working
-        // IMAP/password account that sorts after it.
+        // The agent doesn't supply an accountId. Aggregate EVERY enabled
+        // account — the first-success-wins loop read only the newest-linked
+        // account's mailbox (getEmailAccounts orders created_at DESC), so the
+        // digest and iris never saw mail from the other accounts at all.
+        // A dangling oauth_account_id (oauth_accounts row deleted but the
+        // email_accounts row still references it) is skipped per-account, not
+        // allowed to abort the rest.
         const accounts = getEmailAccounts(null).filter((a) => a.enabled);
         if (accounts.length === 0) {
           return { ok: false, error: 'no enabled email account' };
         }
         const errors: string[] = [];
+        const merged: any[] = [];
+        let anyAccountServed = false;
         for (const account of accounts) {
           if (account.oauth_account_id && !getOAuthAccount(account.oauth_account_id)) {
             errors.push(`${account.email}: linked OAuth account was deleted, skipping`);
             continue;
           }
           try {
-            // Prefer the warm INBOX cache (refreshed every ~5 min by
-            // startInboxCacheWarmer). The agent usually wants "recent mail
-            // since X" — the cached recent batch covers that and avoids a live
-            // fetch of up to `limit` messages one-by-one from the provider
-            // (Gmail does sequential per-message GETs → tens of seconds for
-            // limit 500). Serve the cache without a length check: the agent's
-            // limit is an upper bound, not a minimum, and the date filter
-            // narrows the cached set.
+            // Serve the warm INBOX cache (refreshed every ~5 min by
+            // startInboxCacheWarmer) ONLY for a plain "recent emails" read.
+            // A search must hit the provider (Gmail q=) — the cache drops the
+            // search term and hands iris ~20 recent emails to scan by hand, so
+            // a "find emails about X" comes back with the handful iris happens
+            // to spot. A date-range query is the same: the cache holds only ~20
+            // recent emails, so a "last 30 days" read silently misses anything
+            // older. Both bypass the cache and fetch live — reads are
+            // preview-only (metadata/snippets), which is the fast path, not the
+            // sequential full-body GETs the cache was built to avoid.
+            const hasQuery =
+              (typeof search === 'string' && search.length > 0) ||
+              !Number.isNaN(sinceMs) ||
+              !Number.isNaN(beforeMs);
             let emails: any[];
-            const cached = getCachedInboxEmails(account.id, folder);
+            const cached = hasQuery ? undefined : getCachedInboxEmails(account.id, folder);
             if (cached) {
               emails = cached.emails;
             } else {
               emails = await fetchEmails(account.id, folder, limit, search, previewOnly);
             }
+            anyAccountServed = true;
             // Client-side date-range filter — fetchEmails' 4th param is a text
             // search, not a date filter, so the providers can't do this.
             const filtered = (Number.isNaN(sinceMs) && Number.isNaN(beforeMs))
@@ -662,12 +816,21 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
                   if (!Number.isNaN(beforeMs) && t >= beforeMs) return false;
                   return true;
                 });
-            return { ok: true, emails: filtered };
+            merged.push(...filtered);
           } catch (err: any) {
             errors.push(`${account.email}: ${String(err?.message ?? err)}`);
           }
         }
-        return { ok: false, error: `all email accounts failed — ${errors.join('; ')}` };
+        if (!anyAccountServed && errors.length > 0) {
+          return { ok: false, error: `all email accounts failed — ${errors.join('; ')}` };
+        }
+        // Newest first across all mailboxes, capped at the caller's limit.
+        merged.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        return {
+          ok: true,
+          emails: merged.slice(0, limit),
+          ...(errors.length > 0 ? { account_errors: errors } : {}),
+        };
       } catch (err: any) {
         return { ok: false, error: String(err?.message ?? err) };
       }
@@ -684,7 +847,6 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         const accounts = getEmailAccounts(null);
         const account = accounts.find((a) => a.enabled && !a.read_only);
         if (!account) {
-          // TODO: wire to actual email function once a writable account is configured.
           return { ok: false, error: 'no enabled read-write email account' };
         }
         const result = await sendEmail(account.id, to, subject, body);
@@ -710,10 +872,14 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
           return { ok: false, error: 'no enabled email account' };
         }
         const errors: string[] = [];
+        const disconnected: string[] = [];
+        let searched = 0;
         for (const account of accounts) {
           if (account.oauth_account_id && !getOAuthAccount(account.oauth_account_id)) {
+            disconnected.push(account.email);
             continue;
           }
+          searched++;
           try {
             const email = await getEmailById(account.id, emailId);
             if (email) return { ok: true, email };
@@ -721,7 +887,72 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
             errors.push(`${account.email}: ${String(err?.message ?? err)}`);
           }
         }
-        return { ok: false, error: `email not found — ${errors.join('; ')}` };
+        // Each branch below names why the lookup ended empty. The skip-guard
+        // above used to leave `errors` empty, so every one of these cases
+        // returned the bare string "email not found — " (2026-09-21 19:07).
+        if (searched === 0) {
+          return { ok: false, error: `no mailbox could be searched — the stored OAuth link is missing for ${disconnected.join(', ')}` };
+        }
+        if (errors.length > 0) {
+          return { ok: false, error: `email ${emailId} could not be fetched — ${errors.join('; ')}` };
+        }
+        return { ok: false, error: `no connected mailbox holds a message with id ${emailId}` };
+      } catch (err: any) {
+        return { ok: false, error: String(err?.message ?? err) };
+      }
+    },
+
+    // Download one attachment from an email and save it under the workspace
+    // (data/email-attachments/) so other agents can Read it. Accepts the
+    // attachment's id or just its filename. Without this, "email me the PDF"
+    // routed to atlas, which scraped Gmail's DOM in the browser.
+    download_email_attachment: async (args: any) => {
+      try {
+        const emailId = args?.emailId ?? args?.email_id;
+        if (typeof emailId !== 'string' || !emailId) {
+          return { ok: false, error: 'missing emailId' };
+        }
+        const attachmentId = typeof args?.attachmentId === 'string' ? args.attachmentId : undefined;
+        const filename = typeof args?.filename === 'string' ? args.filename : undefined;
+        if (!attachmentId && !filename) {
+          return { ok: false, error: 'missing attachmentId or filename' };
+        }
+        const accounts = getEmailAccounts(null).filter((a) => a.enabled);
+        if (accounts.length === 0) {
+          return { ok: false, error: 'no enabled email account' };
+        }
+        const errors: string[] = [];
+        const disconnected: string[] = [];
+        let searched = 0;
+        for (const account of accounts) {
+          if (account.oauth_account_id && !getOAuthAccount(account.oauth_account_id)) {
+            disconnected.push(account.email);
+            continue;
+          }
+          searched++;
+          try {
+            const att = await downloadEmailAttachment(account.id, emailId, attachmentId, filename);
+            if (!att) continue;
+            // Sanitize the filename: strip directories and shell-unfriendly
+            // characters so a hostile filename can't escape the target dir.
+            const safeName = att.filename.replace(/[^A-Za-z0-9._ -]/g, '_').replace(/^\.+/, '_');
+            const root = WORKSPACE_ROOT.replace(/^~(?=\/|$)/, process.env.HOME ?? '');
+            const dir = path.join(root, 'data', 'email-attachments');
+            fs.mkdirSync(dir, { recursive: true });
+            const filePath = path.join(dir, `${emailId}_${safeName}`);
+            fs.writeFileSync(filePath, att.data);
+            return { ok: true, path: filePath, filename: att.filename, size: att.data.length };
+          } catch (err: any) {
+            errors.push(`${account.email}: ${String(err?.message ?? err)}`);
+          }
+        }
+        if (searched === 0) {
+          return { ok: false, error: `no mailbox could be searched — the stored OAuth link is missing for ${disconnected.join(', ')}` };
+        }
+        if (errors.length > 0) {
+          return { ok: false, error: `attachment could not be downloaded — ${errors.join('; ')}` };
+        }
+        return { ok: false, error: `no connected mailbox holds ${attachmentId ? `attachment ${attachmentId}` : `an attachment named ${filename}`} on email ${emailId}` };
       } catch (err: any) {
         return { ok: false, error: String(err?.message ?? err) };
       }
@@ -946,7 +1177,7 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
     // ─── Work tasks (wired to db.ts user_work_tasks) ───────────────────────
     // The agent-runner's create_work_task/list_work_tasks/update_work_task/
     // delete_work_task tools delegate here via callHost(); without these the
-    // callbacks had "no registered handler" and Byte could never add a task.
+    // callbacks had "no registered handler" and the work-management agent could never add a task.
     list_work_tasks: async (args: any) => {
       try {
         // Single-user schema: every work task is the owner's, so list all of
@@ -968,7 +1199,7 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         // email-driven tasks that don't fit a specific project go here.
         if (!projectId) projectId = PERSONAL_PROJECT_ID;
         // Resolve name→id if the model passed the project name, and confirm the
-        // project actually exists — Byte's retry loop created duplicates because
+        // project actually exists — an early work-management agent's retry loop created duplicates because
         // it kept re-creating projects when its task calls silently failed.
         const resolved = resolveProjectId(projectId) || projectId;
         if (!getProject(resolved)) return { ok: false, error: 'project not found' };
@@ -1020,10 +1251,23 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         if (!name || !command) {
           return { ok: false, error: 'missing name or command' };
         }
+        if (!/^[a-z0-9._-]+$/i.test(name)) {
+          return { ok: false, error: 'invalid server name (a-z 0-9 . _ - only)' };
+        }
+        const serverArgs = Array.isArray(args?.args) ? args.args.map(String) : [];
+        // Smoke-test before persisting: a stdio MCP server must live long
+        // enough to answer an initialize request. Entries are only useful if
+        // they connect on the next runner spawn, and a junk entry (a command
+        // that exits immediately) fails on EVERY spawn forever — so an entry
+        // that cannot handshake is rejected here, not saved and retried.
+        const smoke = await smokeTestMcpServer(command, serverArgs);
+        if (!smoke.ok) {
+          return { ok: false, error: smoke.error };
+        }
         const entry: McpServerConfig = {
           name,
           command,
-          args: Array.isArray(args?.args) ? args.args.map(String) : [],
+          args: serverArgs,
           env: args?.env && typeof args.env === 'object' ? args.env : undefined,
           transport: 'stdio',
           enabled: true,
@@ -1130,9 +1374,51 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
 
     open_app: async (args: any) => {
       try {
-        const app = typeof args?.app === 'string' ? args.app.trim() : '';
-        if (!app) return { ok: false, error: 'missing app name' };
-        const extraArgs: string[] = Array.isArray(args?.args) ? args.args.map(String) : [];
+        const requested = typeof args?.app === 'string' ? args.app.trim() : '';
+        if (!requested) return { ok: false, error: 'missing app name' };
+        // Model-friendly names don't always match the binary installed here
+        // (2026-09-21: `open_app chrome` -> spawn ENOENT; the browser on this
+        // box is google-chrome-stable). Each value is argv, so a flatpak app
+        // resolves to the command that launches it. Every target below was
+        // checked with `command -v` on this host — a name that maps to nothing
+        // installed is left out on purpose, so asking for a program this box
+        // does not have fails with its real ENOENT instead of quietly opening
+        // some other program.
+        const APP_ALIASES: Record<string, string[]> = {
+          chrome: ['google-chrome-stable'],
+          'google-chrome': ['google-chrome-stable'],
+          browser: ['google-chrome-stable'],
+          'web-browser': ['google-chrome-stable'],
+          files: ['dolphin'],
+          'file-manager': ['dolphin'],
+          filemanager: ['dolphin'],
+          explorer: ['dolphin'],
+          terminal: ['konsole'],
+          console: ['konsole'],
+          editor: ['kate'],
+          'text-editor': ['kate'],
+          texteditor: ['kate'],
+          notepad: ['kate'],
+          calculator: ['kcalc'],
+          settings: ['systemsettings'],
+          'system-settings': ['systemsettings'],
+          screenshot: ['spectacle'],
+          'image-viewer': ['gwenview'],
+          'pdf-viewer': ['okular'],
+          'document-viewer': ['okular'],
+          'archive-manager': ['ark'],
+          mail: ['kmail'],
+          email: ['kmail'],
+          'mail-client': ['kmail'],
+          discord: ['flatpak', 'run', 'com.discordapp.Discord'],
+        };
+        const resolved = APP_ALIASES[requested.toLowerCase()] ?? [requested];
+        const app = resolved[0];
+        const launched = resolved.join(' ');
+        const extraArgs: string[] = [
+          ...resolved.slice(1),
+          ...(Array.isArray(args?.args) ? args.args.map(String) : []),
+        ];
         const hostEnv = {
           ...process.env,
           DISPLAY: process.env.DISPLAY || ':0',
@@ -1147,9 +1433,27 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
           detached: true,
           stdio: 'ignore',
         });
+        // Spawn errors (ENOENT etc.) arrive ASYNC on the child — the try/catch
+        // around spawn never sees them, and an unhandled 'error' event is a
+        // fatal process crash: `open_app chrome` (no such binary on this box)
+        // took the whole Warden host down twice on 2026-09-21, mid-turn, and
+        // the wreckage is what sent the seat into pkill. Log it, and hold the
+        // reply briefly so a launch failure (bad binary name) doesn't get
+        // reported to the user as a success (2026-09-21: "I've opened Google
+        // Chrome" when nothing launched — logs/warden.log 17:39:03-06).
+        const launchError: Promise<string | null> = new Promise((resolve) => {
+          child.once('error', (err) => {
+            const message = String((err as Error)?.message || err);
+            logger.error({ launched, err: message }, 'open_app: launch failed');
+            resolve(message);
+          });
+          setTimeout(() => resolve(null), 300);
+        });
         child.unref();
-        logger.info({ app, args: extraArgs }, 'open_app: launched host application');
-        return { ok: true, message: `Launched ${app}` };
+        const failure = await launchError;
+        if (failure) return { ok: false, error: `failed to launch ${launched}: ${failure}` };
+        logger.info({ launched, args: extraArgs }, 'open_app: launched host application');
+        return { ok: true, message: `Launched ${launched}` };
       } catch (err: any) {
         return { ok: false, error: String(err?.message ?? err) };
       }
@@ -1157,7 +1461,7 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
 
     // ─── Host-side image capture ───────────────────────────────────────────
     // Screenshots, webcam frames, and arbitrary host image files are captured
-    // here in the orchestrator process (which has the host display + devices),
+    // here in the host process (which has the host display + devices),
     // not inside the container. The container tool pushes the returned base64
     // into its vision-context queue.
 
@@ -1168,6 +1472,20 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
         // app's frame server, which runs in the laptop's graphical session).
         // Region is cropped here from the full-screen PNG. window_title is not
         // supported remotely (no way to focus a window on the laptop from here).
+        //
+        // Say so instead of dropping the argument: this handler used to accept
+        // window_title, ignore it, and return the whole screen, so a caller that
+        // asked for one window got a full-desktop frame it believed was that
+        // window (2026-09-21 18:33, window_title "facebook.com"). The caller's
+        // reply is built from `error` alone, so refusing is the only way the
+        // mismatch reaches it.
+        const windowTitle = typeof args?.window_title === 'string' ? args.window_title.trim() : '';
+        if (windowTitle) {
+          return {
+            ok: false,
+            error: 'this capture is the whole screen — per-window capture is unavailable on this host. A sub-rectangle of the screen is available through region {x,y,w,h}.',
+          };
+        }
         let region: { x: number; y: number; w: number; h: number } | undefined;
         const r = args?.region;
         if (r && typeof r === 'object') {
@@ -1223,265 +1541,99 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
       }
     },
 
-    // Orchestrator monitor-tick reports route HERE (not send_message), so the
-    // tick's supervision prose lands in the dashboard's progress panel instead
-    // of spamming the chat. The chat only carries completed-task reports
-    // (inbox digest) and interventions.
-    progress_event: async (args: any) => {
+    // Artemis's trainable-error flag → training/loop/flags (src/training-flags.ts).
+    // The loop's modify step turns pending flags into corrective SFT rows.
+    flag_training_error: async (args: any) => {
       try {
-        const text = typeof args?.text === 'string' ? args.text : '';
-        if (!text.trim()) return { ok: true, skipped: true };
-        pushSupervisorNote(text);
-        return { ok: true };
+        const r = addTrainingFlag(args);
+        if (r.ok) logger.info({ id: r.id, duplicate: r.duplicate, cls: args?.failure_class }, 'flag_training_error: flagged');
+        return r;
       } catch (err: any) {
+        logger.warn({ err }, 'flag_training_error: failed');
         return { ok: false, error: String(err?.message ?? err) };
       }
     },
 
-    // ─── Oculus alert (close) ──────────────────────────────────────────────
-    // Close the open security alert on the standalone detector app, re-arming
-    // it so it can raise the next alert. The detector holds an alert OPEN until
-    // this is called (one alert per incident, not one per detection).
-    close_security_alert: async (_args: any) => {
-      const ip = getSatelliteIp();
-      const url = `http://${ip}:8765/alert/close`;
+    // Sentry scan submission. The agent collects the raw inventory with Bash,
+    // JUDGES it itself (a smart model knows what a normal Linux desktop looks
+    // like), and submits it ONCE with its `suspicious` flags. THIS handler
+    // only logs the scan row and relays the flags — no baseline, no host-side
+    // diff. Clean scans are logged and silent.
+    sentry_report: async (args: any) => {
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-        try {
-          const res = await fetch(url, { method: 'POST', signal: controller.signal });
-          const body = await res.text().catch(() => '');
-          logger.info({ status: res.status, body: body.slice(0, 120) }, 'close_security_alert: detector re-armed');
-          return { ok: res.ok, state: body };
-        } finally {
-          clearTimeout(timer);
+        const mode = args?.mode === 'deep' ? 'deep' : 'peek';
+        const arr = (v: any): string[] =>
+          Array.isArray(v) ? v.map((x: any) => String(x).trim()).filter(Boolean) : [];
+        const inventory: Record<string, string[]> = {
+          listening: arr(args?.listening),
+          connections: arr(args?.connections),
+          services: arr(args?.services),
+        };
+        if (mode === 'deep') {
+          inventory.autostart = arr(args?.autostart);
+          inventory.crontab = arr(args?.crontab);
+          inventory.units = arr(args?.units);
         }
-      } catch (err: any) {
-        logger.warn({ err }, 'close_security_alert: security app not reachable');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
+        const suspicious = arr(args?.suspicious);
+        const nowIso = new Date().toISOString();
+        const checked = Object.values(inventory).reduce((n, a) => n + a.length, 0);
+        const verdict = suspicious.length > 0 ? 'FINDINGS' : 'CLEAN';
 
-    // "Open your eyes" — toggle the detector's eyes_open flag on (it will POST
-    // AWARENESS events again). Mirrors close_oculus_alert. The detector keeps
-    // running + showing the feed; eyes_open means awareness is active, eyes
-    // closed means it's paused.
-    arm_security: async (_args: any) => {
-      const ip = getSatelliteIp();
-      const url = `http://${ip}:8765/open`;
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-        try {
-          const res = await fetch(url, { method: 'POST', signal: controller.signal });
-          const body = await res.text().catch(() => '');
-          logger.info({ status: res.status, body: body.slice(0, 120) }, 'arm_security: eyes opened');
-          return { ok: res.ok, state: body };
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch (err: any) {
-        logger.warn({ err }, 'arm_security: oculus app not reachable');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // "Close your eyes" — toggle the detector's eyes_open flag off (stop posting
-    // AWARENESS events).
-    disarm_security: async (_args: any) => {
-      const ip = getSatelliteIp();
-      const url = `http://${ip}:8765/close`;
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-        try {
-          const res = await fetch(url, { method: 'POST', signal: controller.signal });
-          const body = await res.text().catch(() => '');
-          logger.info({ status: res.status, body: body.slice(0, 120) }, 'disarm_security: eyes closed');
-          return { ok: res.ok, state: body };
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch (err: any) {
-        logger.warn({ err }, 'disarm_security: oculus app not reachable');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // Oculus's conditions log (own sqlite store, store/security.db). Records
-    // each alert assessment with an exact timestamp, and queries history by
-    // local-time range so Oculus can reference events by time/date.
-    security_log: async (args: any) => {
-      return securityLog(args);
-    },
-
-    // Oculus's situational-awareness history (arrivals/departures/greetings).
-    awareness_log: async (args: any) => {
-      return awarenessLog(args);
-    },
-
-    // Oculus watch-out-for match: copy the latest fetched frame into the owner's
-    // uploads tree (groups/owner/oculus/<ts>.jpg) so the user can review it later,
-    // and return the uploads path. Silent — no message to the user. Called by the
-    // Oculus agent when an AWARENESS event matches a user-defined watch-out-for
-    // situation. The frame was already pulled + saved by fetchAndSaveSecurityFrame.
-    oculus_capture: async (_args: any) => {
-      try {
-        if (!latestOculusFrame) return { ok: false, error: 'no frame available' };
-        const m = latestOculusFrame.match(/\[Image:\s*(.+?)\]/);
-        if (!m) return { ok: false, error: 'could not parse frame reference' };
-        const rel = m[1].trim();                      // e.g. attachments/xyz.jpg
-        const src = path.join(WORKSPACE_ROOT, 'groups', 'owner', rel);
-        if (!fs.existsSync(src)) return { ok: false, error: 'frame file not found' };
-        const destDir = path.join(WORKSPACE_ROOT, 'groups', 'owner', 'oculus');
-        fs.mkdirSync(destDir, { recursive: true });
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const base = path.basename(rel);
-        const dest = path.join(destDir, `${stamp}-${base}`);
-        fs.copyFileSync(src, dest);
-        const uploadPath = `oculus/${stamp}-${base}`;
-        logger.info({ uploadPath }, 'oculus_capture: watch-out-for match saved to uploads');
-        return { ok: true, path: uploadPath };
-      } catch (err: any) {
-        logger.warn({ err }, 'oculus_capture: failed to save frame');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // Oculus registers a known person; the satellite computes the face embedding
-    // on CPU and stores it locally.
-    save_known_person: async (args: any) => {
-      try {
-        const label = String(args?.label || '').trim();
-        if (!label) return { ok: false, error: 'missing label' };
-        const ip = getSatelliteIp();
-        const url = `http://${ip}:8765/known/save`;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15000);
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label }),
-          signal: controller.signal,
+        logSentryScan({
+          ts: nowIso,
+          mode,
+          verdict,
+          summary: `${checked} items checked${suspicious.length ? `, ${suspicious.length} finding(s)` : ''}`,
+          rawJson: JSON.stringify(inventory),
+          findingsJson: JSON.stringify(suspicious),
         });
-        clearTimeout(timer);
-        const body: any = await res.json().catch(() => ({}));
-        if (!res.ok || !body?.ok) {
-          return { ok: false, error: body?.error || `HTTP ${res.status}` };
+
+        // Speak only when something's wrong. Dedup announcements: a flag
+        // spoken once stays quiet while it keeps appearing, and a clean scan
+        // clears the set so anything that reappears later speaks again.
+        let fresh = suspicious;
+        if (suspicious.length > 0) {
+          let reported = new Set<string>();
+          try { reported = new Set(JSON.parse(getRouterState('sentry:reported') || '[]')); } catch { /* fresh set */ }
+          fresh = suspicious.filter((f) => !reported.has(f));
+          if (fresh.length > 0) {
+            reported = new Set([...reported, ...fresh]);
+            setRouterState('sentry:reported', JSON.stringify([...reported].slice(-200)));
+            const text = `🛡 Security scan found something new:\n${fresh.map((f) => `• ${f}`).join('\n')}`;
+            const messageId = `sentry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            storeMessage({
+              id: messageId,
+              chat_jid: OWNER_JID,
+              sender: 'assistant:sentry',
+              sender_name: '🛡 Sentry',
+              content: text,
+              timestamp: nowIso,
+              is_from_me: false,
+              is_bot_message: true,
+            });
+            await Promise.allSettled(
+              channels.map((ch) =>
+                ch.sendMessage(OWNER_JID, text).catch((err) =>
+                  logger.warn({ channel: ch.name, err }, 'Failed to deliver Sentry finding to channel'),
+                ),
+              ),
+            );
+          }
+        } else {
+          setRouterState('sentry:reported', '[]');
         }
-        return { ok: true, label };
+
+        const verdictText =
+          verdict === 'CLEAN'
+            ? `CLEAN — ${checked} items checked, nothing looked wrong.`
+            : `FINDINGS — ${suspicious.length} item(s) flagged${fresh.length < suspicious.length ? ` (${fresh.length} new)` : ''}: ${suspicious.join('; ').slice(0, 400)}`;
+        return { ok: true, verdict: verdictText };
       } catch (err: any) {
-        logger.warn({ err }, 'save_known_person: failed to reach satellite');
+        logger.warn({ err }, 'sentry_report: failed');
         return { ok: false, error: String(err?.message ?? err) };
       }
     },
 
-    // Orchestrator vision aid: the latest AWARENESS info from Oculus / the
-    // camera detector — the most recent event text plus the recent host event
-    // rows (event, is_known/label, person_count, how long the room's been
-    // occupied/empty). Lets the orchestrator answer "who's in the room" by
-    // combining a webcam_capture photo with this structured context (names,
-    // counts, durations) that the photo alone can't provide.
-    awareness_status: async () => {
-      try {
-        const recent = await queryAwarenessHostEvents(5);
-        return { ok: true, latest: lastAwarenessEvent, recent };
-      } catch (err: any) {
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // Orchestrator → Oculus direct. The user tells Jarvis a presence/schedule
-    // note (e.g. "heading out for the evening"); Oculus processes it according to
-    // the rules in eyes_ears/oculus.md. Oculus does not reply in the chat.
-    tell_oculus: async (args: any) => {
-      try {
-        const message = typeof args?.message === 'string' ? args.message.trim() : '';
-        if (!message) return { ok: false, error: 'missing message' };
-        const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
-        const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
-        const compactTs = localNow.replace(/[-:]/g, ''); // match the detector's %Y%m%dT%H%M%S
-        const task =
-          `Current local time is ${localNow} (timezone ${tz}).\n\n` +
-          `AWARENESS — note at ${compactTs}. data: {"event":"note","message":${JSON.stringify(message)},"ts":"${compactTs}"}\n\n` +
-          `The user passed you a note. Read eyes_ears/oculus.md and follow its rules. ` +
-          `Do NOT send_message and do NOT reply in chat unless the rules explicitly tell you to greet. Stop after one action.`;
-        spawnOculusBackground(task);
-        logger.info('tell_oculus: spawned Oculus to process note');
-        return { ok: true };
-      } catch (err: any) {
-        logger.warn({ err }, 'tell_oculus: failed to spawn Oculus');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // Orchestrator → Oculus live status query. Spawns Oculus synchronously so
-    // it can pull/process live data and return a concise report, instead of
-    // returning stale cached rows. The orchestrator uses this to decide whether
-    // a current room-status question needs a webcam frame.
-    oculus_query: async (args: any) => {
-      try {
-        const question = typeof args?.question === 'string' && args.question.trim()
-          ? args.question.trim()
-          : 'live status';
-        const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
-        const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
-        const task =
-          `[ORCHESTRATOR_QUERY] Current local time is ${localNow} (timezone ${tz}).\n\n` +
-          `The orchestrator asks: "${question}"\n\n` +
-          `You are Oculus, the situational-awareness agent. This is a live query from the orchestrator, NOT an AWARENESS event. ` +
-          `Do NOT send_message to the user (you do not have it). ` +
-          `If the question is about what is happening NOW or what is on screen: call awareness_status for the current room state, and security_frame once to look at the live screen if it would help answer. ` +
-          `If the question is about what happened at or around a given time: query awareness_log (action: query) and security_log for that time window to read the text logs. ` +
-          `Then return a concise report as your final plain-text output. ` +
-          `Start with NOTHING_NOTEWORTHY if the room is currently empty and there is no person present, no recent motion/arrival/departure, and the camera is normal. ` +
-          `Start with NOTEWORTHY if a person is currently present, an unknown person is detected, there is recent motion, or the camera is covered/moved. ` +
-          `If the user asked about a specific time, report what the logs show for that window. ` +
-          `Then add one sentence of detail. Read eyes_ears/oculus.md if you need user-specific rules, but do not greet or alert the user directly.`;
-        const model = resolveAwarenessModel();
-        const result = await runSubAgentSync({
-          agent: 'oculus',
-          prompt: task,
-          model,
-          workspaceRoot: WORKSPACE_ROOT,
-          chatJid: OWNER_JID,
-          groupFolder: 'owner',
-          isMain: true,
-          timeoutMs: 30 * 1000,
-          callbacks: buildAgentCallbacks({}),
-        } as any);
-        logger.info({ report: result.content.slice(0, 200), exitCode: result.exitCode }, 'oculus_query: got report');
-        return { ok: true, report: result.content };
-      } catch (err: any) {
-        logger.warn({ err }, 'oculus_query: failed to query Oculus');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // Oculus raised an alert → light the red alert on the satellite detector.
-    open_security_alert: async (args: any) => {
-      const reason = String(args?.reason || '').trim();
-      if (!reason) return { ok: false, error: 'missing reason' };
-      const ip = getSatelliteIp();
-      const url = `http://${ip}:8765/alert/open`;
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-        try {
-          const res = await fetch(url, { method: 'POST', signal: controller.signal });
-          const body = await res.text().catch(() => '');
-          logger.info({ status: res.status, body: body.slice(0, 120) }, 'open_security_alert: detector ALERTED');
-          return { ok: res.ok, state: body };
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch (err: any) {
-        logger.warn({ err }, 'open_security_alert: security app not reachable');
-        return { ok: false, error: String(err?.message ?? err) };
-      }
-    },
-
-    // The orchestrator called its clear_context tool. Record the clear boundary
     // on the host so <chat_history> is gated to messages AFTER this point —
     // otherwise pre-clear turns (e.g. a STT-misheard "dental file" thread the
     // small model keeps latching onto) get re-injected every turn. The
@@ -1490,8 +1642,13 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
     clear_context: async (args: any) => {
       try {
         const now = new Date().toISOString();
-        setRouterState('orchestrator:context_clear_at', now);
+        setRouterState('atlas:context_clear_at', now);
         setRouterState('last_agent_timestamp', now);
+        // The boundary must end up AFTER this turn's own reply, not at the
+        // request time: deliverReply/send_message advance it when the reply is
+        // stored. Otherwise the clearing turn's reply is re-injected as history
+        // next turn.
+        pendingContextClear = true;
         logger.info({ reason: args?.reason }, 'clear_context tool: host boundary recorded');
         return { ok: true, clearedAt: now };
       } catch (err: any) {
@@ -1615,6 +1772,227 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
           }
         }
 
+        // Alarm IPC — the agent-runner's `alarms` toolset (create/list/update/
+        // delete_alarm) used to write these as task files into an IPC dir the
+        // host no longer watches, so alarms were accepted ("Alarm created.")
+        // but never persisted and never fired. Handle them in-process instead.
+        // Single-user: all alarms belong to OWNER_JID.
+        if (type === 'create_alarm') {
+          const label = String(args.label || '').trim();
+          const rawTime = String(args.alarm_time || '').trim();
+          if (!label || !/^\d{1,2}:\d{2}$/.test(rawTime)) {
+            return { ok: false, error: 'create_alarm requires label and alarm_time (HH:MM)' };
+          }
+          // Normalize to HH:MM and default a one-time alarm to today — the
+          // model should never have to compute today's date.
+          const [h, m] = rawTime.split(':');
+          const hhmm = `${String(h).padStart(2, '0')}:${m}`;
+          const now = new Date();
+          const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+          let repeatType = String(args.repeat_type || 'once');
+          if (repeatType === 'none') repeatType = 'once';
+          const alarmDate = repeatType === 'once' ? (args.alarm_date || today) : (args.alarm_date || null);
+          const alarm = createAlarm(OWNER_JID, {
+            label, alarm_time: hhmm, alarm_date: alarmDate || undefined,
+            repeat_type: repeatType, repeat_days: args.repeat_days, sound: args.sound,
+          });
+          pushNotification(OWNER_JID, { type: 'alarm_created', message: `Alarm "${label}" set for ${hhmm}`, taskId: alarm?.id });
+          logger.info({ label: alarm.label, time: alarm.alarm_time, date: alarm.alarm_date, repeat: alarm.repeat_type }, 'Alarm created via ipc callback');
+          return { ok: true, alarm };
+        }
+
+        if (type === 'list_alarms') {
+          return { ok: true, alarms: getUserAlarms(OWNER_JID) };
+        }
+
+        if (type === 'update_alarm') {
+          const alarmId = String(args.alarm_id || '');
+          if (!alarmId) return { ok: false, error: 'update_alarm requires alarm_id' };
+          const updates: Record<string, unknown> = {};
+          if (typeof args.label === 'string') updates.label = args.label;
+          if (typeof args.alarm_time === 'string') updates.alarm_time = args.alarm_time;
+          if (args.alarm_date === null || typeof args.alarm_date === 'string') updates.alarm_date = args.alarm_date;
+          if (typeof args.repeat_type === 'string') updates.repeat_type = args.repeat_type === 'none' ? 'once' : args.repeat_type;
+          if (typeof args.repeat_days === 'string') updates.repeat_days = args.repeat_days;
+          if (typeof args.enabled === 'boolean') updates.enabled = args.enabled ? 1 : 0;
+          if (typeof args.sound === 'string') updates.sound = args.sound;
+          const updated = updateAlarm(alarmId, updates);
+          if (!updated) return { ok: false, error: 'alarm not found' };
+          return { ok: true, alarm: updated };
+        }
+
+        if (type === 'delete_alarm') {
+          const alarmId = String(args.alarm_id || '');
+          if (!alarmId) return { ok: false, error: 'delete_alarm requires alarm_id' };
+          return { ok: deleteAlarmDb(alarmId) };
+        }
+
+        // ── Friends (peer mesh over Tailscale) ──────────────────────────
+        // The agent-runner never sees friend tokens — it sends the action here,
+        // the host resolves the stored token and makes the call.
+        if (type === 'friend_list') {
+          const friends = listFriends().map((f: any) => ({
+            hostname: f.id,
+            name: f.name || f.id,
+            status: f.status,
+            last_seen: f.last_seen,
+            profile: f.profile || '',
+            capabilities: (() => { try { return JSON.parse(f.capabilities); } catch { return []; } })(),
+            specialists: (() => { try { return JSON.parse(f.specialists); } catch { return []; } })(),
+          }));
+          return {
+            ok: true,
+            self: { hostname: myHostname(), link: myLink(), profile: getSelfProfile() },
+            friends,
+            requests: listFriendRequests().map((r: any) => ({ id: r.id, from_hostname: r.from_hostname })),
+            blocked: listBlocked(),
+            offenses: listOffenses(100),
+          };
+        }
+        if (type === 'friend_profile') {
+          const profile = String(args.profile || '').slice(0, 500);
+          setSelfProfile(profile);
+          return { ok: true, profile };
+        }
+        if (type === 'friend_block') {
+          const hostname = String(args.hostname || '');
+          if (!hostname) return { ok: false, error: 'friend_block requires hostname' };
+          // Remove as friend and cut off on every route.
+          deleteFriend(hostname);
+          blockFriend(hostname, String(args.reason || 'blocked').slice(0, 200));
+          return { ok: true, blocked: hostname };
+        }
+        if (type === 'friend_unblock') {
+          const hostname = String(args.hostname || '');
+          if (!hostname) return { ok: false, error: 'friend_unblock requires hostname' };
+          return { ok: unblockFriend(hostname), hostname };
+        }
+        if (type === 'friend_dm') {
+          const hostname = String(args.hostname || '');
+          const message = String(args.message || '').slice(0, 4000);
+          if (!hostname || !message) return { ok: false, error: 'friend_dm requires hostname and message' };
+          return await dmFriend(hostname, message);
+        }
+        if (type === 'friend_broadcast') {
+          const room = String(args.room || '').slice(0, 120);
+          const message = String(args.message || '').slice(0, 4000);
+          const hostnames = Array.isArray(args.hostnames) ? args.hostnames.map(String) : [];
+          if (!room || !message || hostnames.length === 0) {
+            return { ok: false, error: 'friend_broadcast requires room, message, and hostnames' };
+          }
+          return await broadcastToRoom(room, message, hostnames);
+        }
+        if (type === 'friend_share') {
+          const hostname = String(args.hostname || '');
+          const filename = String(args.filename || '').slice(0, 120);
+          const content = String(args.content || '').slice(0, 1024 * 1024);
+          if (!hostname || !filename || !content) return { ok: false, error: 'friend_share requires hostname, filename, and content' };
+          return await shareFile(hostname, filename, content);
+        }
+        if (type === 'friend_ask') {
+          const hostname = String(args.hostname || '');
+          const task = String(args.task || '').slice(0, 8000);
+          const agent = String(args.agent || '').toLowerCase();
+          if (!hostname || !task) return { ok: false, error: 'friend_ask requires hostname and task' };
+          const r = await askFriend(hostname, task, 120000, agent || undefined);
+          return r.ok ? { ok: true, answer: r.answer } : { ok: false, error: r.error };
+        }
+        if (type === 'friend_task') {
+          const hostname = String(args.hostname || '');
+          const title = String(args.title || '').slice(0, 300);
+          if (!hostname || !title) return { ok: false, error: 'friend_task requires hostname and title' };
+          const r = await assignFriendTask(hostname, {
+            title,
+            description: String(args.description || '').slice(0, 4000) || undefined,
+            priority: String(args.priority || '') || undefined,
+            due_date: String(args.due_date || '') || undefined,
+          });
+          return r.ok ? { ok: true, task_id: r.task_id } : { ok: false, error: r.error };
+        }
+        if (type === 'friend_inbox') {
+          // Read the social inbox: DMs, room posts, shared files. Files come
+          // back with their on-disk path so the seat can Grep/Read them.
+          return {
+            ok: true,
+            self: { hostname: myHostname(), link: myLink() },
+            messages: listFriendMessages(50),
+            rooms: listFriendRoomMessages(100),
+            files: listFriendFiles(100),
+          };
+        }
+        if (type === 'bbs_read') {
+          const host = String(args.host || '').trim();
+          const board = String(args.board || '').trim().slice(0, 60);
+          if (host && host !== myHostname()) return await bbsDialState(host, board || undefined);
+          return bbsState(board || undefined);
+        }
+        if (type === 'bbs_post') {
+          const board = String(args.board || '').slice(0, 60);
+          const body = String(args.body || '').slice(0, 8000);
+          const title = String(args.title || '').slice(0, 200);
+          const threadId = String(args.thread_id || '').slice(0, 64);
+          const host = String(args.host || '').trim();
+          if (!board || !body) return { ok: false, error: 'bbs_post requires board and body' };
+          return await bbsPost({ board, body, title: title || undefined, thread_id: threadId || undefined, author_kind: 'bot', host: host || undefined });
+        }
+        if (type === 'friend_patch') {
+          const hostname = String(args.hostname || '').trim();
+          if (!hostname) return { ok: false, error: 'friend_patch requires hostname' };
+          return await sendPatch(hostname, {
+            repo: String(args.repo || ''),
+            base: args.base ? String(args.base) : undefined,
+            description: String(args.description || ''),
+          });
+        }
+        if (type === 'friend_collab') {
+          const hostnames = Array.isArray(args.hostnames) ? args.hostnames.map(String) : [];
+          const subtasks = Array.isArray(args.subtasks)
+            ? args.subtasks.map((s: any) => ({ hostname: String(s?.hostname || ''), task: String(s?.task || '') }))
+            : undefined;
+          if (hostnames.length === 0) return { ok: false, error: 'friend_collab requires hostnames' };
+          return await friendCollab({
+            hostnames,
+            title: String(args.title || ''),
+            task: String(args.task || ''),
+            subtasks,
+            save: args.save !== false,
+          });
+        }
+        if (type === 'bbs_file_save') {
+          const name = String(args.name || '').slice(0, 120);
+          const content = String(args.content || '');
+          if (!name || !content) return { ok: false, error: 'bbs_file_save requires name and content' };
+          return bbsFileSave(name, content);
+        }
+        if (type === 'bbs_files') {
+          const host = String(args.host || '').trim();
+          if (host && host !== myHostname()) {
+            const d = await bbsDialState(host);
+            return { ok: d.ok, files: d.files || [], host, online: d.online, error: d.error };
+          }
+          return { ok: true, files: bbsFiles() };
+        }
+        if (type === 'bbs_file_read') {
+          const name = String(args.name || '');
+          const host = String(args.host || '').trim();
+          if (host && host !== myHostname()) return await readFriendFile(host, name);
+          return bbsFileRead(name);
+        }
+        if (type === 'bbs_botnet') {
+          // Get/set the autonomy sweep's kill switch + which specialist runs it.
+          const action = String(args.action || 'get');
+          if (action === 'set') {
+            if (args.enabled !== undefined) setRouterState('bbs:autonomy:enabled', (args.enabled === true || args.enabled === 'true') ? 'true' : 'false');
+            const agent = String(args.agent || '').toLowerCase();
+            if (agent === 'atlas' || agent === 'vulkan') setRouterState('bbs:autonomy:agent', agent);
+          }
+          return {
+            ok: true,
+            enabled: getRouterState('bbs:autonomy:enabled') !== 'false',
+            agent: getRouterState('bbs:autonomy:agent') || 'atlas',
+          };
+        }
+
         return { ok: false, error: `unknown ipc type: ${type}` };
       } catch (err: any) {
         logger.warn({ err, type: args?.type }, 'ipc callback: error');
@@ -1625,20 +2003,566 @@ export function buildAgentCallbacks(opts?: { awarenessText?: string }): Callback
   };
 }
 
-let mercuryTurnCounter = 0;
+// ─── Friends: run an inbound "ask" as a normal seat turn ───────────────────
+// A friend who was accepted may POST /api/friends/request. This runs the task
+// through the same seat (Atlas) as an owner message — same model/settings,
+// same tools — and returns the seat's final answer. Bounded ~2 min. Never
+// builds the prompt via buildPrompt(): that injects the owner's private chat
+// history, which a friend must not see.
+let friendTurnBusy = false;
 
-function maybeUpdateMercurySummary(): void {
-  mercuryTurnCounter++;
-  if (mercuryTurnCounter % MERCURY_SUMMARY_EVERY === 0) {
-    void updateMercurySummary();
+/** The seat's full model/settings wiring, shared by every "background seat turn"
+ *  (inbound friend ask + the BotNet autonomy sweep) so they run with the same
+ *  models and tools as an owner message — no private chat history attached. */
+function seatModelSettings() {
+  return {
+    maxOutputTokens: (getRouterState('local:max_output_tokens') || '').trim(),
+    model: (getRouterState('atlas:model') || '').replace(/^local:/, '') || undefined,
+    vulkanModel: (getRouterState('vulkan:model') || '').replace(/^local:/, '') || undefined,
+    supervisorModel: (getRouterState('supervisor:model') || '').replace(/^local:/, '') || undefined,
+    supervisorEnabled: getRouterState('supervisor:enabled') !== 'false',
+    irisModel: (getRouterState('local:subagent_model') || '').replace(/^local:/, '') || undefined,
+    artemisModel: (getRouterState('artemis:model') || '').replace(/^local:/, '') || undefined,
+    sentryModel: (getRouterState('sentry:model') || getRouterState('atlas:model') || '').replace(/^local:/, '') || undefined,
+    drivingForce: getRouterState('atlas:driving_force') || '',
+    contextClearAt: getRouterState('atlas:context_clear_at') || '',
+    councilSkepticModel: (getRouterState('council:skeptic_model') || '').replace(/^local:/, '') || undefined,
+    councilPragmatistModel: (getRouterState('council:pragmatist_model') || '').replace(/^local:/, '') || undefined,
+    councilSynthesistModel: (getRouterState('council:synthesist_model') || '').replace(/^local:/, '') || undefined,
+    defaultApps: readDefaultApps(),
+    assistantName: ASSISTANT_NAME,
+    pinnedTools: readPinnedTools(),
+    showThinking: 'false',
+    verbose: false,
+  };
+}
+
+export async function runFriendTurn(task: string, fromHost: string, agent?: string): Promise<{ text: string; error?: string }> {
+  if (friendTurnBusy || agentProcessing || isForegroundTurnActive()) {
+    return { text: '', error: 'this Warden is busy on another turn right now' };
+  }
+  friendTurnBusy = true;
+  try {
+    const routing = agent && agent !== 'atlas'
+      ? `The friend asked specifically for your ${agent} specialist. Delegate this to ${agent} with your ${agent} tool and return that specialist's result as your answer.`
+      : `Do the work yourself with your tools if needed, then reply directly to the friend with a concise, complete answer.`;
+    const prompt =
+      `A Warden friend (${fromHost}) asked you something.\n\n` +
+      `<friend_message from="${fromHost}">\n${task}\n</friend_message>\n\n` +
+      routing;
+
+    const msg: NewMessage = {
+      id: crypto.randomUUID(),
+      chat_jid: OWNER_JID,
+      sender: fromHost,
+      sender_name: fromHost,
+      content: task,
+      timestamp: new Date().toISOString(),
+      channel: 'web',
+    };
+
+    const input: AgentInput = {
+      prompt,
+      sessionId: 'owner',
+      workspaceRoot: WORKSPACE_ROOT,
+      history: [msg],
+      timeoutMs: 120000,
+      ...seatModelSettings(),
+    };
+
+    const output = await runAgent({ ...input, callbacks: buildAgentCallbacks() });
+
+    let text = cleanAgentText(output.text);
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.result === 'string' && parsed.result.trim()) {
+          text = cleanAgentText(parsed.result);
+        } else if (parsed.status === 'error' && typeof parsed.error === 'string' && parsed.error.trim()) {
+          return { text: '', error: parsed.error.trim() };
+        } else {
+          text = '';
+        }
+      }
+    } catch { /* not JSON, use as-is */ }
+
+    if (!text) return { text: '', error: output.error || 'no answer produced' };
+    return { text };
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? err, fromHost }, 'runFriendTurn failed');
+    return { text: '', error: String(err?.message ?? err) };
+  } finally {
+    friendTurnBusy = false;
   }
 }
+
+// ─── BotNet autonomy sweep ─────────────────────────────────────────────────
+// On an idle interval (default 20 min), when the human is away and nothing else
+// is running, the assigned specialist (atlas or vulkan — bbs:autonomy:agent)
+// reads the BBS, contributes if useful, queues integration tasks, and surfaces a
+// one-line summary to the human chat. Gated on: an enabled kill switch, human
+// presence (bots off while the human looks at the window), and idle (no turn or
+// job in flight). Mirrors checkSentryDue() — rides the 2s poll loop, never
+// throws, never blocks message pickup.
+
+const BBS_AUTONOMY_INTERVAL_MS = 20 * 60 * 1000;
+let bbsAutonomyChecked = false;
+let bbsAutonomyBusy = false;
+let bbsSweepRunning = false;
+
+async function runBbsAutonomySweep(): Promise<void> {
+  if (bbsSweepRunning) return;
+  bbsSweepRunning = true;
+  try {
+    const agent = getRouterState('bbs:autonomy:agent') === 'vulkan' ? 'vulkan' : 'atlas';
+    const routing = agent === 'vulkan'
+      ? `This sweep is assigned to your vulkan specialist. Hand the reading and any code change to vulkan with your vulkan tool, and base your summary on its result.`
+      : `Do this work yourself with your tools.`;
+    const prompt =
+      `This is your autonomous BotNet sweep — you run on your own while the human is away. Work quietly, then stop.\n\n` +
+      `1. Read your own BBS node with bbs_read. Then, for each online friend in friend_list, dial in with bbs_read (host=<friend>) and skim its boards.\n` +
+      `2. If a thread genuinely deserves a reply, post it with bbs_post (the right host and thread_id). A quiet board is a fine result — no padding, no repeats.\n` +
+      `3. If a thread poses a question several friends could usefully answer, use friend_collab to gather their answers and save the combined result.\n` +
+      `4. If you find an idea or change worth integrating into your own Warden, queue it as a work task with the project tool: describe exactly what to integrate and why.\n` +
+      `5. Note anything the human would want to hear about (a package worth discussing, a notable build).\n\n` +
+      `Use only these tools for the sweep: bbs_read, bbs_post, friend_list, friend_collab, bbs_file_save, project. If nothing needed action, end your reply with exactly the word QUIET on its own line; otherwise end with one short line of internal notes. This is a silent background task — nothing you write is shown in chat.\n\n` +
+      routing;
+
+    const msg: NewMessage = {
+      id: crypto.randomUUID(),
+      chat_jid: OWNER_JID,
+      sender: 'botnet',
+      sender_name: 'BotNet',
+      content: 'autonomous BotNet sweep',
+      timestamp: new Date().toISOString(),
+      channel: 'web',
+    };
+
+    const input: AgentInput = {
+      prompt,
+      sessionId: 'owner',
+      workspaceRoot: WORKSPACE_ROOT,
+      history: [msg],
+      timeoutMs: 90000,
+      sideTurn: true,
+      ...seatModelSettings(),
+    };
+
+    const output = await runAgent({ ...input, callbacks: buildAgentCallbacks() });
+
+    let text = cleanAgentText(output.text);
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.result === 'string' && parsed.result.trim()) text = cleanAgentText(parsed.result);
+        else text = '';
+      }
+    } catch { /* not JSON, use as-is */ }
+
+    // The sweep is a hidden background task — nothing it reads or writes for the
+    // BBS is reported in chat. Log the summary for debugging and drop it.
+    if (text && text.trim()) {
+      const line = text.trim().split('\n').filter(Boolean).pop() || text.trim();
+      if (/^quiet$/i.test(line.trim()) || /^no botnet action needed/i.test(line.trim())) {
+        logger.info('BotNet sweep: nothing needed action');
+      } else {
+        logger.info({ summary: line.slice(0, 400) }, 'BotNet sweep finished');
+      }
+    }
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? err }, 'BotNet autonomy sweep failed');
+  } finally {
+    bbsSweepRunning = false;
+  }
+}
+
+function checkBbsAutonomyDue(): void {
+  if (bbsAutonomyBusy) return;
+  bbsAutonomyBusy = true;
+  const firstCheck = !bbsAutonomyChecked;
+  bbsAutonomyChecked = true;
+  try {
+    if (getRouterState('bbs:autonomy:enabled') === 'false') return; // kill switch
+    if (isHumanWatching()) return; // human at the window → bots off (don't advance)
+    const now = Date.now();
+    const lastRaw = getRouterState('bbs:autonomy:lastrun');
+    if (!lastRaw) { setRouterState('bbs:autonomy:lastrun', new Date(now).toISOString()); return; }
+    const last = new Date(lastRaw).getTime();
+    if (Number.isNaN(last)) { setRouterState('bbs:autonomy:lastrun', new Date(now).toISOString()); return; }
+    if (now - last < BBS_AUTONOMY_INTERVAL_MS) return;
+    if (firstCheck) {
+      // Overdue while Warden was down — reset and wait for the next interval
+      // rather than firing a catch-up sweep the instant we boot.
+      setRouterState('bbs:autonomy:lastrun', new Date(now).toISOString());
+      return;
+    }
+    if (wardenBusy() || agentProcessing || friendTurnBusy || bbsSweepRunning) return; // idle-gated; don't advance
+    setRouterState('bbs:autonomy:lastrun', new Date(now).toISOString());
+    logger.info('BotNet autonomy sweep firing');
+    void runBbsAutonomySweep().catch((err) => logger.warn({ err: err?.message ?? err }, 'BotNet sweep failed'));
+  } finally {
+    bbsAutonomyBusy = false;
+  }
+}
+
+// ─── BotNet colab (human-initiated swarm) ───────────────────────────────────
+// The dashboard's Colab screen posts a task here; the host orchestrates a real
+// fan-out instead of one seat turn: a planner turn splits the task, each piece
+// becomes a REAL work task under a "BotNet — …" project in the Warden ledger
+// (the dashboard Projects view shows the swarm as a first-class project), the
+// workers run in parallel — friends over the mesh, one local seat slice — and
+// each one reports back, closes its task, and the host moves on. The combined
+// report is filed to the file area and announced on the shoutbox.
+// Live state is served at GET /api/friends/colab/status for the Colab screen.
+
+export interface ColabWorker {
+  worker: string;      // 'local' (this node) or a friend hostname
+  title: string;
+  state: 'queued' | 'running' | 'done' | 'error';
+  detail?: string;     // first slice of the answer, or the error
+  elapsedMs?: number;
+  taskId?: string;
+}
+export interface ColabStatus {
+  busy: boolean;
+  phase: 'idle' | 'organizing' | 'delegating' | 'combining' | 'done' | 'error';
+  task: string;
+  projectId: string;
+  projectName: string;
+  tree: string;        // the run's shared git tree on disk (WORKSPACE_ROOT/colab/<slug>)
+  workers: ColabWorker[];
+  report: string;
+  file: string;
+  error: string;
+  startedAt: number;
+}
+
+let colabState: ColabStatus = {
+  busy: false, phase: 'idle', task: '', projectId: '', projectName: '', tree: '', workers: [],
+  report: '', file: '', error: '', startedAt: 0,
+};
+export function getColabStatus(): ColabStatus {
+  return { ...colabState, workers: colabState.workers.map((w) => ({ ...w })) };
+}
+
+// One seat turn for the swarm (planner or the single local worker). Holds no
+// locks of its own — runColab gates entry and holds both turn locks for the
+// whole run, so a peer request mid-swarm hears "busy" instead of colliding.
+// With rawJson the model's final text passes through untouched (the planner's
+// answer IS the JSON plan, not a {result} envelope to unpack).
+async function runSwarmTurn(prompt: string, timeoutMs: number, rawJson = false): Promise<{ text: string; error?: string }> {
+  const msg: NewMessage = {
+    id: crypto.randomUUID(),
+    chat_jid: OWNER_JID,
+    sender: 'botnet',
+    sender_name: 'BotNet',
+    content: prompt.slice(0, 500),
+    timestamp: new Date().toISOString(),
+    channel: 'web',
+  };
+  try {
+    const output = await runAgent({
+      prompt,
+      sessionId: 'owner',
+      workspaceRoot: WORKSPACE_ROOT,
+      history: [msg],
+      timeoutMs,
+      ...seatModelSettings(),
+      callbacks: buildAgentCallbacks(),
+    });
+    let text = cleanAgentText(output.text);
+    if (!rawJson) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          if (typeof parsed.result === 'string' && parsed.result.trim()) text = cleanAgentText(parsed.result);
+          else if (parsed.status === 'error' && typeof parsed.error === 'string' && parsed.error.trim()) {
+            return { text: '', error: parsed.error.trim() };
+          } else text = '';
+        }
+      } catch { /* not JSON, use as-is */ }
+    }
+    if (!text) return { text: '', error: output.error || 'no answer produced' };
+    return { text };
+  } catch (err: any) {
+    return { text: '', error: String(err?.message ?? err) };
+  }
+}
+
+interface SwarmSubtask { worker: string; title: string; detail: string }
+
+export async function runColab(task: string, fromHost = 'dashboard'): Promise<{ text: string; error?: string }> {
+  if (friendTurnBusy || bbsSweepRunning || agentProcessing || isForegroundTurnActive()) {
+    return { text: '', error: 'this Warden is busy on another turn right now' };
+  }
+  bbsSweepRunning = true;
+  friendTurnBusy = true;
+  colabState = {
+    busy: true, phase: 'organizing', task, projectId: '', projectName: '', tree: '', workers: [],
+    report: '', file: '', error: '', startedAt: Date.now(),
+  };
+  try {
+    const online = listFriends().filter((f) => f.status === 'online');
+
+    // The ledger first: the swarm is a Warden project with one work task per
+    // worker, so it shows natively on the dashboard Projects view.
+    const project = createProject({
+      name: `BotNet — ${task.replace(/\s+/g, ' ').slice(0, 60)}`,
+      group_jid: OWNER_JID,
+      description: task.slice(0, 4000),
+      status: 'On Track',
+    });
+    colabState.projectId = project.id;
+    colabState.projectName = project.name;
+
+    // The shared tree: every run materializes under WORKSPACE_ROOT/colab/<slug>/
+    // as its own git repo — the mesh works ONE versioned tree per run. Local
+    // workers save deliverables straight into it; remote answers are committed
+    // on the sender's behalf, one commit per worker. Diffable, branchable, left
+    // on disk as the run's workspace.
+    const slug = task.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'run';
+    const runDir = path.join(WORKSPACE_ROOT, 'colab', `${slug}-${Date.now().toString(36)}`);
+    fs.mkdirSync(path.join(runDir, 'workers'), { recursive: true });
+    colabState.tree = runDir;
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: runDir });
+    } catch (e: any) {
+      logger.warn({ err: e?.message ?? e }, 'colab tree: git init failed — this run is unversioned');
+    }
+    // Commits are chained — parallel workers finishing together would race the
+    // index lock otherwise.
+    let gitChain: Promise<unknown> = Promise.resolve();
+
+    // ORGANIZE — the seat plans the split, nothing more.
+    const crew = online.length
+      ? online.map((f) => `- ${f.id} — ${String(f.profile || f.name || 'no profile').slice(0, 120)}`).join('\n')
+      : '(none online — no friend nodes can take work right now)';
+    const plannerPrompt =
+      `A human (${fromHost}) posted this task to the BotNet colab channel. You are the ORGANIZER: plan the swarm, do NOT do the work.\n\n` +
+      `<colab_task>\n${task}\n</colab_task>\n\n` +
+      `Online friend nodes you can delegate to:\n${crew}\n\n` +
+      `Rules:\n` +
+      `- Split the task into 1-6 self-contained subtasks; each worker sees ONLY its own title and detail.\n` +
+      `- worker is a friend hostname exactly as listed, or "local" for this node. Delegate real work to online friends when the task benefits from it.\n` +
+      `- AT MOST ONE subtask may be "local".\n` +
+      `- All deliverables are collected into one shared git tree on this node — the swarm works a single versioned workspace.\n` +
+      `- Reply with ONLY a JSON object, no prose, no code fences:\n` +
+      `{"subtasks":[{"worker":"local|hostname","title":"short label","detail":"complete instructions for the worker"}]}`;
+    const planOut = await runSwarmTurn(plannerPrompt, 60000, true);
+
+    let subtasks: SwarmSubtask[] = [];
+    if (planOut.text) {
+      try {
+        const m = planOut.text.match(/\{[\s\S]*\}/);
+        const parsed = m ? JSON.parse(m[0]) : null;
+        if (parsed && Array.isArray(parsed.subtasks)) {
+          for (const s of parsed.subtasks) {
+            const st: SwarmSubtask = {
+              worker: String(s?.worker || 'local').trim(),
+              title: String(s?.title || '').slice(0, 120) || 'subtask',
+              detail: String(s?.detail || '').slice(0, 4000),
+            };
+            if (st.detail) subtasks.push(st);
+          }
+        }
+      } catch { /* unparseable plan — solo fallback below */ }
+    } else {
+      logger.warn({ err: planOut.error }, 'colab planner produced nothing — running solo');
+    }
+    // Sanitize: only real online friends run remote; unknown/down hosts and any
+    // extra "local" pieces fold into the single local slice (the seat is one seat).
+    const onlineHosts = new Set(online.map((f) => f.id));
+    const remote: SwarmSubtask[] = [];
+    const localParts: SwarmSubtask[] = [];
+    for (const s of subtasks.slice(0, 6)) {
+      if (s.worker !== 'local' && onlineHosts.has(s.worker)) remote.push(s);
+      else localParts.push(s);
+    }
+    const plan: SwarmSubtask[] = [...remote];
+    if (localParts.length === 1) plan.push({ ...localParts[0], worker: 'local' });
+    else if (localParts.length > 1) {
+      plan.push({
+        worker: 'local',
+        title: localParts.map((s) => s.title).join(' + ').slice(0, 120),
+        detail: 'Do ALL of these slices, each clearly separated:\n\n' +
+          localParts.map((s, i) => `${i + 1}. ${s.title}\n${s.detail}`).join('\n\n'),
+      });
+    }
+    if (!plan.length) plan.push({ worker: 'local', title: task.replace(/\s+/g, ' ').slice(0, 120), detail: task });
+
+    // DELEGATE — one work task per worker, then every worker runs at once.
+    for (const s of plan) {
+      const wt = createWorkTask({
+        title: s.title,
+        description: s.detail,
+        priority: 'high',
+        assigned_to: s.worker === 'local' ? 'atlas' : s.worker,
+        created_by: 'botnet',
+        project_id: project.id,
+      });
+      colabState.workers.push({ worker: s.worker, title: s.title, state: 'queued', taskId: wt.id });
+    }
+    const answers: string[] = new Array(plan.length).fill('');
+    colabState.phase = 'delegating';
+    await Promise.all(plan.map(async (s, i) => {
+      const wk = colabState.workers[i];
+      const started = Date.now();
+      wk.state = 'running';
+      updateWorkTask(wk.taskId!, { status: 'in_progress' });
+      try {
+        if (s.worker === 'local') {
+          const workerPrompt =
+            `You are the BotNet worker on this node. The mesh is swarming a task posted to the colab channel; this is your slice.\n\n` +
+            `<colab_task>\n${task}\n</colab_task>\n\n` +
+            `<your_subtask title="${s.title}">\n${s.detail}\n</your_subtask>\n\n` +
+            `The swarm shares one git tree for this run at ${runDir} — save substantial deliverables (code, drafts, structured data) as files in it, ` +
+            `names prefixed "local_". Then reply with the deliverable itself (or, for large work, a tight summary naming the files you saved). ` +
+            `That reply goes straight to the organizer and is filed. Do not call send_message.`;
+          const out = await runSwarmTurn(workerPrompt, 120000);
+          if (!out.text) throw new Error(out.error || 'no answer produced');
+          answers[i] = out.text;
+        } else {
+          const a = await askFriend(s.worker, `${s.title}\n\n${s.detail}\n\n(Your answer is filed whole into the swarm's shared tree on the organizing node.)`, 120000);
+          if (!a.ok || !a.answer) throw new Error(a.error || 'no answer');
+          answers[i] = a.answer;
+        }
+        // Remote slice → a file in the tree named for the node; local slices
+        // may already be files the worker wrote itself. Either way: one commit
+        // per worker, chained so parallel finishes never race the index lock.
+        if (s.worker !== 'local') {
+          fs.writeFileSync(path.join(runDir, 'workers', `${s.worker.replace(/[^a-zA-Z0-9._-]+/g, '_')}.md`), answers[i]);
+        }
+        gitChain = gitChain.then(() => {
+          execFileSync('git', ['add', '-A'], { cwd: runDir });
+          execFileSync('git', ['-c', 'user.name=BotNet', '-c', `user.email=${s.worker}@botnet`, 'commit', '-q', '--allow-empty', '-m', `${s.worker}: ${s.title}`], { cwd: runDir });
+        }).catch(() => { /* unversioned run — git init failed above */ });
+        wk.state = 'done';
+        wk.detail = answers[i].replace(/\s+/g, ' ').slice(0, 240);
+        updateWorkTask(wk.taskId!, { status: 'done', notes: answers[i].slice(0, 4000) });
+      } catch (err: any) {
+        wk.state = 'error';
+        wk.detail = String(err?.message ?? err).slice(0, 240);
+        // back to 'todo' on purpose: an unfinished subtask must look unfinished
+        updateWorkTask(wk.taskId!, { status: 'todo', notes: `worker failed: ${wk.detail}` });
+      }
+      wk.elapsedMs = Date.now() - started;
+      const doneSoFar = colabState.workers.filter((w) => w.state === 'done').length;
+      updateProject(project.id, { progress: Math.round(doneSoFar / colabState.workers.length * 100) });
+    }));
+
+    // COMBINE — deterministic assembly; no extra model call to fail.
+    await gitChain;
+    colabState.phase = 'combining';
+    const title = `Colab — ${task.replace(/\s+/g, ' ').slice(0, 50)}`;
+    const lines: string[] = [`# ${title}`, '', `> Goal: ${task}`, ''];
+    plan.forEach((s, i) => {
+      const wk = colabState.workers[i];
+      lines.push(`## ${s.worker === 'local' ? 'this node' : s.worker} — ${s.title}`, '');
+      lines.push(answers[i] ? answers[i].trim() : `_no answer: ${wk.detail || 'failed'}_`, '');
+    });
+    const doneCount = colabState.workers.filter((w) => w.state === 'done').length;
+    let commitLog = '';
+    try {
+      commitLog = execFileSync('git', ['log', '--oneline', '--no-decorate'], { cwd: runDir, encoding: 'utf8' }).toString().trim();
+    } catch { /* unversioned run */ }
+    const treeFiles: string[] = [];
+    try {
+      for (const f of fs.readdirSync(runDir)) if (f !== '.git' && f !== 'workers') treeFiles.push(f);
+      for (const f of fs.readdirSync(path.join(runDir, 'workers'))) treeFiles.push(`workers/${f}`);
+    } catch { /* tree unreadable — the path note below still stands */ }
+    lines.push(
+      '---',
+      `${doneCount}/${colabState.workers.length} subtasks completed`,
+      '',
+      `Tree: \`${runDir}\`${commitLog ? ` — ${commitLog.split('\n').length} commit(s), one per worker` : ' (unversioned — git unavailable)'}`,
+      commitLog || '',
+      treeFiles.length ? `Files:\n${treeFiles.map((f) => `- ${f}`).join('\n')}` : 'Files: (none saved)',
+    );
+    const report = lines.join('\n').trim();
+
+    const saved = bbsFileSave(title, report);
+    if (saved.ok) colabState.file = String(saved.name || title);
+    if (doneCount === colabState.workers.length) completeProject(project.id);
+    else updateProject(project.id, { status: 'At Risk' });
+
+    // Announce on the shoutbox — the mesh's own record of the run.
+    await bbsPost({
+      board: 'shoutbox',
+      body: `▲ colab swarm done — ${doneCount}/${colabState.workers.length} subtasks · report filed: ${colabState.file || title} · project: ${project.name}`,
+      author_kind: 'bot',
+    }).catch(() => undefined);
+
+    colabState.report = report;
+    colabState.phase = 'done';
+    logger.info({ workers: colabState.workers.length, done: doneCount, project: project.id }, 'BotNet colab run complete');
+    return { text: report };
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? err }, 'runColab failed');
+    colabState.phase = 'error';
+    colabState.error = String(err?.message ?? err);
+    if (colabState.projectId) updateProject(colabState.projectId, { status: 'Blocked' });
+    return { text: '', error: colabState.error };
+  } finally {
+    bbsSweepRunning = false;
+    friendTurnBusy = false;
+    colabState.busy = false;
+  }
+}
+
+// Mercury scheduling — runs on the 2s poll loop (see startMessageLoop), not
+// the per-turn tail. ONE trigger, locked (2026-09-19): fire after 30 new user
+// turns since the last compaction. No time-based interval/downtime triggers —
+// those compacted mid-conversation and folded fresh turns into the summary
+// while the model was still reading them live in <chat_history>. Idle-gated
+// (agent:processing !== 'true') so a compaction never contends with an
+// in-flight seat turn. cleanerBusy is the shared stagger lock (see
+// digestMonitorBusy): Mercury compaction, the Iris digests, and memory
+// writeback all acquire it so no two cleaners run at once.
+// mercury:interval_minutes / mercury:downtime_minutes are no longer read; the
+// dashboard rows are inert.
+let cleanerBusy = false;
+let mercuryRunning = false;
+
+// Compaction fires every this many user turns, locked.
+const MERCURY_TURNS_PER_COMPACTION = 30;
+
+function maybeScheduleMercury(): void {
+  if (mercuryMode() === 'off') return;
+  if (cleanerBusy || mercuryRunning) return;
+  const now = Date.now();
+  // Lazy first-boot seed (mirrors digest:lastrun seeding): advance to now and
+  // wait for the turn count rather than compacting immediately at boot.
+  const lastRaw = getRouterState('mercury:lastrun') || '';
+  const last = Date.parse(lastRaw) || 0;
+  if (!last) {
+    setRouterState('mercury:lastrun', new Date(now).toISOString());
+    return;
+  }
+  // Turn-count trigger: user turns (non-bot messages) newer than the last run.
+  // A deep window so a burst of short turns cannot hide below the horizon.
+  const turnsSince = (getChatHistory(OWNER_JID, 200) as unknown as NewMessage[])
+    .filter((m) => !m.is_bot_message && (m.timestamp || '') > lastRaw).length;
+  if (turnsSince < MERCURY_TURNS_PER_COMPACTION) return;
+  if (getRouterState('agent:processing') === 'true') return; // idle-gate
+
+  // Advance lastrun BEFORE firing so a slow run can't double-fire on the next tick.
+  setRouterState('mercury:lastrun', new Date(now).toISOString());
+  cleanerBusy = true;
+  mercuryRunning = true;
+  void updateMercurySummary()
+    .catch((err) => logger.warn({ err: err?.message ?? err }, 'Mercury scheduled summary failed'))
+    .finally(() => {
+      cleanerBusy = false;
+      mercuryRunning = false;
+    });
+}
+
 
 /**
  * Mercury — automatic rolling conversation compaction.
  *
  * Reads the last ~40 messages, preserves the most recent turns verbatim, and
- * asks the orchestrator model to compress the older turns into a concise
+ * asks the dashboard Mercury model to compress the older turns into a concise
  * summary of facts, decisions, open questions, and relevant context. Writes the
  * result to MERCURY_MEMORY.md so every subsequent prompt starts with compact
  * context instead of an ever-growing transcript.
@@ -1647,7 +2571,7 @@ function maybeUpdateMercurySummary(): void {
  */
 async function updateMercurySummary(): Promise<void> {
   try {
-    const clearAt = getRouterState('orchestrator:context_clear_at') || '';
+    const clearAt = getRouterState('atlas:context_clear_at') || '';
     const allRaw = getChatHistory(OWNER_JID, 45) as unknown as NewMessage[];
     // Gate by the clear boundary so a context clear also stops Mercury from
     // compacting pre-clear turns into the rolling summary — otherwise the next
@@ -1665,40 +2589,108 @@ async function updateMercurySummary(): Promise<void> {
       return `${role}: ${m.content}`;
     }).join('\n');
 
-    const summaryPrompt =
-      `You are Mercury — a conversation compaction layer for Warden. Summarize the following older conversation turns into a concise memory note. ` +
-      `Preserve facts, decisions, values, file paths, URLs, and any open tasks or questions. ` +
-      `Drop pleasantries, filler, and exact wording unless it's important. ` +
-      `Do NOT include the most recent ${MERCURY_RECENT_MESSAGES} turns; they are kept verbatim. ` +
-      `Write in short bullet/paragraph form so the main agent can scan it quickly.\n\n${olderLines}\n\nMercury summary:`;
-
-    // Mercury shares the Toolcall model (local:subagent_model).
-    const model = (getRouterState('local:subagent_model') || '').replace(/^local:/, '') || undefined;
-    const mercuryInput: AgentInput = {
-      prompt: summaryPrompt,
-      sessionId: 'mercury',
-      workspaceRoot: WORKSPACE_ROOT,
-      history: [],
-      timeoutMs: 120_000,
-      orchestratorModel: model,
-      showThinking: 'false',
-      verbose: false,
-    };
-
-    const result = await runAgent({ ...mercuryInput, callbacks: {} });
-    let summary = cleanAgentText(result.text || '');
+    // STRUCTURED CONTRACT — this is the shape the toolcall fine-tune is
+    // TRAINED on (training/gen_mercury_sft.mjs extracts MERCURY_SYSTEM_PROMPT
+    // from this file, so train can never drift from serve). The previous
+    // merged state goes in as JSON (STATE), the newly-dropped turns as
+    // ROLE: text lines (TURNS), and the merged state comes back as JSON held
+    // to MERCURY_FORMAT by constrained decoding. Folding is
+    // merge(STATE, TURNS) → new STATE, so nothing older than the verbatim
+    // window silently falls out — the thread-loss this layer exists to
+    // prevent. The old prose-summarizer shape was off-distribution for a
+    // tool-call fine-tune: it kept answering in JSON anyway, which is why a
+    // defensive JSON.parse unwrap used to sit below.
+    let state: MercuryState = EMPTY_MERCURY_STATE;
     try {
-      const parsed = JSON.parse(summary);
-      if (parsed && typeof parsed === 'object' && typeof parsed.result === 'string') summary = cleanAgentText(parsed.result);
-    } catch { /* not JSON */ }
-    if (!summary.trim()) return;
+      const stored = getRouterState('mercury:state');
+      if (stored) {
+        const parsed = JSON.parse(stored) as { ts?: string; state?: Partial<MercuryState> };
+        // Same clearAt invalidation as the summary file: a context clear
+        // drops the memory along with the context it belonged to.
+        const stale = !!(parsed?.ts && clearAt && parsed.ts <= clearAt);
+        if (!stale && parsed?.state) {
+          const cand = parsed.state as Record<string, unknown>;
+          state = {
+            facts: Array.isArray(cand.facts) ? cand.facts.filter((x): x is string => typeof x === 'string') : [],
+            decisions: Array.isArray(cand.decisions) ? cand.decisions.filter((x): x is string => typeof x === 'string') : [],
+            open: Array.isArray(cand.open) ? cand.open.filter((x): x is string => typeof x === 'string') : [],
+            refs: Array.isArray(cand.refs) ? cand.refs.filter((x): x is string => typeof x === 'string') : [],
+          };
+        }
+      }
+    } catch { /* corrupt stored state — start empty */ }
+
+    // Mercury's model comes ONLY from the dashboard Mercury row (mercury:model)
+    // — no env override, no fallback to the shared Toolcall row. Settings is
+    // the single source of model selection; a blank Mercury row means
+    // compaction no-ops rather than silently distilling on a model the user
+    // never chose.
+    const model = (getRouterState('mercury:model') || '')
+      .replace(/^local:/, '').trim();
+    if (!model) return;
+    // num_ctx and keep_alive must travel with the call — a bare request without
+    // them loads a second copy of the model at Ollama's native 2048 ctx / 300s
+    // default, which can evict an instance the user keeps resident.
+    const ctxRaw = (getRouterState('local:mercury_ctx') || getRouterState('local:subagent_ctx') || '').trim();
+    const ctxNum = Number(ctxRaw);
+    const numCtx = Number.isFinite(ctxNum) && ctxNum > 0 ? ctxNum : undefined;
+    const keepRaw = (getRouterState('local:toolcall_keep_alive') || '').trim();
+    const keepAlive = keepRaw === '-1' ? -1 : (Number.isFinite(Number(keepRaw)) && keepRaw ? Number(keepRaw) : 300);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+    let merged: MercuryState | null = null;
+    try {
+      const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          stream: false,
+          // Constrained decoding: the single biggest lever for holding a 3B
+          // to valid structured output. Every model seat is Ollama in this
+          // install (local and cloud), so format applies on both paths.
+          format: MERCURY_FORMAT,
+          messages: [
+            { role: 'system', content: MERCURY_SYSTEM_PROMPT },
+            { role: 'user', content: `STATE:\n${JSON.stringify(state)}\n\nTURNS:\n${olderLines}` },
+          ],
+          options: { temperature: 0, ...(numCtx ? { num_ctx: numCtx } : {}) },
+          keep_alive: keepAlive,
+        }),
+      });
+      if (!resp.ok) {
+        logger.warn({ status: resp.status, model }, 'Mercury summary call failed');
+        return;
+      }
+      const data = (await resp.json()) as { message?: { content?: string } };
+      merged = parseMercuryState(cleanAgentText(data.message?.content || ''));
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? err, model }, 'Mercury merge call failed');
+      return;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!merged) {
+      logger.warn({ model }, 'Mercury merge returned no valid state — keeping previous summary');
+      return;
+    }
 
     const root = WORKSPACE_ROOT.replace(/^~(?=\/|$)/, process.env.HOME ?? '');
     const mercuryPath = path.join(root, MERCURY_MEMORY_FILE);
     const stamp = new Date().toISOString();
-    const entry = `# Mercury summary updated ${stamp}\n\n${summary}\n\n---\n\n`;
+    // The file holds the human-readable rendering (its header
+    // stamp is the clearAt invalidation marker); router state holds the raw
+    // JSON, which is what the next compaction's STATE input needs.
+    const rendered = renderMercuryState(merged);
+    const entry = `# Mercury summary updated ${stamp}\n\n${rendered}\n\n---\n\n`;
     fs.writeFileSync(mercuryPath, entry, 'utf8');
-    logger.info({ chars: summary.length }, 'Mercury summary updated');
+    setRouterState('mercury:state', JSON.stringify({ ts: stamp, state: merged }));
+    logger.info(
+      { facts: merged.facts.length, decisions: merged.decisions.length, open: merged.open.length, refs: merged.refs.length },
+      'Mercury state updated',
+    );
   } catch (err: any) {
     logger.warn({ err: err?.message ?? err }, 'Mercury summary update failed');
   }
@@ -1712,134 +2704,58 @@ async function processOwnerMessages(): Promise<void> {
   // Re-sync cursor with router state in case an external stop/advance changed it.
   lastAgentTimestamp = getRouterState('last_agent_timestamp') || lastAgentTimestamp;
   const since = lastAgentTimestamp;
-  const pending = getMessagesSince(OWNER_JID, since, ASSISTANT_NAME);
+  let pending = getMessagesSince(OWNER_JID, since, ASSISTANT_NAME);
+
+  // Requeue after a user stop: if the previous turn was stopped (soft interrupt
+  // or kill), its messages were dropped by the cursor advance. The marker holds
+  // the timestamp just BEFORE the stopped turn's first message — extend `since`
+  // back to it so that turn's text is answered alongside the new message. Only
+  // when something newer is actually pending; a bare stop must not retrigger.
+  if (pending.length > 0) {
+    const stoppedSince = getRouterState('atlas:stopped_turn_since');
+    if (stoppedSince && stoppedSince < since) {
+      setRouterState('atlas:stopped_turn_since', '');
+      pending = getMessagesSince(OWNER_JID, stoppedSince, ASSISTANT_NAME);
+      logger.info({ stoppedSince }, 'Re-including messages from the stopped turn');
+    }
+  }
   if (pending.length === 0) return;
+
+  // A clear requested last turn whose reply never got stored has no reply to
+  // move past — the boundary already sits at request time. Start every turn
+  // clean so a stale flag can't advance the boundary over the wrong message.
+  pendingContextClear = false;
 
   // ── Idle context clear ──────────────────────────────────────────────────
   // If the user's last message was older than the configured threshold (Model
-  // Configuration → Idle clear; default 30 min), drop the orchestrator's
+  // Configuration → Idle clear; default OFF), drop the seat's
   // accumulated context before this turn so testing chatter can't bloat the
-  // working window. Setting orchestrator:context_clear_at to the latest pending
+  // working window. Setting atlas:context_clear_at to the latest pending
   // timestamp makes the agent-runner reset its in-memory conversation (it
   // resets when the marker changes) and gates <chat_history> to messages after
-  // it. 0 = disabled. We also remember this message's time so the next idle
-  // check measures from here.
+  // it. 0 = disabled.
+  //
+  // DEFAULT IS OFF (0). This is a single-user desktop assistant, not a testbed:
+  // the normal pattern is to walk away for an hour and come back with "yes" to a
+  // pending question. A 30-min idle auto-clear ate exactly that — it gated
+  // <chat_history> to after the "yes", so the question the "yes" was answering
+  // vanished and the seat replied "I don't see a pending question in
+  // front of me" (2026-08-29). Context bloat is already handled by Mercury
+  // compaction (mercury:interval_minutes), so this idle-clear is redundant for
+  // bloat and harmful for continuity. The dashboard dropdown still lets the
+  // user opt back in (15/30/60/120/240 min) if they ever want it.
   const latestUserTs = pending[pending.length - 1]!.timestamp;
-  const idleRaw = getRouterState('orchestrator:context_idle_clear_minutes') || '';
-  const idleMin = idleRaw === '' ? 30 : (parseInt(idleRaw, 10) || 0);
-  const prevUserTs = getRouterState('orchestrator:last_user_message_at') || '';
+  const idleRaw = getRouterState('atlas:context_idle_clear_minutes') || '';
+  const idleMin = idleRaw === '' ? 0 : (parseInt(idleRaw, 10) || 0);
+  const prevUserTs = getRouterState('atlas:last_user_message_at') || '';
   if (idleMin > 0 && prevUserTs) {
     const gapMin = (Date.parse(latestUserTs) - Date.parse(prevUserTs)) / 60000;
     if (gapMin > idleMin) {
-      setRouterState('orchestrator:context_clear_at', latestUserTs);
-      logger.info({ idleMin: Math.round(gapMin) }, 'Orchestrator context auto-cleared after user idle');
+      setRouterState('atlas:context_clear_at', latestUserTs);
+      logger.info({ idleMin: Math.round(gapMin) }, 'Atlas context auto-cleared after user idle');
     }
   }
-  setRouterState('orchestrator:last_user_message_at', latestUserTs);
-
-  // ── "Close the alert" — the person at the keyboard re-arms the detector ──
-  // Oculus never closes an ABNORMAL alert itself; the user closes it after
-  // they've checked / acted on it. This intercepts that command and calls the
-  // close_security_alert host callback directly (the orchestrator doesn't own
-  // that tool), then acknowledges — no orchestrator turn needed.
-  const closeText = pending.some((m) => {
-    const s = (m.content || '').toLowerCase();
-    return (/\b(close|clear|dismiss)\b/.test(s) && /\balert|security|intruder|threat\b/.test(s))
-      || /\b(stand\s+down|all\s+clear)\b/.test(s)
-      || /close.*alert/.test(s);
-  });
-  if (closeText) {
-    lastAgentTimestamp = pending[pending.length - 1]!.timestamp;
-    saveState();
-    let reply = 'Alert closed.';
-    try {
-      const r = await buildAgentCallbacks().close_security_alert({});
-      if (r && r.ok === false) reply = `Tried to close the security alert: ${r.error || 'detector app not reachable'}.`;
-    } catch (err: any) {
-      reply = `Could not close the security alert: ${err?.message ?? err}.`;
-    }
-    await deliverReply(reply);
-    pushNotification('owner', { type: 'chat_complete', message: reply, from: OWNER_JID });
-    logger.info({ chatJid: OWNER_JID }, 'Oculus alert closed by user');
-    return;
-  }
-
-  // ── "Open / close your eyes" — the user toggles the detector's eyes_open
-  // flag (awareness on/off). We call the arm_security/disarm_security host
-  // callback directly (the orchestrator doesn't own that tool — the callback
-  // POSTs to the detector's /open or /close) and acknowledge — no orchestrator
-  // turn needed.
-  const closeEyesText = pending.some((m) => {
-    const s = (m.content || '').toLowerCase();
-    return (/\bclose\b/.test(s) && /\beyes?\b/.test(s)) || /\bshut\b.*\beyes?\b/.test(s);
-  });
-  const openEyesText = pending.some((m) => {
-    const s = (m.content || '').toLowerCase();
-    return /\bopen\b/.test(s) && /\beyes?\b/.test(s);
-  });
-  if (openEyesText || closeEyesText) {
-    lastAgentTimestamp = pending[pending.length - 1]!.timestamp;
-    saveState();
-    let reply = '';
-    try {
-      const cb = buildAgentCallbacks();
-      if (closeEyesText) {
-        const r = await cb.disarm_security({});
-        reply = r && r.ok === false
-          ? `Tried to close your eyes: ${r.error || 'detector app not reachable'}.`
-          : 'Eyes closed — awareness paused.';
-      } else {
-        const r = await cb.arm_security({});
-        reply = r && r.ok === false
-          ? `Tried to open your eyes: ${r.error || 'detector app not reachable'}.`
-          : 'Eyes open — awareness active.';
-      }
-    } catch (err: any) {
-      reply = `Could not toggle the eyes: ${err?.message ?? err}.`;
-    }
-    await deliverReply(reply);
-    pushNotification('owner', { type: 'chat_complete', message: reply, from: OWNER_JID });
-    logger.info({ chatJid: OWNER_JID, open: openEyesText, close: closeEyesText }, 'Eyes toggled by user');
-    return;
-  }
-
-  // ── Awareness events → Oculus direct pipe ───────────────────────────────
-  // An AWARENESS message (posted by the standalone detector's presence
-  // tracker — arrival/departure/note, event-driven, never per-frame) is piped
-  // straight to Oculus, the background situational-awareness agent, in code.
-  // Same engrained pattern: the event row is pre-written to awareness_log
-  // (so it's recorded even if Oculus crashes), Oculus runs on the model
-  // configured in dashboard (oculus:model), and we return so the orchestrator
-  // never burns a turn on it.
-  // Independent of the arm/disarm state — awareness ≠ security arming.
-  const isAwareness = pending.some((m) => (m.content || '').startsWith('AWARENESS'));
-  if (isAwareness) {
-    lastAgentTimestamp = pending[pending.length - 1]!.timestamp;
-    saveState();
-    logger.info({ chatJid: OWNER_JID, messageCount: pending.length }, 'Awareness → routing to Oculus (background)');
-
-    const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
-    const events = pending.filter((m) => (m.content || '').startsWith('AWARENESS'));
-    const latest = events.length > 0 ? events[events.length - 1] : pending[pending.length - 1]!;
-    const awarenessText = latest.content || '';
-    // Pull the user's "watch out for" list so Oculus can match silently.
-    let watchOut: string[] = [];
-    try { watchOut = JSON.parse(getRouterState('oculus:watch_out_for') || '[]'); } catch { watchOut = []; }
-    const watchOutBlock = watchOut.length
-      ? `\n\nWatch out for (user-defined situations; if this event CLEARLY matches one, record it in awareness_log with assessment "flagged" and the matched situation, then call oculus_capture to save the photo to uploads — stay SILENT, do not message the user):\n${watchOut.map((w) => `- ${w}`).join('\n')}`
-      : '';
-    const task = `Current local time is ${localNow} (timezone ${tz}).\n\n${awarenessText}\n\nYou are Oculus, Warden's SILENT situational-awareness agent. Use tools only. Read eyes_ears/oculus.md and apply its rules exactly. Your ONLY job is to LOG this event silently: call awareness_log (action: record) with the event details, then stop. Do NOT message the user, do NOT greet, do NOT alert — you have no send_message.${watchOutBlock}\n\nThe AWARENESS payload includes:\n- event type (arrival|departure|camera_covered|camera_moved|motion_burst|note)\n- person_count\n- is_known and label (from InsightFace face embeddings when a face is visible)\n- room occupancy, motion area, camera state\n\nDo not write a plain-text response; use tools only.`;
-
-    try {
-      // Host-side auto-log of the raw event, independent of Oculus.
-      recordAwarenessEvent(awarenessText);
-      spawnOculusBackground(task, awarenessText);
-    } catch (err: any) {
-      logger.warn({ err }, 'Awareness: failed to spawn Oculus');
-    }
-    return; // do NOT run the orchestrator for awareness events
-  }
+  setRouterState('atlas:last_user_message_at', latestUserTs);
 
   const prompt = buildPrompt(pending);
 
@@ -1878,23 +2794,46 @@ async function processOwnerMessages(): Promise<void> {
     sessionId: 'owner',
     workspaceRoot: WORKSPACE_ROOT,
     history: pending,
-    timeoutMs: 10 * 60 * 1000, // orchestrator turns must be short: Atlas is always async; a stuck model/tool call recovers in 10 min
+    // Host-side backstop for an owner-chat turn. Aligned just past the runner's
+    // own 3h WALL_CLOCK_MS (container/agent-runner/src/index.ts) so long legitimate
+    // work — e.g. a complex on-device install that runs inline — completes instead
+    // of being SIGTERM'd at 10 min. The runner's wall-clock is the primary cap and
+    // exits cleanly; this host timer only reaps a persistent child that hangs past
+    // 3h05m. Stuck *model* calls are reaped far earlier by provider-level timeouts
+    // (120s cloud fetch + retries, 20min Ollama), so the old 10-min turn cap only
+    // killed real work. Cleared on normal completion (agent-spawn turnTimeout clear).
+    timeoutMs: 3 * 60 * 60 * 1000 + 5 * 60 * 1000,
     memoryContext,
-    orchestratorModel: (getRouterState('orchestrator:model') || '').replace(/^local:/, '') || undefined,
+    // Output cap straight from settings (blank = the runner's default).
+    maxOutputTokens: (getRouterState('local:max_output_tokens') || '').trim(),
+    // Atlas IS the chat seat; this is the model that replies and runs
+    // background copies of itself (atlas:model). No fallback: the db
+    // migration moved the retired orchestrator row's value here, and the
+    // runner errors loudly if it is ever empty.
     model: (getRouterState('atlas:model') || '').replace(/^local:/, '') || undefined,
     vulkanModel: (getRouterState('vulkan:model') || '').replace(/^local:/, '') || undefined,
-    // byte/dexter/iris share the Toolcall model (dashboard "Toolcall model" row,
-    // persisted as local:subagent_model). The host feeds the same value into each
-    // per-agent IPC field so the runner's dispatch is unchanged.
-    byteModel: (getRouterState('local:subagent_model') || '').replace(/^local:/, '') || undefined,
-    dexterModel: (getRouterState('local:subagent_model') || '').replace(/^local:/, '') || undefined,
+    // Supervisor (completion-verdict) model — blank inherits the Atlas model in
+    // the runner. No ctx row: cloud/small models use their native window.
+    supervisorModel: (getRouterState('supervisor:model') || '').replace(/^local:/, '') || undefined,
+    // Supervisor completion verdict on/off (dashboard "Supervisor" row).
+    supervisorEnabled: getRouterState('supervisor:enabled') !== 'false',
+    // Iris is the single toolcall agent (byte merged in 2026-09-05) and runs
+    // on the Toolcall model (dashboard "Toolcall model" row, persisted as
+    // local:subagent_model).
     irisModel: (getRouterState('local:subagent_model') || '').replace(/^local:/, '') || undefined,
     artemisModel: (getRouterState('artemis:model') || '').replace(/^local:/, '') || undefined,
-    drivingForce: getRouterState('orchestrator:driving_force') || '',
-    contextClearAt: getRouterState('orchestrator:context_clear_at') || '',
+    // Sentry (software-security scanner) has its own model row; blank inherits
+    // the Atlas model (not the shared toolcall wire — Sentry is meant
+    // to run on the big resident model, and only diverges if explicitly set).
+    sentryModel: (getRouterState('sentry:model') || getRouterState('atlas:model') || '').replace(/^local:/, '') || undefined,
+    drivingForce: getRouterState('atlas:driving_force') || '',
+    contextClearAt: getRouterState('atlas:context_clear_at') || '',
     councilSkepticModel: (getRouterState('council:skeptic_model') || '').replace(/^local:/, '') || undefined,
     councilPragmatistModel: (getRouterState('council:pragmatist_model') || '').replace(/^local:/, '') || undefined,
     councilSynthesistModel: (getRouterState('council:synthesist_model') || '').replace(/^local:/, '') || undefined,
+    defaultApps: readDefaultApps(),
+    assistantName: ASSISTANT_NAME,
+    pinnedTools: readPinnedTools(),
     showThinking: getRouterState(`thinking:${OWNER_JID}`)
       || getRouterState('local:thinking')
       || 'true',
@@ -1917,7 +2856,11 @@ async function processOwnerMessages(): Promise<void> {
   agentProcessing = false;
   setRouterState('agent:processing', 'false');
   if (output.userStopped) {
-    logger.info('Agent run stopped by user; no reply delivered and cursor stays advanced');
+    // Mark the window BEFORE this turn's first message so the next real message
+    // re-includes the stopped turn's text (see the extension above). `since`
+    // still holds the pre-turn cursor value at this point.
+    setRouterState('atlas:stopped_turn_since', since);
+    logger.info('Agent run stopped by user; no reply delivered — turn marked for requeue on next message');
     return;
   }
 
@@ -1925,6 +2868,8 @@ async function processOwnerMessages(): Promise<void> {
   // Agent-runner emits JSON: {"status":"success","result":"..."} — extract the text.
   // If result is null/empty/non-string, the agent produced no user-facing reply — drop it
   // rather than forwarding the raw envelope (e.g. '{"status":"success","result":null}') to the chat.
+  let spontaneousDigest = false;
+  let turnError = '';
   try {
     const parsed = JSON.parse(rawText);
     if (parsed && typeof parsed === 'object') {
@@ -1933,10 +2878,32 @@ async function processOwnerMessages(): Promise<void> {
       } else {
         rawText = '';
       }
+      // An error envelope ({"status":"error","result":null,"error":"…"}) is the
+      // turn's only voice — the runner already ended it. Deliver the failure as
+      // a plain fact; swallowing the `error` field left the user with total
+      // silence on every dead turn (model not found, aborted streams —
+      // 2026-09-29 / 2026-10-08: "hello" turns produced nothing at all).
+      if (parsed.status === 'error' && typeof parsed.error === 'string' && parsed.error.trim()) {
+        turnError = parsed.error.trim();
+      }
+      // Digest turns (inbox draining — no user message prompted them) deliver
+      // through the runner's send_message path. If a user message arrived
+      // concurrently and left a resolve pending, this OUTPUT would ALSO be
+      // delivered below — the double report observed 2026-08-24. Suppress here.
+      if (parsed.spontaneous === true) spontaneousDigest = true;
     }
   } catch { /* not JSON, use as-is */ }
   const text = rawText;
+  if (spontaneousDigest) {
+    logger.info('spontaneous (digest) OUTPUT suppressed — send_message path owns digest delivery');
+    return;
+  }
   if (!text) {
+    if (turnError) {
+      logger.warn({ error: turnError }, 'Agent turn errored — delivering the failure to the chat');
+      await deliverReply(`No reply was generated — the turn failed with: ${turnError}`.slice(0, 300));
+      return;
+    }
     if (output.error) {
       logger.warn(
         { error: output.error, exitCode: output.exitCode },
@@ -1948,16 +2915,22 @@ async function processOwnerMessages(): Promise<void> {
 
   await deliverReply(text);
 
-  // Mercury: asynchronously compact the conversation after each turn so the
-  // context window keeps flowing without manual resets.
-  void maybeUpdateMercurySummary();
+  // Mercury compaction now runs on the 2s poll loop (maybeScheduleMercury in
+  // startMessageLoop) on a time/downtime schedule — not after every turn.
 
   // Memory writeback (Mercury's durable-memory half): distill durable facts
   // + a journal entry from this turn's conversation and append them to
-  // MEMORY.md / JOURNAL.md at WORKSPACE_ROOT — which the orchestrator loads
+  // MEMORY.md / JOURNAL.md at WORKSPACE_ROOT — which the seat loads
   // next turn. Fire-and-forget; self-throttled (15-min cooldown, ≥4 new
-  // messages) and non-fatal so it can never break the message loop.
-  void runMemoryWriteback(OWNER_JID);
+  // messages) and non-fatal so it can never break the message loop. Skips this
+  // turn if another cleaner (Mercury compaction / an Iris digest) is running,
+  // and holds the cleaner lock while it runs so no cleaner starts mid-writeback.
+  if (!cleanerBusy) {
+    cleanerBusy = true;
+    void runMemoryWriteback(OWNER_JID)
+      .catch(() => { /* already logs internally */ })
+      .finally(() => { cleanerBusy = false; });
+  }
 
   // Push a notification so the dashboard SSE can react even if it polls slowly.
   pushNotification('owner', {
@@ -1975,24 +2948,24 @@ const STOP_COMMAND_RE = /^\s*(stop|cancel|abort|halt|never\s?mind|nvm|shut up)[\
 // ── Iris digest task seeding ──────────────────────────────────────────────
 // Three recurring tasks (hourly/daily/weekly) that ask Iris to compile a
 // digest and POST it to /api/summaries, feeding the dashboard digest panel.
-// The scheduler injects each prompt into the owner chat; the orchestrator
+// The scheduler injects each prompt into the owner chat; the seat
 // routes it to Iris. Cron times are deliberately off the :00 mark so the
 // fleet-wide API doesn't all hit at once. Idempotent via stable ids.
 const IRIS_DIGEST_TASKS = [
   {
     id: 'iris-digest-hourly',
     cron: '7 * * * *',
-    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nWINDOW: This is the HOURLY digest. Only consider activity in the LAST HOUR (emails received in the last hour; calendar events in the next 2 hours; tasks that were created, completed, or updated in the last hour). Do NOT mention the user bio, sleep schedule, daily routine, or long-running projects unless something about them changed in the last hour.\n\nGROUNDING: Use only facts in INPUT or in the read_emails results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call read_emails with the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 50, preview_only true). Do not invent your own timestamps.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or read_emails, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nACTIONABLE EXTRACTION: From the emails you read with read_emails, also extract concrete actionable items the user must do or attend. This is separate from the "Recent Emails" display block — these drive task/event creation.\n- A task is a concrete to-do the user must do, expressed as an action the user performs: prepare, make sure, get ready, confirm, review, send, schedule, fix, follow up, deliver, pay, book, submit. Put "due" in ISO only when the message states a deadline; leave it empty otherwise.\n- An event is a scheduled meeting, appointment, or dated occasion the user will attend, where the date and start time are stated inside the message. Title it with the scheduled thing itself (a demo, a review, an appointment). Put "start" in ISO using that stated meeting time. Put "end" in ISO when an end time is stated; leave it empty otherwise. The receive/arrival date of an email is metadata — it is NEVER an event start time. Promotional emails, receipts, newsletters, account alerts, shipping notices, and automated reminders are NOT items.\n- A single message may yield both an event and a task. The scheduled thing at a stated time is an event; a readiness or follow-up action around it (prepare, make sure, get ready, confirm, follow up) is a separate task.\n- Set "project_hint" to "personal", "work", or a project name when the item clearly belongs to one; leave it empty otherwise.\n- Extract only items explicitly stated in the emails. Greetings, questions, opinions, status updates, and automated/bot-sent messages are not items. Empty arrays are the correct answer when nothing is actionable. Do not invent items.\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing, and [] for the actionable arrays when nothing is actionable):\n{"title":"<current date and time as shown in INPUT>","summary":"<one or two sentences in markdown about what happened in the LAST HOUR only — or say it was quiet>","alerts":[],"blocks":[{"icon":"inbox","label":"Recent Emails","type":"list","items":["From: <sender>: <subject> (<time>)"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing in the next 2 hours."]},{"icon":"tasks","label":"Active Tasks","type":"list","items":["No active tasks."]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}],"actionable_tasks":[{"title":"","due":"","project_hint":""}],"actionable_events":[{"title":"","start":"","end":""}]}',
+    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nWINDOW: This is the HOURLY digest. Only consider activity in the LAST HOUR (emails received in the last hour; calendar events in the next 2 hours; tasks that were created, completed, or updated in the last hour). Do NOT mention the user bio, sleep schedule, daily routine, or long-running projects unless something about them changed in the last hour.\n\nGROUNDING: Use only facts in INPUT or in the email read results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call email with action="read" and the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 50, preview_only true). Do not invent your own timestamps.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or the email read results, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nACTIONABLE EXTRACTION: From the emails you read with email action="read", also extract concrete actionable items the user must do or attend. This is separate from the "Recent Emails" display block — these drive task/event creation.\n- A task is a concrete to-do the user must do, expressed as an action the user performs: prepare, make sure, get ready, confirm, review, send, schedule, fix, follow up, deliver, pay, book, submit. Put "due" in ISO only when the message states a deadline; leave it empty otherwise.\n- An event is a scheduled meeting, appointment, or dated occasion the user will attend, where the date and start time are stated inside the message. Title it with the scheduled thing itself (a demo, a review, an appointment). Put "start" in ISO using that stated meeting time. Put "end" in ISO when an end time is stated; leave it empty otherwise. The receive/arrival date of an email is metadata — it is NEVER an event start time. Promotional emails, receipts, newsletters, account alerts, shipping notices, and automated reminders are NOT items.\n- A single message may yield both an event and a task. The scheduled thing at a stated time is an event; a readiness or follow-up action around it (prepare, make sure, get ready, confirm, follow up) is a separate task.\n- Set "project_hint" to "personal", "work", or a project name when the item clearly belongs to one; leave it empty otherwise.\n- Extract only items explicitly stated in the emails. Greetings, questions, opinions, status updates, and automated/bot-sent messages are not items. Empty arrays are the correct answer when nothing is actionable. Do not invent items.\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing, and [] for the actionable arrays when nothing is actionable):\n{"title":"<current date and time as shown in INPUT>","summary":"<one or two sentences in markdown about what happened in the LAST HOUR only — or say it was quiet>","alerts":[],"blocks":[{"icon":"inbox","label":"Recent Emails","type":"list","items":["From: <sender>: <subject> (<time>)"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing in the next 2 hours."]},{"icon":"tasks","label":"Active Tasks","type":"list","items":["No active tasks."]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}],"actionable_tasks":[{"title":"","due":"","project_hint":""}],"actionable_events":[{"title":"","start":"","end":""}]}',
   },
   {
     id: 'iris-digest-daily',
     cron: '17 21 * * *',
-    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nGROUNDING: Use only facts in INPUT or in the read_emails results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call read_emails with the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 100, preview_only true). Do not invent your own timestamps.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or read_emails, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing):\n{"title":"<date from INPUT>","summary":"<Start with: Good morning. Then one or two sentences briefing Dominic on today — calendar events, active tasks, and notable emails. Do NOT mention sleep schedule, wake times, or daily routine.>","alerts":[],"blocks":[{"icon":"review","label":"Day in Review","type":"prose","text":"<one or two sentences on calendar events, tasks, and emails for today from INPUT/emails — or empty if there is no data. Do not mention sleep schedule or daily routine.>"},{"icon":"inbox","label":"Recent Emails","type":"list","items":["From: <sender>: <subject> (<time>)"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing on the calendar today."]},{"icon":"tasks","label":"Active Tasks","type":"list","items":["No active tasks."]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"tomorrow","label":"Tomorrow","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}]}',
+    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nGROUNDING: Use only facts in INPUT or in the email read results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call email with action="read" and the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 100, preview_only true). Do not invent your own timestamps.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or the email read results, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing):\n{"title":"<date from INPUT>","summary":"<Start with: Good morning. Then one or two sentences briefing Dominic on today — calendar events, active tasks, and notable emails. Do NOT mention sleep schedule, wake times, or daily routine.>","alerts":[],"blocks":[{"icon":"review","label":"Day in Review","type":"prose","text":"<one or two sentences on calendar events, tasks, and emails for today from INPUT/emails — or empty if there is no data. Do not mention sleep schedule or daily routine.>"},{"icon":"inbox","label":"Recent Emails","type":"list","items":["From: <sender>: <subject> (<time>)"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing on the calendar today."]},{"icon":"tasks","label":"Active Tasks","type":"list","items":["No active tasks."]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"tomorrow","label":"Tomorrow","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}]}',
   },
   {
     id: 'iris-digest-weekly',
     cron: '30 20 * * 0',
-    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nGROUNDING: Use only facts in INPUT or in the read_emails results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call read_emails with the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 200, preview_only true). Do not invent your own timestamps. Pick the 6-10 most relevant.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or read_emails, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing):\n{"title":"<week-of date from INPUT>","summary":"<two or three sentences in markdown summarizing the shape of the week, from INPUT/emails>","alerts":[],"blocks":[{"icon":"review","label":"Week in Review","type":"prose","text":"<two or three sentences on the shape of the week from INPUT/emails, or empty if there is no data>"},{"icon":"inbox","label":"Email Activity","type":"list","items":["From: <sender>: <subject> (<date>)"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing on the calendar this week."]},{"icon":"tasks","label":"Tasks","type":"list","items":["[status] <title>"]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}]}',
+    prompt: 'Scan INPUT and recent emails, then output a JSON object. No commentary, no markdown outside the JSON.\n\nGROUNDING: Use only facts in INPUT or in the email read results. Use the empty-state value shown for a section with no data. Do not invent emails, events, or tasks.\n\nEmails: call email with action="read" and the `since` and `before` values copied verbatim from the INPUT "Email window (UTC)" line (limit 200, preview_only true). Do not invent your own timestamps. Pick the 6-10 most relevant. For each picked email, write its list item from that email\'s actual snippet/body in the email read result — one short line saying what the email is about, grounded in its content. Do not invent details the email does not contain.\n\nLook Out For: INPUT has a "Look Out For" list. For each item, if it matches an email, calendar event, task, or weather in INPUT or the email read results, add to "alerts": "<item> - matched by <what matched>". Otherwise alerts is [].\n\nOutput this shape (fill every field from INPUT/emails; use "" for a field with nothing). Every "items" entry in every block is ONE plain string — never an object, never a nested list:\n{"title":"<week-of date from INPUT>","summary":"<two or three sentences in markdown summarizing the shape of the week, from INPUT/emails>","alerts":[],"blocks":[{"icon":"review","label":"Week in Review","type":"prose","text":"<two or three sentences on the shape of the week from INPUT/emails, or empty if there is no data>"},{"icon":"inbox","label":"Email Activity","type":"list","items":["From: <sender>: <subject> (<date>) — <one short line saying what the email says, from its snippet/body>"]},{"icon":"calendar","label":"Calendar","type":"list","items":["Nothing on the calendar this week."]},{"icon":"tasks","label":"Tasks","type":"list","items":["[status] <title>"]},{"icon":"weather","label":"Weather","type":"prose","text":""},{"icon":"nudge","label":"Nudge","type":"prose","text":""}]}',
   },
 ];
 
@@ -2000,8 +2973,8 @@ function seedIrisDigestTasks(): void {
   const existing = new Map((getAllTasks() ?? []).map((t) => [t.id, t]));
   for (const t of IRIS_DIGEST_TASKS) {
     const found = existing.get(t.id);
-    // The span belongs in the URL path (?span=hourly) so the orchestrator
-    // can't drop it — the first cut put it in the body and the orchestrator
+    // The span belongs in the URL path (?span=hourly) so the seat
+    // can't drop it — the first cut put it in the body and the seat
     // posted hourly digests tagged "daily", leaving the Hourly tab empty.
     // Re-sync only the PROMPT on already-seeded tasks so prompt fixes
     // propagate without deleting/recreating the task. The cron is NOT
@@ -2036,11 +3009,11 @@ function seedIrisDigestTasks(): void {
   }
 }
 
-// ── Iris digest: direct Iris spawn (no orchestrator, no chat pipeline) ──────
+// ── Iris digest: direct Iris spawn (no chat pipeline) ──────
 // runDigest(span) spawns the Iris sub-agent DIRECTLY with a grounded prompt
 // (buildDigestContext + the baked digest prompt). Iris compiles the digest and
 // publishes it to the dashboard via post_summary (keyless loopback to
-// /api/summaries). Nothing is written to the chat and the orchestrator model is
+// /api/summaries). Nothing is written to the chat and the seat model is
 // never involved — this is a hardcoded function, not a routed task. Fired by
 // checkDigestsDue() (the host poll loop's schedule monitor) and by the dashboard
 // "Generate" button (deps.triggerDigest). The three schedules + prompts live in
@@ -2123,43 +3096,38 @@ async function runDigest(span: string, manual = false): Promise<{ ok: boolean; e
   if (!DIGEST_SPANS.includes(span as DigestSpan)) {
     return { ok: false, error: `invalid span: ${span}` };
   }
-  // Iris digest is a granite toolcall agent — use the shared Toolcall model
-  // (local:subagent_model), falling back to the legacy iris:model key only if
-  // the shared key is unset. The ctx/keep_alive/temp come from the toolcall
-  // settings in the runner (IRIS_NUM_CTX / TOOLCALL_KEEP_ALIVE / temp 0), so
-  // only the model identity is resolved here.
-  const irisModel = (getRouterState('local:subagent_model') || getRouterState('iris:model') || '').replace(/^local:/, '');
-  if (!irisModel) {
-    logger.warn({ span }, 'runDigest: no toolcall/iris model configured (local:subagent_model or iris:model) — skipping');
-    return { ok: false, error: 'no toolcall model configured (set the Toolcall model in the Agents panel)' };
-  }
-  const baked = IRIS_DIGEST_TASKS.find((x) => x.id === `iris-digest-${span}`);
-  if (!baked) return { ok: false, error: `no baked digest prompt for ${span}` };
-  // Read the live cron from the scheduled_tasks row if it exists; otherwise use
-  // the baked default. This lets the user edit the digest schedule in the UI.
-  const cron = getDigestTaskCron(span);
-  const t = { ...baked, cron };
-  let prompt = t.prompt;
+  // Deterministic digest (2026-09-09): built by code from real data — the
+  // host's own read_emails, calendar, work tasks, wttr.in weather, and
+  // LOOK_OUT_FOR.md — with NO model in the loop. The granite toolcall model
+  // authored the digest before and fabricated emails/events to fill blocks
+  // with no data ("Ollama Team plan", "DeepSeek price drop" — none real).
+  // runDigest assembles the JSON the dashboard renders and publishes it to
+  // /api/summaries over the same keyless loopback the agent-runner used, then
+  // runs the digest_complete callback (hourly actionable extraction + the
+  // digest:talk voice path) so spoken digests keep working.
+  logger.info({ span, manual }, 'runDigest: building deterministic digest (no model)');
   try {
-    const ctx = await buildDigestContext(span);
-    if (ctx) prompt = `${ctx}\n\n---\n\n${prompt}`;
+    const base = buildAgentCallbacks();
+    const digest = await buildDeterministicDigest(span as DigestSpan, base.read_emails!);
+    const text = JSON.stringify(digest);
+    const port = process.env.STATUS_PORT || '3200';
+    const res = await fetch(`http://127.0.0.1:${port}/api/summaries?span=${encodeURIComponent(span)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      logger.warn({ span, status: res.status }, 'runDigest: publish to /api/summaries failed');
+      return { ok: false, error: `publish failed: HTTP ${res.status}` };
+    }
+    logger.info({ span, status: res.status }, 'runDigest: published deterministic digest to /api/summaries');
+    await digestCallbacks(span).digest_complete({ text });
+    return { ok: true };
   } catch (err: any) {
-    logger.warn({ span, err }, 'runDigest: buildDigestContext failed — running ungrounded');
+    logger.warn({ span, err }, 'runDigest: deterministic digest failed');
+    return { ok: false, error: String(err?.message ?? err) };
   }
-  logger.info({ span, model: irisModel, manual }, 'runDigest: spawning iris-digest directly');
-  runSubAgentBackground({
-    agent: `iris-digest-${span}`,
-    prompt,
-    model: irisModel,
-    sessionId: 'owner',
-    workspaceRoot: WORKSPACE_ROOT,
-    chatJid: OWNER_JID,
-    groupFolder: 'owner',
-    isMain: true,
-    timeoutMs: 5 * 60 * 1000,
-    callbacks: digestCallbacks(span),
-  } as any);
-  return { ok: true };
 }
 
 function digestTalk(span: string): boolean {
@@ -2293,13 +3261,224 @@ async function checkDigestsDue(): Promise<void> {
         continue;
       }
       if (now >= nextFireMs) {
+        // Stagger against the other cleaners (Mercury compaction, memory
+        // writeback): if one is running, skip this tick WITHOUT advancing
+        // lastrun, so the digest retries on the next 2s tick once the lock is
+        // free. (Advancing lastrun here would burn the slot entirely — the
+        // digest wouldn't fire again until the NEXT cron occurrence.)
+        if (cleanerBusy) continue;
         setRouterState(lastrunKey, new Date(now).toISOString());
+        cleanerBusy = true;
         logger.info({ span, cron: liveCron }, 'checkDigestsDue: firing scheduled digest');
-        void runDigest(span, false).catch((err) => logger.warn({ span, err }, 'runDigest failed'));
+        void runDigest(span, false)
+          .catch((err) => logger.warn({ span, err }, 'runDigest failed'))
+          .finally(() => { cleanerBusy = false; });
       }
     }
   } finally {
     digestMonitorBusy = false;
+  }
+}
+
+// ── Sentry: scheduled software-security scans ──────────────────────────────
+// Sentry (reborn 2026-09-08 — the old webcam-awareness Sentry died with the
+// oculus consolidation) is the antivirus-like background scanner: hourly PEEK
+// (listening sockets, established connections, running services) + daily DEEP
+// (adds autostart, user crontab, enabled user units, rc-file/process audit).
+// It runs with NO elevated permissions — every scan command is user-readable.
+// The agent runs the commands, JUDGES the output itself (it's an
+// agent-class model that knows what a normal Linux desktop looks like),
+// and submits once via sentry_report with its suspicious flags; THAT HOST
+// CALLBACK logs the scan row to sentry_scans and relays the flags, posting a
+// chat message ONLY when something's wrong. No baseline, no host-side diff.
+// Scheduled
+// scans bypass the chat pipeline exactly like the iris digests: scheduled_tasks
+// rows (visibility + cron editing in the Sched UI) fired by checkSentryDue()
+// on the poll loop, spawning the sentry child directly. Clean scans are silent.
+
+function resolveSentryModel(): string {
+  // Sentry has its own model wire (sentry:model — the dashboard Sentry row).
+  // Unset, it inherits the Atlas model — never the shared toolcall
+  // wire, which is the small model this setting exists to get away from.
+  return (getRouterState('sentry:model') || getRouterState('atlas:model') || '')
+    .trim().replace(/^local:/, '');
+}
+
+const SENTRY_TASK_DEFS = [
+  { id: 'sentry-peek', mode: 'peek' as const, cron: '23 * * * *', prompt: 'Run a PEEK (fast) security scan of the PC: listening sockets, established connections, running services. Collect every category, then submit the inventory once with sentry_report.' },
+  { id: 'sentry-deep', mode: 'deep' as const, cron: '17 4 * * *', prompt: 'Run a DEEP (full) security scan of the PC: listening sockets, established connections, running services, autostart entries, user crontab, enabled user units, shell rc files, and a process audit. Collect every category, then submit the inventory once with sentry_report.' },
+];
+
+// Disabled 2026-09-28: sentry has never run a real scan. The toolcall fine-tune
+// fabricates the inventory instead of running Bash — every sentry_report ever
+// logged carries invented sockets (nginx/mysql/grafana on this arch desktop)
+// or nothing at all, and ~12% of runs the fabrication loop never terminates:
+// it emits an unbounded JSON array, hits the 16384 num_predict cap, ollama
+// drops the unterminated tool call, and the run surfaces as "produced no
+// output and ran no tools". Root cause: zero sentry examples in the SFT data
+// (orchatlas-sft.jsonl) — the model was never taught collect-then-report.
+// Flip this back on only after sentry examples are trained in.
+const SENTRY_SCANS_ENABLED = false;
+
+function seedSentryTasks(): void {
+  const existing = new Map((getAllTasks() ?? []).map((t) => [t.id, t]));
+  for (const t of SENTRY_TASK_DEFS) {
+    const found = existing.get(t.id);
+    // Same re-sync policy as the Iris digests: prompt fixes propagate, the
+    // cron does NOT (the user customizes it in the Sched UI and a re-seed
+    // would revert their chosen time on every restart).
+    if (found) {
+      if (found.prompt !== t.prompt) {
+        updateTask(t.id, { prompt: t.prompt });
+        logger.info({ taskId: t.id }, 'updated Sentry scan task prompt');
+      }
+      continue;
+    }
+    createTask({
+      id: t.id,
+      chat_jid: OWNER_JID,
+      prompt: t.prompt,
+      schedule_type: 'cron',
+      schedule_value: t.cron,
+      context_mode: 'isolated',
+      next_run: computeNextRun({
+        id: t.id, chat_jid: OWNER_JID, prompt: t.prompt,
+        schedule_type: 'cron', schedule_value: t.cron,
+        context_mode: 'isolated', next_run: null,
+        last_run: null, last_result: null, status: 'active', created_at: '',
+      }),
+      status: 'active',
+      created_at: new Date().toISOString(),
+    });
+    logger.info({ taskId: t.id, cron: t.cron }, 'seeded Sentry scan task');
+  }
+}
+
+let sentryScanBusy = false;
+// True once checkSentryDue has run at least once this process lifetime. The
+// first check after boot SKIPS overdue catch-up: a scan slot missed while
+// Warden was down has nothing to report the next slot won't, and firing it on
+// restart made every mid-hour restart trigger an immediate scan.
+let sentryBootChecked = false;
+
+/** Fire a Sentry scan (peek or deep) as a direct background child spawn —
+ *  no chat pipeline. Used by checkSentryDue() for the scheduled
+ *  scans; also exported so an API route / future automation can trigger one. */
+export function runSentryScan(mode: 'peek' | 'deep'): { ok: boolean; error?: string } {
+  if (!SENTRY_SCANS_ENABLED) {
+    logger.info({ mode }, 'runSentryScan: sentry scans are disabled (SENTRY_SCANS_ENABLED=false)');
+    return { ok: false, error: 'sentry scans are disabled (the model fabricates its inventory — see SENTRY_SCANS_ENABLED in src/index.ts)' };
+  }
+  const model = resolveSentryModel();
+  if (!model) {
+    logger.warn({ mode }, 'runSentryScan: no sentry model configured (sentry:model) — skipping');
+    return { ok: false, error: 'no sentry model configured (set sentryModel in the Agents panel)' };
+  }
+  const baked = SENTRY_TASK_DEFS.find((t) => t.mode === mode);
+  const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
+  // Already-announced findings (sentry:reported) go to the model verbatim so a
+  // recurring item can be phrased EXACTLY the same — the host silences exact
+  // repeats, and paraphrases would defeat that. The host only relays; the
+  // model stays the analyst.
+  let alreadyReported = '';
+  try {
+    const reported = JSON.parse(getRouterState('sentry:reported') || '[]');
+    if (Array.isArray(reported) && reported.length) {
+      alreadyReported =
+        `\nFindings already announced to the user (they stay silenced unless your wording matches exactly — if one of these is still present, re-flag it VERBATIM from this list; only list it again if it got worse):\n` +
+        reported.map((r: string) => `- ${r}`).join('\n') + '\n\n';
+    }
+  } catch { /* unparseable dedup state — scan without it */ }
+  const task =
+    `Current local time is ${localNow} (timezone ${tz}).\n\n` +
+    `${baked?.prompt ?? 'Run a security scan of the PC, then submit the inventory once with sentry_report.'}\n\n` +
+    alreadyReported +
+    `This is a scheduled ${mode} scan. Submit your inventory with sentry_report and stop.`;
+  logger.info({ mode, model }, 'runSentryScan: spawning sentry directly');
+  runSubAgentBackground({
+    agent: 'sentry',
+    prompt: task,
+    model,
+    sessionId: 'owner',
+    workspaceRoot: WORKSPACE_ROOT,
+    chatJid: OWNER_JID,
+    groupFolder: 'owner',
+    isMain: true,
+    timeoutMs: 10 * 60 * 1000, // deep scans run many read commands; generous but bounded
+    callbacks: buildAgentCallbacks(),
+  } as any);
+  return { ok: true };
+}
+
+/** True while any agent run is in flight — a seat turn, a spontaneous
+ *  digest report-back, or a background job (atlas/vulkan/…). Sentry is
+ *  deferred while this is true: its scan loads a whole second big model
+ *  (sentry:model, ~17 GB) which evicts the resident Atlas model
+ *  from VRAM mid-work — `keep_alive=-1` only stops idle-timeout unloads, not
+ *  VRAM eviction. So Sentry waits until the machine is actually idle. */
+function wardenBusy(): boolean {
+  return isForegroundTurnActive() || getLiveJobs().length > 0;
+}
+
+/** Scheduled-scan monitor, riding the same poll loop as checkDigestsDue().
+ *  Fires runSentryScan(mode) when the live cron (from the scheduled_tasks row,
+ *  so the user can edit it in the Sched UI) is due. Pause/resume via the row
+ *  status. Never throws, never blocks message pickup. */
+function checkSentryDue(): void {
+  if (!SENTRY_SCANS_ENABLED) return;
+  if (sentryScanBusy) return;
+  sentryScanBusy = true;
+  const firstCheck = !sentryBootChecked;
+  sentryBootChecked = true;
+  try {
+    const now = Date.now();
+    for (const t of SENTRY_TASK_DEFS) {
+      const row = getTaskById(t.id);
+      if (row && row.status !== 'active') continue;
+      const cron = row?.schedule_value || t.cron;
+      const lastrunKey = `sentry:lastrun:${t.mode}`;
+      const last = getRouterState(lastrunKey);
+      if (!last) {
+        // First boot: seed lastrun to now so the first scan fires at the next
+        // cron slot, not immediately on startup.
+        setRouterState(lastrunKey, new Date(now).toISOString());
+        continue;
+      }
+      let nextFireMs: number;
+      try {
+        nextFireMs = CronExpressionParser.parse(cron, {
+          tz: TIMEZONE,
+          currentDate: new Date(last),
+        }).next().getTime();
+      } catch {
+        continue;
+      }
+      if (now >= nextFireMs) {
+        setRouterState(lastrunKey, new Date(now).toISOString());
+        if (firstCheck) {
+          // Overdue slot missed while Warden was down — advance the schedule
+          // and wait for the next slot instead of catch-up firing on boot.
+          logger.info({ mode: t.mode }, 'checkSentryDue: overdue slot missed while Warden was down — skipping catch-up scan, next scan at the next cron slot');
+          continue;
+        }
+        if (wardenBusy()) {
+          // Agent run in flight — skip this slot and wait for the next one.
+          // lastrun was already advanced, so it won't refire until the next
+          // cron slot.
+          logger.info({ mode: t.mode }, 'checkSentryDue: deferring scan — agent run in flight');
+          continue;
+        }
+        logger.info({ mode: t.mode, cron }, 'checkSentryDue: firing scheduled security scan');
+        try {
+          runSentryScan(t.mode);
+        } catch (err) {
+          logger.warn({ mode: t.mode, err }, 'runSentryScan failed');
+        }
+      }
+    }
+  } finally {
+    sentryScanBusy = false;
   }
 }
 
@@ -2473,8 +3652,10 @@ async function startMessageLoop(): Promise<void> {
         if (agentRunInFlight) {
           const stopMsg = [...messages].reverse().find((m) => STOP_COMMAND_RE.test(m.content || ''));
           if (stopMsg) {
-            logger.info({ text: stopMsg.content }, 'Stop command received mid-run — killing agent');
-            killCurrentAgent();
+            logger.info({ text: stopMsg.content }, 'Stop command received mid-run — interrupting agent');
+            // Soft-interrupt so the warm runner child survives the stop; fall
+            // back to a kill only when there is no persistent child.
+            if (!cancelCurrentTurn()) killCurrentAgent();
             // Consume everything up to and including the stop message so it
             // isn't replayed as a prompt on the next tick. Messages sent
             // after the stop stay pending and start a fresh run.
@@ -2495,6 +3676,19 @@ async function startMessageLoop(): Promise<void> {
       // timer. Fires runDigest(span) directly (Iris, no chat) when a baked-in
       // cron schedule is due. Fire-and-forget; never blocks message pickup.
       void checkDigestsDue();
+      // Sentry schedule monitor: same poll-loop pattern — fires the hourly
+      // peek / daily deep security scans directly as background sentry
+      // spawns (no chat, no seat turn) when their cron is due.
+      void checkSentryDue();
+      // BotNet autonomy scheduler: same poll loop — fires a seat sweep on an
+      // idle interval when the human is away. Presence + idle gated.
+      void checkBbsAutonomyDue();
+      // Memory-tree classifier: same rider. When nothing is happening (no
+      // agent run, no big model holding VRAM) it classifies the unprocessed
+      // warden.log backlog into the memory tree with granite4.1:30b — runs
+      // until the backlog is finished, cursor-persisted, aborts if the
+      // machine is claimed again.
+      void maybeClassifyMemoryTree(agentRunInFlight);
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
@@ -2517,151 +3711,6 @@ function recoverPendingMessages(): void {
   }
 }
 
-// Dedicated persistent Chrome profile for Warden automation.
-// Chrome runs as a standalone process with --remote-debugging-port. The
-// agent-runner's native browser_* tools attach to it over CDP (playwright-core
-// connectOverCDP); when an agent session ends the CDP connection drops but
-// Chrome (and every open tab) stays alive.
-// Sign into Google once; the profile persists across restarts.
-const CHROME_CDP_PORT = 9222;
-const WARDEN_CHROME_PROFILE = path.join(process.env.HOME ?? '/root', '.config', 'playwright-jarvis');
-const CHROME_BIN = '/usr/bin/google-chrome-stable';
-
-// dockbox runs as a systemd user unit without DISPLAY/XAUTHORITY in its env,
-// so Chrome can't reach the X server and dies on launch. Discover the active
-// session's display env from a running user process (plasmashell, kded, or
-// anything with DISPLAY set) so Chrome can attach to the visible session.
-function discoverDisplayEnv(): { DISPLAY?: string; XAUTHORITY?: string } {
-  const uid = process.getuid?.() ?? 0;
-  // Prefer processes likely to own the user's graphical session.
-  const candidates = ['plasmashell', 'kded', 'gnome-shell', 'Xwayland', 'Xorg', 'sway', 'i3'];
-  for (const name of candidates) {
-    try {
-      const pids = execSync(`pgrep -u ${uid} -x ${name} 2>/dev/null`, { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
-      for (const pid of pids) {
-        const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
-        const DISPLAY = env.find((e) => e.startsWith('DISPLAY='));
-        const XAUTHORITY = env.find((e) => e.startsWith('XAUTHORITY='));
-        if (DISPLAY) {
-          return {
-            DISPLAY: DISPLAY.slice('DISPLAY='.length),
-            XAUTHORITY: XAUTHORITY ? XAUTHORITY.slice('XAUTHORITY='.length) : undefined,
-          };
-        }
-      }
-    } catch { /* try next candidate */ }
-  }
-  // Fallback: scan any user process for DISPLAY.
-  try {
-    const pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
-    for (const pid of pids) {
-      try {
-        const stat = fs.statSync(`/proc/${pid}`);
-        if (stat.uid !== uid) continue;
-        const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
-        const DISPLAY = env.find((e) => e.startsWith('DISPLAY='));
-        if (DISPLAY) {
-          const XAUTHORITY = env.find((e) => e.startsWith('XAUTHORITY='));
-          return {
-            DISPLAY: DISPLAY.slice('DISPLAY='.length),
-            XAUTHORITY: XAUTHORITY ? XAUTHORITY.slice('XAUTHORITY='.length) : undefined,
-          };
-        }
-      } catch { /* process died */ }
-    }
-  } catch { /* /proc unreadable */ }
-  return {};
-}
-
-function spawnChrome(): void {
-  // Clear stale profile locks so Chrome doesn't refuse to start after a crash.
-  try {
-    fs.rmSync(path.join(WARDEN_CHROME_PROFILE, 'SingletonLock'), { force: true });
-    fs.rmSync(path.join(WARDEN_CHROME_PROFILE, 'SingletonSocket'), { force: true });
-  } catch { /* ignore */ }
-  const displayEnv = discoverDisplayEnv();
-  // Headless hosts (the Pi runs Warden as a systemd user unit with no X/Wayland
-  // session) can't open a display, so Chrome exits immediately and the watchdog
-  // relaunches it in a boot loop. Run headless when there's no DISPLAY to attach
-  // to; --disable-gpu skips the EGL init noise on those boxes.
-  const headless = !displayEnv.DISPLAY;
-  const chromeArgs = [
-    `--remote-debugging-port=${CHROME_CDP_PORT}`,
-    `--user-data-dir=${WARDEN_CHROME_PROFILE}`,
-    '--no-sandbox',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-features=Translate',
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding',
-    '--disable-features=LockProfileCookieDatabase',
-  ];
-  if (headless) {
-    chromeArgs.push('--headless=new', '--disable-gpu');
-  }
-  const child = spawn(CHROME_BIN, chromeArgs, {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ...displayEnv },
-  });
-  child.on('error', (err) => logger.warn({ err }, 'Chrome spawn failed'));
-  child.stdout?.on('data', () => {});
-  child.stderr?.on('data', (chunk: Buffer) => {
-    const line = chunk.toString('utf8').trim();
-    if (line) logger.debug({ chrome: line }, 'chrome stderr');
-  });
-  child.on('exit', (code, signal) => {
-    logger.warn({ code, signal }, 'Chrome process exited');
-  });
-  child.unref();
-  logger.info({ cdpPort: CHROME_CDP_PORT, headless, ...displayEnv }, 'Launched persistent Chrome');
-}
-
-function startChromeWatchdog(): void {
-  // Kill any stale chrome on this port before starting fresh.
-  try { execSync(`pkill -f "remote-debugging-port=${CHROME_CDP_PORT}" 2>/dev/null`); } catch {}
-  let chromeLaunchTime = Date.now();
-  let chromeFailures = 0;
-
-  function restartChrome(reason: string): void {
-    logger.warn({ reason, chromeFailures }, 'Relaunching Chrome');
-    try { execSync(`pkill -f "remote-debugging-port=${CHROME_CDP_PORT}" 2>/dev/null`); } catch {}
-    chromeFailures = 0;
-    chromeLaunchTime = Date.now();
-    spawnChrome();
-  }
-
-  spawnChrome();
-
-  const httpOk = (url: string, timeoutMs = 3000) =>
-    new Promise<boolean>((resolve) => {
-      const req = http.get(url, { timeout: timeoutMs }, (res) => {
-        res.resume();
-        resolve(res.statusCode != null && res.statusCode >= 200 && res.statusCode < 500);
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-      setTimeout(() => { req.destroy(); resolve(false); }, timeoutMs);
-    });
-
-  // Re-check every 15 seconds; restart Chrome only after repeated failures
-  // and never within a 10 s grace period after a fresh launch.
-  setInterval(async () => {
-    const now = Date.now();
-    if (now - chromeLaunchTime < 10000) return;
-
-    const chromeUp = await httpOk(`http://localhost:${CHROME_CDP_PORT}/json/version`, 3000);
-    if (!chromeUp) {
-      chromeFailures++;
-      if (chromeFailures >= 3) {
-        restartChrome('Chrome CDP unreachable');
-      }
-      return;
-    }
-    chromeFailures = 0;
-  }, 15000).unref();
-}
-
 
 /**
  * One-time migration: materialize a concrete per-agent model + ctx for every
@@ -2674,90 +3723,206 @@ function startChromeWatchdog(): void {
  * loudly instead of falling back.
  */
 function seedPerAgentModelSettings(): void {
-  const orch = getRouterState('orchestrator:model') || '';
-  // The five toolcall agents share one model/ctx (local:subagent_model/_ctx),
-  // written by the dashboard "Toolcall model" row. On the first boot after this
-  // consolidation, preserve the user's current toolcall agent model (Iris is the
-  // representative one — typically granite4.1:8b) and ctx so nothing changes.
+  const atlas = getRouterState('atlas:model') || '';
+  // MODELS ONLY. num_ctx is NEVER seeded or hardcoded here — every ctx value
+  // lives in the settings (router_state local:*_ctx, written by the Agents
+  // panel) and syncAgentCtxEnv copies it to the env verbatim. Baking a ctx
+  // "default" here has repeatedly overridden the user's chosen settings.
   const toolcall = getRouterState('local:subagent_model')
     || getRouterState('iris:model')
-    || getRouterState('byte:model')
-    || orch;
-  const toolcallCtx = getRouterState('local:subagent_ctx')
-    || getRouterState('local:iris_ctx')
-    || getRouterState('local:byte_ctx')
-    || '';
-  const subagent = toolcall;
-  const atlas = getRouterState('atlas:model') || orch;
-  const toolsCtx = toolcallCtx;
-  const atlasCtx = getRouterState('local:atlas_ctx') || '';
+    || atlas;
   const seed = (key: string, value: string) => {
     if (!getRouterState(key) && value) setRouterState(key, value);
   };
-  // Seed the shared toolcall model/ctx (the real runtime source for the 5 agents).
+  // Seed the shared toolcall model (the real runtime source for the toolcall
+  // agents: Iris, Sentry). ctx is NOT seeded — settings only.
   seed('local:subagent_model', toolcall);
-  seed('local:subagent_ctx', toolcallCtx);
-  // Orchestrator has historically been resident (keep_alive -1); materialize that
-  // as the default so the checkbox reflects reality. Toolcall/Atlas stay unset →
-  // the runner defaults to 300 (their historic sub-agent TTL).
-  seed('local:orch_keep_alive', '-1');
+  // Atlas IS the seat and has historically been resident (keep_alive -1);
+  // materialize that as the default so the checkbox reflects reality.
+  // Toolcall stays unset → the runner defaults to 300 (its historic
+  // sub-agent TTL).
+  seed('local:atlas_keep_alive', '-1');
+  seed('local:sentry_keep_alive', '300');
   // New per-agent model keys inherit the legacy shared value.
-  seed('byte:model', subagent);
-  seed('dexter:model', subagent);
-  seed('iris:model', subagent);
+  seed('iris:model', toolcall);
   seed('artemis:model', atlas);
-  // Existing keys that previously fell back to orchestrator at runtime — seed
+  // Existing keys that previously fell back to the seat at runtime — seed
   // them too so that runtime fallback can be removed without breaking agents.
-  seed('atlas:model', orch);
-  seed('vulkan:model', orch);
-  seed('mercury:model', orch);
-  seed('oculus:model', orch);
-  // ctx — preserve each agent's current effective value.
-  seed('local:byte_ctx', toolsCtx);
-  seed('local:dexter_ctx', toolsCtx);
-  seed('local:iris_ctx', toolsCtx);
-  seed('local:artemis_ctx', atlasCtx);
-  // Oculus bakes in 8192 today (granite4.1:8b overflows at the 2048 default) —
-  // materialize that as its ctx setting so the hardcoded bake can be removed.
-  seed('local:oculus_ctx', '8192');
-  // Vulkan had no ctx override (native window) — leave it blank (native).
+  seed('vulkan:model', atlas);
+  seed('mercury:model', atlas);
+  // Supervisor (completion-verdict) model inherits the seat model on first
+  // boot — no blank anywhere: every dashboard model dropdown always shows a
+  // concrete model. The user picks a small/cloud one afterward if they want.
+  seed('supervisor:model', atlas);
+  // Supervisor completion verdict: on by default. Large local models
+  // routinely spend 10-30 min on one task. The user can toggle it off in settings.
+  seed('supervisor:enabled', 'true');
 }
 
 /**
  * Sync every per-agent num_ctx override from router_state into process.env so
- * the agent-runner child (and background spawns like Oculus, which inherit
+ * the agent-runner child (and background spawns like Sentry, which inherit
  * ...process.env) always sees the current value. Called at boot (after the
  * migration seed, so background spawns before the first chat turn are covered)
  * and again per turn (so dashboard changes take effect immediately).
  */
 export function syncAgentCtxEnv(): void {
-  process.env.ORCHESTRATOR_NUM_CTX = getRouterState('local:orchestrator_ctx') || '';
   process.env.SUBAGENT_NUM_CTX = getRouterState('local:subagent_ctx') || '';
   process.env.ATLAS_NUM_CTX = getRouterState('local:atlas_ctx') || '';
   process.env.TOOLS_NUM_CTX = getRouterState('local:tools_ctx') || '';
-  // The five toolcall agents share one ctx (local:subagent_ctx).
-  process.env.MERCURY_NUM_CTX = getRouterState('local:subagent_ctx') || '';
-  process.env.BYTE_NUM_CTX = getRouterState('local:subagent_ctx') || '';
-  process.env.DEXTER_NUM_CTX = getRouterState('local:subagent_ctx') || '';
-  process.env.IRIS_NUM_CTX = getRouterState('local:subagent_ctx') || '';
+  // Iris has its own ctx row in Settings (local:iris_ctx). Until a per-agent
+  // value is saved it inherits the shared toolcall ctx (local:subagent_ctx)
+  // so behavior is unchanged. Reading the per-agent key here (and the host
+  // re-syncing env per turn before runAgent) is what lets the dropdown
+  // override the spawn-time 32k the persistent child was locked to.
+  process.env.IRIS_NUM_CTX =
+    getRouterState('local:iris_ctx') || getRouterState('local:subagent_ctx') || '';
   process.env.ARTEMIS_NUM_CTX = getRouterState('local:artemis_ctx') || '';
   process.env.VULKAN_NUM_CTX = getRouterState('local:vulkan_ctx') || '';
-  process.env.OCULUS_NUM_CTX = getRouterState('local:subagent_ctx') || '';
+  // Mercury has its own ctx row in Settings. Until a per-agent value is saved
+  // it inherits the shared toolcall ctx so effective behavior is unchanged.
+  process.env.MERCURY_NUM_CTX =
+    getRouterState('local:mercury_ctx') || getRouterState('local:subagent_ctx') || '';
+  process.env.SENTRY_NUM_CTX =
+    getRouterState('local:sentry_ctx') || getRouterState('local:atlas_ctx') || '';
+  process.env.VISION_MODEL = getRouterState('vision:model') || '';
   // Per-agent Ollama keep_alive (-1 = resident, 300 = 5 min).
-  process.env.ORCHESTRATOR_KEEP_ALIVE = getRouterState('local:orch_keep_alive') || '';
   process.env.ATLAS_KEEP_ALIVE = getRouterState('local:atlas_keep_alive') || '';
   process.env.TOOLCALL_KEEP_ALIVE = getRouterState('local:toolcall_keep_alive') || '';
+  process.env.SENTRY_KEEP_ALIVE = getRouterState('local:sentry_keep_alive') || '';
+}
+
+/**
+ * Fire-and-forget Ollama model warmup at boot. Every model configured to stay
+ * resident (keep_alive = -1) gets a trivial /api/generate so the first real
+ * message doesn't pay a multi-minute cold load. Only the models that should
+ * stay resident: atlas (the seat) and the shared toolcall model when
+ * local:toolcall_keep_alive is -1. Cloud models are excluded (no VRAM to warm).
+ * Retries /api/ps until Ollama is reachable (it may still be starting).
+ */
+async function warmResidentOllamaModels(): Promise<void> {
+  // Wait for Ollama to answer (service may start before Ollama is up).
+  let up = false;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      const res = await fetch(`${OLLAMA_URL}/api/ps`);
+      if (res.ok) { up = true; break; }
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (!up) {
+    logger.warn('Ollama unreachable after 60s — skipping model warmup');
+    return;
+  }
+
+  const candidates = [
+    // Atlas IS the chat seat — it needs warming or the first real message pays
+    // a cold load. Gated on its own keep-alive like toolcall below.
+    getRouterState('local:atlas_keep_alive') === '-1'
+      ? getRouterState('atlas:model')
+      : '',
+    getRouterState('local:toolcall_keep_alive') === '-1'
+      ? getRouterState('local:subagent_model')
+      : '',
+  ];
+  const toWarm = [
+    ...new Set(
+      candidates
+        .map((m) => (m || '').replace(/^local:/, '').trim())
+        .filter((m) => m && !/cloud/i.test(m)),
+    ),
+  ];
+  const ctxFor = (m: string): number | undefined => {
+    if (m === (getRouterState('local:subagent_model') || '').replace(/^local:/, '').trim()) {
+      const n = parseInt(getRouterState('local:subagent_ctx') || '', 10);
+      return n > 0 ? n : undefined;
+    }
+    if (m === (getRouterState('atlas:model') || '').replace(/^local:/, '').trim()) {
+      const n = parseInt(getRouterState('local:atlas_ctx') || '', 10);
+      return n > 0 ? n : undefined;
+    }
+    return undefined;
+  };
+  for (const model of toWarm) {
+    try {
+      // Warm at the SAME num_ctx the settings page configures for this model —
+      // a warmup load at Ollama's default ctx creates a resident instance that
+      // the first real request (at the settings ctx) immediately discards and
+      // reloads, defeating the warmup. ctx is 100% settings-derived: no literal.
+      // Declared above the loop: the minute-ly re-pin uses it too.
+      const numCtx = ctxFor(model);
+      const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          prompt: ' ',
+          keep_alive: -1,
+          stream: false,
+          ...(numCtx ? { options: { num_ctx: numCtx } } : {}),
+        }),
+      });
+      logger.info({ model, ok: res.ok, numCtx: numCtx || 'native' }, 'Warmed resident Ollama model');
+    } catch (err) {
+      logger.warn({ model, err }, 'Model warmup failed (non-fatal)');
+    }
+  }
+
+  // Ollama applies the keep_alive of the LAST request to a loaded model, so
+  // any worker that calls a pinned model without a keep_alive (marm's
+  // indexers, tree classification — anything on the host that omits it)
+  // silently demotes a checkbox-pinned model to a 5-minute TTL and dumps it
+  // from VRAM minutes later (2026-09-20, qwen3.5:35b "4 minutes from now").
+  // Re-pin every minute: one token of generation against an already-loaded
+  // model, cheaper than any reload.
+  const repin = async () => {
+    // Loaded-models snapshot first: the re-pin maintains the TTL of models that
+    // ARE resident — it must never (re)spawn one that was deliberately unloaded.
+    // Unconditionally POSTing resurrected models the training-loop audit had just
+    // cleared from VRAM, and the reload preempted the 17 GB analyst mid-run
+    // ("Stopping...") — every classification then paid a cold 30b reload
+    // (2026-09-21).
+    let loaded = null;
+    try {
+      const res = await fetch(`${OLLAMA_URL}/api/ps`);
+      if (res.ok) {
+        loaded = new Set(((await res.json() as any).models || []).map((m: any) => m.name));
+      }
+    } catch { /* ps unreachable — fall through, pin anyway */ }
+    for (const model of toWarm) {
+      if (loaded && !loaded.has(model)) continue; // absent = stay unloaded
+      try {
+        const numCtx = ctxFor(model);
+        await fetch(`${OLLAMA_URL}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt: ' ',
+            keep_alive: -1,
+            stream: false,
+            ...(numCtx ? { options: { num_ctx: numCtx } } : {}),
+          }),
+        });
+      } catch { /* next minute retries */ }
+    }
+  };
+  const repinTimer = setInterval(() => { void repin(); }, 60_000);
+  repinTimer.unref?.();
 }
 
 async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
-  startChromeWatchdog();
   loadState();
   // Seed the three Iris digest automations (hourly/daily/weekly) as
   // scheduled_tasks rows so they show in the Sched tab and the host poll loop
   // can fire them. Re-syncs the prompt/cron when the baked values change.
   seedIrisDigestTasks();
+  // Seed the two Sentry security scans (hourly peek / daily deep) the same
+  // way: scheduled_tasks rows for visibility + cron editing, fired by
+  // checkSentryDue() on the poll loop.
+  seedSentryTasks();
   // Materialize a concrete per-agent model + ctx for every agent from the
   // legacy shared values BEFORE any agent runs, so every Agents-panel dropdown
   // is populated (no blank) and the agent-runner never sees an empty key. This
@@ -2765,6 +3930,9 @@ async function main(): Promise<void> {
   // when the key is empty), then runtime uses the key directly with no `||`.
   seedPerAgentModelSettings();
   syncAgentCtxEnv();
+  // Warm resident Ollama models in the background (fire-and-forget) so the
+  // first message after a service start doesn't pay a multi-minute cold load.
+  void warmResidentOllamaModels();
 
   // Wire the activity publisher so agent-runner stderr thinking tokens reach
   // the dashboard's live thinking bar via SSE.
@@ -2825,7 +3993,13 @@ async function main(): Promise<void> {
   };
   startStatusServer({
     queue: { enqueueMessageCheck() {}, enqueueTask() {}, setActiveMode() {}, getStatus: () => {
-      const processing = getRouterState('agent:processing') === 'true';
+      // A turn is in flight if the host drove it (agent:processing, set in
+      // processOwnerMessages around runAgent) OR the runner is running a
+      // spontaneous digest turn — the report-back reply after a background job
+      // finishes. Those run inside the persistent child with no runAgent
+      // wrapper, so the fg statuses the runner streams are the only in-flight
+      // signal the host gets (isForegroundTurnActive).
+      const processing = getRouterState('agent:processing') === 'true' || isForegroundTurnActive();
       return {
         activeCount: processing ? 1 : 0,
         groups: [{
@@ -2929,6 +4103,7 @@ async function main(): Promise<void> {
   seedPersonalProject(OWNER_JID);
 
   startCalendarSyncPoller();
+  startCalendarReminderLoop();
 
   // Cap warden.log at ~5 MB in-process (trim the head, keep the tail) so the
   // log file can't fill the disk — or, on a ramdisk, eat RAM. See log-rotator.

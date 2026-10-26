@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { registry } from '../tool-registry.js';
 import { log } from '../ipc-helpers.js';
 import { writeCallbackAsync } from '../index.js';
@@ -17,6 +17,29 @@ function run(cmd: string, extraEnv: Record<string, string> = {}): string {
     }).trim();
 }
 
+/** Run a command with an ARGV array — no shell, so the bytes we pass are the
+ *  bytes the program receives. Anything carrying user/model text (typed
+ *  strings, key combos) must go through here, never through a shell string. */
+function runArgs(cmd: string, args: string[], extraEnv: Record<string, string> = {}): string {
+    return execFileSync(cmd, args, {
+        encoding: 'utf-8',
+        timeout: 30000,
+        env: { ...process.env, ...DISPLAY_ENV, ...extraEnv },
+    }).trim();
+}
+
+/** Models emit newlines two ways: a real newline in the JSON string, or the
+ *  two characters backslash-n when they over-escape. Typing a literal "\n"
+ *  into a markdown editor is never what anyone meant, so fold the escaped
+ *  forms back into real characters before typing. */
+function unescapeTypedText(text: string): string {
+    return text
+        .replace(/\r\n/g, '\n')
+        .replace(/\\r\\n/g, '\n')
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t');
+}
+
 /** Push a base64 image into the vision-context queue consumed after this tool call. */
 function queueForVision(b64: string): void {
     if (!b64) return;
@@ -26,14 +49,16 @@ function queueForVision(b64: string): void {
 
 registry.register({
     name: 'desktop_screenshot',
-    description: 'Take a screenshot of the full desktop (or a window/region). The image is loaded into your vision context immediately — you can see it in your next response and use the pixel coordinates to drive desktop_click(x, y). Returns the native resolution. Use this to SEE a native desktop app (Stremio, a media player, a settings window) before clicking it; for web pages use browser_snapshot instead.',
+    // Whole-screen capture only: the host serves one full frame and refuses a
+    // per-window ask, so window_title is gone from the schema rather than
+    // advertised-and-rejected. `region` is the way to narrow a capture.
+    description: '{"what":"capture the whole screen into your vision context","use_when":"see a native desktop app before desktop_click","web_pages":"chrome_read_page"}',
     schema: {
         type: 'object',
         properties: {
-            window_title: { type: 'string', description: 'Optional: capture a specific window by title substring instead of the full desktop.' },
             region: {
                 type: 'object',
-                description: 'Optional: capture a sub-rectangle in pixels.',
+                description: '{"what":"narrow the capture to a sub-rectangle of the screen","unit":"pixels","fields":"x,y,w,h — all four required together","default":"omit = whole screen"}',
                 properties: {
                     x: { type: 'number' }, y: { type: 'number' },
                     w: { type: 'number' }, h: { type: 'number' },
@@ -64,12 +89,12 @@ registry.register({
 
 registry.register({
     name: 'webcam_capture',
-    description: 'Take a photo, picture, or selfie with the host webcam (camera) and load it into YOUR vision context. Use when the user asks to take a photo, snap a picture, take a selfie, see what the camera sees, or check who/what is in the room. The Warden orchestrator grabs the frame on the host. Call this yourself; do NOT delegate it to a sub-agent (sub-agents have no vision and cannot see the result). Returns the resolution.',
+    description: '{"what":"photo/selfie from the host webcam into your vision context","use_when":"take a photo, see what the camera sees, who is in the room","rule":"call it yourself — sub-agents have no vision"}',
     schema: {
         type: 'object',
         properties: {
-            device: { type: 'string', description: 'Optional: v4l2 device path (default /dev/video0).' },
-            width: { type: 'number', description: 'Optional: requested frame width in pixels (default 640).' },
+            device: { type: 'string', description: '{"what":"v4l2 device path","default":"/dev/video0","when":"omit unless the user names a second camera"}' },
+            width: { type: 'number', description: '{"what":"requested frame width","unit":"pixels","default":640}' },
         },
         required: [],
     },
@@ -94,11 +119,11 @@ registry.register({
 
 registry.register({
     name: 'read_image',
-    description: 'Read an image file from the HOST filesystem (any absolute path the Warden orchestrator can access) and load it into YOUR vision context. Use this for images outside the container workspace. Call this yourself; do NOT delegate it to a sub-agent (sub-agents have no vision and cannot see the result). Returns the dimensions. Only call this when the user actually points you at a specific image file path.',
+    description: '{"what":"load a host image file into your vision context","use_when":"the user points at a specific image path","source":"absolute host path","rule":"call it yourself — sub-agents have no vision"}',
     schema: {
         type: 'object',
         properties: {
-            path: { type: 'string', description: 'Absolute path to the image file on the host.' },
+            path: { type: 'string', description: '{"what":"the image file to load","format":"absolute path on the host","source":"a path the user named, or one a file listing returned"}' },
         },
         required: ['path'],
     },
@@ -123,14 +148,14 @@ registry.register({
 
 registry.register({
     name: 'desktop_click',
-    description: 'Click at absolute screen coordinates. Use coordinates from a desktop_screenshot image.',
+    description: '{"what":"click at absolute screen coordinates","source":"coordinates read off a desktop_screenshot image","scope":"native desktop apps; a web page belongs to the browser tools"}',
     schema: {
         type: 'object',
         properties: {
-            x: { type: 'number', description: 'X coordinate (pixels from left)' },
-            y: { type: 'number', description: 'Y coordinate (pixels from top)' },
-            button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button (default: left)' },
-            double: { type: 'boolean', description: 'Double-click (default: false)' },
+            x: { type: 'number', description: '{"what":"horizontal position","unit":"pixels from the left edge","source":"a desktop_screenshot image"}' },
+            y: { type: 'number', description: '{"what":"vertical position","unit":"pixels from the top edge","source":"a desktop_screenshot image"}' },
+            button: { type: 'string', enum: ['left', 'right', 'middle'], description: '{"what":"mouse button","vals":"left|right|middle","default":"left"}' },
+            double: { type: 'boolean', description: '{"what":"double-click instead of single","default":false}' },
         },
         required: ['x', 'y'],
     },
@@ -154,13 +179,13 @@ registry.register({
 
 registry.register({
     name: 'desktop_type',
-    description: 'Type text or send keyboard shortcuts on the desktop. Use for typing into focused fields or sending key combos like ctrl+c.',
+    description: '{"what":"type text or send a key combo into the focused desktop field","multiline":"pass real line breaks — each line is typed with a Return between","one_of":"text or keys, never both"}',
     schema: {
         type: 'object',
         properties: {
-            text: { type: 'string', description: 'Text to type. Cannot be used together with keys.' },
-            keys: { type: 'string', description: 'Key combo to send, e.g. "ctrl+c", "Return", "alt+F4", "ctrl+shift+t". Cannot be used together with text.' },
-            delay_ms: { type: 'number', description: 'Delay between keystrokes in ms (default 12). Increase for slow apps.' },
+            text: { type: 'string', description: '{"what":"the text to type","format":"real line breaks for multi-line; the document keeps its own shape","exclusive_with":"keys"}' },
+            keys: { type: 'string', description: '{"what":"one key or combo to send","format":"xdotool key syntax — a key name, or modifiers joined by +","exclusive_with":"text"}' },
+            delay_ms: { type: 'number', description: '{"what":"delay between keystrokes","unit":"ms","default":12,"raise_when":"the target app drops characters"}' },
         },
         required: [],
     },
@@ -169,7 +194,7 @@ registry.register({
 
         if (args.keys) {
             try {
-                run(`xdotool key --clearmodifiers "${args.keys}"`);
+                runArgs('xdotool', ['key', '--clearmodifiers', String(args.keys)]);
                 return `Sent keys: ${args.keys}`;
             } catch (err: any) {
                 return `Error sending keys "${args.keys}": ${err.message}`;
@@ -177,9 +202,25 @@ registry.register({
         }
 
         if (args.text) {
+            // The old path built a shell string with JSON.stringify(text) for
+            // quoting. JSON.stringify turns a real newline into the two
+            // characters backslash-n, the shell passes those through verbatim,
+            // and xdotool TYPES them: every multi-line write landed in the
+            // editor as one wall of text with literal \n between the lines —
+            // the demo failure Dominic reported over and over (2026-09-17
+            // "that is not markdown, that is a wall of text with backslash n").
+            // argv, not a shell string, and press Return between lines.
+            const text = unescapeTypedText(String(args.text));
             try {
-                run(`xdotool type --clearmodifiers --delay ${delay} -- ${JSON.stringify(args.text)}`);
-                return `Typed: ${args.text.slice(0, 80)}${args.text.length > 80 ? '…' : ''}`;
+                const lines = text.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    if (i > 0) runArgs('xdotool', ['key', '--clearmodifiers', 'Return']);
+                    if (lines[i].length > 0) {
+                        runArgs('xdotool', ['type', '--clearmodifiers', '--delay', String(delay), '--', lines[i]]);
+                    }
+                }
+                const preview = text.slice(0, 80).replace(/\n/g, '⏎');
+                return `Typed ${text.length} chars (${lines.length} line${lines.length === 1 ? '' : 's'}): ${preview}${text.length > 80 ? '…' : ''}`;
             } catch (err: any) {
                 return `Error typing text: ${err.message}`;
             }

@@ -10,7 +10,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
-import { resolveInsideWorkspace, WorkspaceBoundaryError } from './workspace-boundary.js';
+import { resolveInsideWorkspace } from './workspace-boundary.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -87,14 +87,9 @@ async function writeCallbackAsync(tool: string, args: unknown, timeoutMs = 30000
   });
 }
 
-/** Resolve a workspace-relative path, returning a boundary error message on failure. */
-function safeResolve(inputPath: string): { ok: true; path: string } | { ok: false; error: string } {
-  try {
-    return { ok: true, path: resolveInsideWorkspace(inputPath) };
-  } catch (e) {
-    if (e instanceof WorkspaceBoundaryError) return { ok: false, error: e.message };
-    throw e;
-  }
+/** Resolve a path (~ expansion + workspace-relative joining). Never fails. */
+function safeResolve(inputPath: string): { ok: true; path: string } {
+  return { ok: true, path: resolveInsideWorkspace(inputPath) };
 }
 
 /** Map tool names to user-friendly labels */
@@ -150,7 +145,7 @@ server.tool(
   (isMain ? ' As the main group, you can send to any registered group by specifying target_jid.' : ''),
   {
     text: z.string().describe('The message text to send'),
-    files: z.array(z.string()).optional().describe('File paths relative to /workspace/group to attach (e.g. ["report.zip", "attachments/image.png"]). Each file appears as a clickable download link.'),
+    files: z.array(z.string()).optional().describe('Paths relative to your workspace (e.g. ["report.zip", "attachments/image.png"]). Each file appears as a clickable download link.'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
     target_jid: z.string().optional().describe('(Main group only) JID of the chat to send the message to. Defaults to the current group.'),
   },
@@ -186,7 +181,6 @@ server.tool(
           }
         }
         const resolved = safeResolve(candidate);
-        if (resolved.ok === false) continue;
         if (!fs.existsSync(resolved.path)) continue;
         const wsRoot = process.env.WORKSPACE_ROOT
           ? path.resolve(process.env.WORKSPACE_ROOT)
@@ -1258,11 +1252,7 @@ For images, use type "image" and they'll be displayed inline. For other files, u
       }
     }
 
-    // Resolve through the workspace boundary
     const resolved = safeResolve(filePath);
-    if (resolved.ok === false) {
-      return { content: [{ type: 'text' as const, text: `Error: ${resolved.error}` }] };
-    }
     if (!fs.existsSync(resolved.path)) {
       return { content: [{ type: 'text' as const, text: `Error: file not found at ${filePath}. Make sure it exists in the workspace.` }] };
     }
@@ -1281,25 +1271,6 @@ For images, use type "image" and they'll be displayed inline. For other files, u
       timestamp: new Date().toISOString(),
     });
     return { content: [{ type: 'text' as const, text: `File attached: ${relPath}` }] };
-  },
-);
-
-server.tool(
-  'ping_user',
-  'Send a notification ping to a user. The user will see a browser notification with your message. Check available_users.json for user IDs.',
-  {
-    user_id: z.string().describe('User ID to ping'),
-    message: z.string().describe('Notification message'),
-  },
-  async (args) => {
-    writeCallback('ipc', {
-      type: 'ping_user',
-      userId: args.user_id,
-      message: args.message,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
-    return { content: [{ type: 'text' as const, text: `Ping sent to ${args.user_id}.` }] };
   },
 );
 

@@ -20,6 +20,19 @@ registry.register({
         if (/\brm\b.*-[a-zA-Z]*[rf].*(\s+\*|\s+\.\/\*|\s+\/\s*$)/.test(cmd)) {
             return 'Error: Cannot rm -rf the entire filesystem root. Delete specific files by name.';
         }
+        // Ban multi-line shell input: this covers heredocs (cat <<EOF ... EOF),
+        // multi-line inline scripts (python3 -c "import re\n..."), and
+        // multi-line pipe chains. Those bypass the Write/Edit tools, so the file
+        // change never appears in modifiedFiles / the activity log / the audit
+        // trail — observed 2026-08-24: an audit job edited week2.html in place
+        // with a python re.sub inline script, untracked. Single-line commands
+        // (incl. `python3 -c "import x; do()"` and `echo 'a\nb' > f`) stay valid;
+        // the newline test keys on a literal newline in the command string.
+        // Bonus: it also protects the tmux send-keys path below, where an
+        // embedded newline would act as Enter and execute a partial command.
+        if (cmd.includes('\n') || cmd.includes('\r')) {
+            return 'Error: Multi-line commands and heredocs are not allowed. To change file contents, use the Write or Edit tool instead so the change is tracked. To run a longer operation, split it into separate single-line commands.';
+        }
 
         const { execSync, spawnSync } = await import('child_process');
         const label = `Running: ${cmd.slice(0, 80)}`;
@@ -28,11 +41,36 @@ registry.register({
         try { execSync(`tmux has-session -t ${WARDEN_SESSION} 2>/dev/null`, { encoding: 'utf-8' }); useTmux = true; } catch {}
 
         if (!useTmux) {
+            // Never pipe this command's stdio: a `cmd &`-backgrounded child
+            // (e.g. `node /tmp/serve-work.js &`) inherits the pipes, and
+            // execSync/spawnSync wait for the STREAMS to close, not just the
+            // shell — so a legitimate server start blocked the full 120s
+            // timeout and reported failure for a server that actually started
+            // (observed 2026-09-03: 2 min of dead GPU per Bash call). Route
+            // stdout/stderr to a temp file: the shell exits immediately, the
+            // backgrounded child inherits a harmless file, and the tool
+            // returns when the command is actually done.
+            const { spawnSync } = await import('child_process');
+            const outFile = `/tmp/.warden_bash_${process.pid}_${Date.now()}.log`;
+            let fd: number;
+            try { fd = fs.openSync(outFile, 'w'); } catch { fd = 1; }
             try {
-                const result = execSync(cmd, { encoding: 'utf-8', timeout: args.timeout || 120000, cwd: process.cwd(), shell: '/bin/bash' });
-                return result || 'Command executed successfully (no output).';
-            } catch (err: any) {
-                return `Error: ${err.message}`;
+                const result = spawnSync('/bin/bash', ['-c', cmd], {
+                    encoding: 'utf-8',
+                    timeout: args.timeout || 120000,
+                    cwd: process.cwd(),
+                    stdio: ['ignore', fd, fd],
+                });
+                let out = '';
+                try { out = fs.readFileSync(outFile, 'utf-8'); } catch { /* nothing written */ }
+                if (result.error || result.status !== 0) {
+                    const why = result.error?.message || `exit ${result.status}`;
+                    return `Error (${why}):\n${out}` || `Error: ${why}`;
+                }
+                return out || 'Command executed successfully (no output).';
+            } finally {
+                try { if (fd !== 1) fs.closeSync(fd); } catch { /* already closed */ }
+                try { fs.unlinkSync(outFile); } catch { /* temp cleanup best-effort */ }
             }
         }
 

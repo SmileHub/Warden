@@ -9,7 +9,15 @@ export class OllamaProvider implements ChatProvider {
 
     async chat(request: ChatRequest): Promise<ChatResult> {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000); // 5 min hard timeout
+        // Hard backstop on a stuck fetch. This is non-streaming (stream:false),
+        // so Ollama buffers the whole response before replying — a 27b local
+        // model composing a large file in one turn legitimately runs well past
+        // 5 min, and aborting it mid-generation threw away the whole turn and
+        // triggered a retry loop. 20 min covers any realistic single turn while
+        // still catching a genuinely hung socket (without this, a stuck fetch
+        // would hang the sub-agent until the 3h wall-clock — nothing else
+        // interrupts an in-flight provider.chat).
+        const timeout = setTimeout(() => controller.abort(), 20 * 60 * 1000); // 20 min hard timeout
         try {
             const resp = await fetch(`${this.baseUrl}/api/chat`, {
                 method: 'POST',
@@ -57,9 +65,15 @@ export class OllamaProvider implements ChatProvider {
                 ...(request.keep_alive !== undefined ? { keep_alive: request.keep_alive } : {}),
                 ...(request.think !== undefined ? { think: request.think } : {}),
             }),
+            ...(request.signal ? { signal: request.signal } : {}),
         });
         if (!resp.ok) {
-            throw new Error(`Ollama stream error: ${resp.status} ${resp.statusText}`);
+            // Include Ollama's error body like the non-streaming path does — a
+            // bare "400 Bad Request" hides whether it's context overflow
+            // ("input length exceeds context length"), an unsupported image, or
+            // something else. Diagnosis needs the body.
+            const body = await resp.text().catch(() => '');
+            throw new Error(`Ollama stream error: ${resp.status} ${resp.statusText}${body ? ` (${body.slice(0, 200)})` : ''}`);
         }
         const reader = resp.body?.getReader();
         if (!reader) throw new Error('No response body');
@@ -78,8 +92,18 @@ export class OllamaProvider implements ChatProvider {
                         if (chunk.message.content) {
                             finalMessage.content = (finalMessage.content || '') + chunk.message.content;
                         }
+                        // Accumulate thinking (thinking-capable models emit it in
+                        // a separate field per chunk). Surfaced live in Oversight.
+                        if (chunk.message.thinking) {
+                            finalMessage.thinking = (finalMessage.thinking || '') + chunk.message.thinking;
+                        }
                         if (chunk.message.tool_calls) {
-                            finalMessage.tool_calls = chunk.message.tool_calls;
+                            // Accumulate (push), not replace — Ollama can stream
+                            // tool calls across chunks, and replacing would keep only
+                            // the last chunk's calls. Mirrors the orchestrator's own
+                            // streaming parser (index.ts collectedToolCalls.push).
+                            if (!finalMessage.tool_calls) finalMessage.tool_calls = [];
+                            for (const tc of chunk.message.tool_calls) finalMessage.tool_calls.push(tc);
                         }
                         onChunk({
                             message: chunk.message,

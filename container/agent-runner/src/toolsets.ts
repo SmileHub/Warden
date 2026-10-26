@@ -1,13 +1,16 @@
 import { ToolsetDef, registry } from './tool-registry.js';
 
 export const TOOLSETS: Record<string, ToolsetDef> = {
-    file:      { name: 'file',      tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'], tier: 'both' },
+    file:      { name: 'file',      tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'query_image'], tier: 'both' },
     web:       { name: 'web',       tools: ['WebSearch', 'WebFetch'], tier: 'public' },
-    browser:   { name: 'browser',   tools: ['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type',
-                                             'browser_press_key', 'browser_select_option', 'browser_hover',
-                                             'browser_screenshot', 'browser_evaluate', 'browser_wait_for',
-                                             'browser_tabs', 'browser_back', 'browser_current_url'], tier: 'public' },
-    terminal:  { name: 'terminal',  tools: ['Bash', 'desktop_click', 'desktop_type'], tier: 'public' },
+    // `browser`/`browser-vision` toolsets removed with the CDP debug Chrome —
+    // the tools no longer register, and interactive browsing belongs to the
+    // default-app provider.
+    terminal:  { name: 'terminal',  tools: ['Bash', 'open_app', 'desktop_click', 'desktop_type'], tier: 'public' },
+    // Vision capture belongs to VULKAN, not the local seat: the local seat runs
+    // a visionless model (granite4.1:8b), so handing it a screenshot tool buys
+    // a capture nothing can read. Vulkan is the cloud seat, so it is the one
+    // that can actually look at the frame.
     // Desktop vision — desktop_screenshot is the one capture sub-agents need, so
     // they can SEE the screen while driving native apps with desktop_click/type.
     // runSubAgent drains _pendingImages into the next iteration (mirroring the
@@ -15,70 +18,93 @@ export const TOOLSETS: Record<string, ToolsetDef> = {
     // and read_image stay orchestrator-only (in `capture` below).
     'desktop-vision': { name: 'desktop-vision', tools: ['desktop_screenshot'], tier: 'public' },
     capture:   { name: 'capture',   tools: ['desktop_screenshot', 'webcam_capture', 'read_image'], tier: 'public' },
-    projects:  { name: 'projects',  tools: ['create_project','get_project','update_project','archive_project',
-                                             'complete_project','delete_project','list_projects'], tier: 'public' },
-    worktasks: { name: 'worktasks', tools: ['create_work_task','list_work_tasks','update_work_task',
-                                             'delete_work_task'], tier: 'public' },
-    tasks:     { name: 'tasks',     tools: ['schedule_task','list_tasks','pause_task','resume_task',
-                                             'cancel_task','update_task'], tier: 'public' },
-    deliverables: { name: 'deliverables', tools: ['add_deliverable','toggle_deliverable','delete_deliverable'], tier: 'public' },
-    blockers:  { name: 'blockers',  tools: ['add_blocker','delete_blocker','add_priority','delete_priority',
-                                             'update_financials'], tier: 'public' },
-    tracking:  { name: 'tracking',  tools: ['log_time','start_timer','stop_timer'], tier: 'public' },
-    email:     { name: 'email',     tools: ['read_emails','send_email','get_email','refresh_email_cache',
-                                             'get_cached_emails'], tier: 'private' },
-    calendar:  { name: 'calendar',  tools: ['create_calendar_event','list_calendar_events',
-                                             'update_calendar_event','delete_calendar_event'], tier: 'private' },
-    alarms:    { name: 'alarms',    tools: ['create_alarm','list_alarms','update_alarm','delete_alarm'], tier: 'private' },
-    sms:       { name: 'sms',       tools: ['send_sms','read_sms'], tier: 'private' },
-    chat:      { name: 'chat',      tools: ['get_chat_history','ping_user','attach_file','set_user_email','tell_oculus'], tier: 'both' },
-    // admin tools must be listed explicitly — resolveToolset() only walks the
-    // `tools` array + `includes`, NOT the `toolset` property tools are
-    // registered with. post_summary was registered with toolset:'admin' but
-    // must be listed here to be reachable.
-    // (add_digest_note was removed — the digest-notes expiry system is gone;
-    // a time-bound reminder is just a calendar event.)
-    admin:     { name: 'admin',     tools: ['register_group','list_api_keys','api_request','post_summary'], tier: 'public' },
-    documents: { name: 'documents', tools: ['generate_pdf','convert_file'], tier: 'public' },
+    // Iris's merged action tools (2026-09-09 collapse): one tool per noun,
+    // `action` param selects the operation. Admin was dropped from iris
+    // entirely — email, scheduled tasks, calendar, and alarms are the core.
+    tasks:     { name: 'tasks',     tools: ['task'], tier: 'public' },
+    email:     { name: 'email',     tools: ['email'], tier: 'private' },
+    calendar:  { name: 'calendar',  tools: ['calendar'], tier: 'private' },
+    alarms:    { name: 'alarms',    tools: ['alarm'], tier: 'private' },
+    // Projects/work-tasks (re-wired 2026-09-11): the 17 flat tools from the
+    // 2026-09-09 collapse are ONE merged `project` tool (kind + action).
+    projects:  { name: 'projects',  tools: ['project'], tier: 'public' },
+    documents: { name: 'documents', tools: ['generate_pdf','convert_file','generate_image'], tier: 'public' },
     context:   { name: 'context',   tools: ['clear_context'], tier: 'public' },
     fabric:    { name: 'fabric',    tools: ['fabric_pattern'], tier: 'both' },
-    agent:     { name: 'agent',     tools: ['byte','dexter','atlas','vulkan','artemis','iris'], tier: 'public' },
+    agent:     { name: 'agent',     tools: ['atlas','vulkan','artemis','iris','sentry'], tier: 'public' },
 
-    // Security tools — used by Oculus (the single background security agent) to
-    // Oculus awareness tools — look at the live frame + log. Oculus is a SILENT
-    // awareness agent: it records to awareness_log/security_log and can look at the
-    // frame / register a known face, but it has NO send_message, NO alerting, NO
-    // arm/disarm — it never proactively speaks or raises an alert. The user opens
-    // / closes the eyes (toggles eyes_open) and queries Oculus at will.
-    security:     { name: 'security',     tools: ['security_frame','security_caption','save_known_person','security_log','oculus_capture'], tier: 'public' },
-    'security-core': { name: 'security-core', includes: ['security'] },
+    // Sentry — the software-security scanner (reborn 2026-09-08). Bash for the
+    // read-only scan commands (ss, ps, systemctl, crontab — all user-readable,
+    // NO elevated permissions anywhere) + sentry_report to submit the inventory
+    // once. A narrow toolset on purpose: a security scanner gets no
+    // fabric/MCP/web/browser tools.
+    'sentry-core': { name: 'sentry-core', tools: ['Bash', 'sentry_report'], tier: 'public' },
 
-    // awareness_log / awareness_status — the record/query + live-room-state tools
-    // Oculus uses on every event and every orchestrator query. No send_message
-    // here either: Oculus is silent by design.
-    awareness:    { name: 'awareness',    tools: ['awareness_log','awareness_status'], tier: 'public' },
-    'awareness-core': { name: 'awareness-core', includes: ['awareness'] },
-
-    // Byte — work management. `email` is included so Byte can read the inbox
-    // and turn actionable messages into real projects/work tasks when the
-    // user asks in chat.
-    'byte-core':     { name: 'byte-core',     includes: ['projects','worktasks','deliverables','blockers','tracking','admin','email'] },
-    'dexter-core':   { name: 'dexter-core',   includes: ['tasks','calendar'] },
-    // Media (speaker/mic volume + playback) — atlas/vulkan drive the hardware.
+    // Media (speaker/mic volume + playback) — atlas drives the hardware.
+    // (Byte was merged into iris 2026-09-05; its work-management toolsets were
+    // dropped entirely in the 2026-09-09 collapse.)
     media:        { name: 'media',     tools: ['audio_volume','mic_volume','media_control'], tier: 'public' },
-    'atlas-core':    { name: 'atlas-core',    includes: ['web','browser','terminal','documents','admin','desktop-vision','media'] },
-    // Vulkan — the coding specialist. Like atlas-core but adds `file`
-    // (Read/Write/Edit/Glob/Grep) so it can edit source, plus browser +
-    // desktop-vision for webapp/UI testing. Both Atlas and Vulkan merge
-    // active skill tools at spawn, so the data/skills/ library is inherited.
-    'vulkan-core': { name: 'vulkan-core', includes: ['file','web','browser','terminal','documents','admin','desktop-vision','media'] },
+    // YouTube is atlas's alone (2026-09-18, with the orchestrator's web/browser
+    // tools removed): one merged `youtube` tool — find it, open it, confirm it
+    // is actually playing — instead of search → navigate → evaluate by hand.
+    // Deliberately NOT in `media`: `media` is shared with the orchestrator for
+    // pause/skip/volume, and youtube needs the browser, which the orchestrator
+    // no longer has.
+    youtube:      { name: 'youtube',   tools: ['youtube'], tier: 'public' },
+    // Friends — the social mesh over Tailscale (list/dm/broadcast/share/ask/inbox).
+    // Registry tools are auto-visible to Atlas via registry.getAllToolNames, so
+    // this toolset entry is documentation + a stable resolve target, not the
+    // only route to visibility. Included in atlas-core so the seat's own pool
+    // advertises the social surface explicitly.
+    friends:      { name: 'friends',  tools: ['friend_list','friend_dm','friend_broadcast','friend_share','friend_ask','friend_task','friend_inbox','friend_block','friend_profile','friend_collab','friend_patch'], tier: 'public' },
+    // BBS — the shared bulletin board over the friend mesh. The seat reads what
+    // friends are building and posts its own ideas/builds/questions. Included in
+    // atlas-core so the seat's pool advertises the social surface explicitly.
+    bbs:          { name: 'bbs',      tools: ['bbs_read','bbs_post','bbs_file_save','bbs_files','bbs_file_read'], tier: 'public' },
+    // desktop-vision rides WITH terminal (2026-09-19): terminal carries
+    // desktop_click/desktop_type, and a seat that can click and type needs to
+    // see the frame (runSubAgent drains captures into the next iteration) —
+    // without this include the seat drove native apps blind.
+    // 'browser'/'browser-vision' (the CDP debug-Chrome tools) are NOT in the
+    // core: the debug Chrome is retired, so interactive browsing has exactly
+    // one provider — the default app (Settings → Default apps, e.g. the
+    // browser-driving bridge on the real Chrome). WebSearch/WebFetch (plain
+    // HTTP, no browser) stay core.
+    'atlas-core':    { name: 'atlas-core',    includes: ['web','terminal','desktop-vision','documents','media','youtube','friends','bbs'] },
+    // Vulkan — the coding specialist, coding-only. Read/Write/Edit/Glob/Grep
+    // to edit source, Bash to run builds/tests/git. NO browser, NO desktop,
+    // NO screenshot, NO open_app — vulkan edits code and reports done; seeing
+    // the result (opening a page, launching an app, showing a file) is atlas's
+    // job, routed by the orchestrator. Giving vulkan browser/desktop tools let
+    // it "verify" its own subjective edits by screenshot-looping, hitting the
+    // file://-open wall and spinning on http.server workarounds. With those
+    // tools absent the spiral is physically impossible. Both Atlas and Vulkan
+    // merge active skill tools at spawn, so the data/skills/ library is inherited.
+    // 'email' added 2026-09-15 (Dom, "just in case"): vulkan can email Dom a
+    // bug report / .patch directly instead of only reporting via orchestrator.
+    'vulkan-core': { name: 'vulkan-core', tools: ['Read','Write','Edit','Glob','Grep','Bash','email','get_chat_history'], includes: ['capture'] },
     'artemis-core':  { name: 'artemis-core',  tools: ['Read','Grep','Glob','Bash','get_chat_history'] },
-    // Iris (digest compiler) — email (IMAP read_emails, works) + admin
-    // (post_summary, list_api_keys, api_request). Contacts/todos toolsets were
-    // removed entirely (no DB backend, were Radicale-only). Calendar + tasks
-    // come from buildDigestContext (DB) in INPUT (above), not from tools.
-    'iris-core':     { name: 'iris-core',     includes: ['email','admin','calendar'] },
-    'file-core':     { name: 'file-core',     includes: ['file','chat'] },
+    // Artemis's single write: flag a confirmed fine-tunable failure for the
+    // training loop (host store training/loop/flags). Its own toolset so orch —
+    // which carries artemis-core — never gets it, and SUBAGENT_OWNED keeps it
+    // out of the orchestrator's pool.
+    'artemis-flag':  { name: 'artemis-flag',  tools: ['flag_training_error'] },
+    // Iris — single toolcall agent (byte merged in 2026-09-05). 2026-09-09
+    // collapse: 4 merged action tools (email/task/calendar/alarm), one per
+    // noun with an `action` param. Iris's fine-tune is trained on exactly
+    // these four schemas. 2026-09-11: the merged `project` tool (kind+action,
+    // in projects/ above) is deliberately NOT here — no subagent owns it, so
+    // it flows into the orchestrator's own tool pool and the orchestrator
+    // handles projects/work-tasks DIRECTLY (simple CRUD is one tool call;
+    // no delegation, and iris stays in-distribution). Iris is single-shot
+    // (one tool call per delegation); the orchestrator drives any
+    // multi-step flow by calling iris once per step.
+    'iris-core':     { name: 'iris-core',     tools: ['email','task','calendar','alarm'] },
+    // NOTE on registry tags with no entry here ('api'): those tools
+    // reach the model through the orchestrator's own pool (registry.getAllToolNames
+    // minus SUBAGENT_OWNED — see index.ts), never through resolveToolset, so
+    // they need no TOOLSETS definition; adding one would be a toolset nothing
+    // includes. Same reason the merged `project` tool needs no sub-agent entry.
 };
 
 // Register all toolsets
@@ -93,3 +119,36 @@ export function resolveToolset(name: string): string[] {
 export function resolveMultipleToolsets(names: string[]): string[] {
     return registry.resolveMultipleToolsets(names);
 }
+
+// ─── Default apps ───────────────────────────────────────────────────────────
+// A CAPABILITY is a job some tool does — browsing, fetching a page, running a
+// shell command. Warden ships a built-in provider for each (the "good enough to
+// download a real browser" one). An installed MCP server can take that job over
+// via router_state `default_app:<capability>` = 'builtin' | 'mcp:<server>'.
+//
+// The point is substitution, not addition: when a capability is handed to an
+// MCP server the built-in tools are REMOVED, so exactly one provider can do
+// each job. Two tools that both plausibly browse is how a small model ends up
+// hand-driving a page instead of calling the tool that owns the task.
+//
+// Listed as explicit tool names rather than a toolset, because a toolset mixes
+// capabilities: `terminal` holds Bash AND the desktop tools, and handing the
+// shell to an MCP server must not take the desktop away with it.
+// Every name here must exist at EVERY layer that provides the capability:
+// the registry names (delegate toolsets: vulkan/artemis carry Read/Write/…)
+// AND the core builtin skill's lowercase wire names (the seat's file hands —
+// atlas-core has no `file` toolset). A real tool missing from this list is a
+// capability the default-app substitution silently fails to withhold
+// (2026-09-19: read_file survived files → mcp:filesystem and kept answering).
+export const CAPABILITY_BUILTINS: Record<string, string[]> = {
+    // No built-in browser tools exist — the CDP debug-Chrome toolset was
+    // deleted. The capability key STAYS: default-app routing and the
+    // DEFAULT APPS prompt section (music/video → youtube) key off it, and
+    // with no built-ins there is simply nothing to withhold.
+    browser: [],
+    web:     ['WebSearch', 'WebFetch'],
+    files:   ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'read_file', 'write_file', 'list_file'],
+    shell:   ['Bash'],
+    capture: ['desktop_screenshot', 'webcam_capture', 'read_image'],
+};
+export const CAPABILITY_NAMES = Object.keys(CAPABILITY_BUILTINS);

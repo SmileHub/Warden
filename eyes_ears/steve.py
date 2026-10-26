@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Steve — a STANDALONE big-button voice application.
+
+Completely independent of the main voice app: no control server, no shared
+process, no bridge to the main UI. This process owns its own mic (VAD
+record-until-silence), Whisper STT, Warden HTTP round-trip, and TTS playback.
+
+- Horizontal strip, bottom-left, always on top: red TALK on the left
+  (25% the stop sign's size), big yellow STOP SIGN on the right, thin
+  status line under the row.
+- TALK — one click, or 3 taps on the mic — starts the conversation:
+  record until silence → transcribe → POST to Warden /api/messages as a
+  plain message with the Steve prompt block and the remembered facts
+  prepended (wrapped in a <!--hidden--> block: the orchestrator reads it,
+  the chat view never shows it — only his spoken words appear) → poll for
+  the reply → speak it → listen again. Back and forth until the stop sign
+  is pressed (stops everything — recording, waiting, or speaking; voice
+  out), or the conversation ends on its own: he says an end phrase ("that's
+  all for now", "stop listening", "that's enough", "be quiet", "goodbye",
+  or a bare "stop"), or — the one he never remembers — he simply goes
+  quiet, and a sustained run of silent listens means he's done talking.
+  The stop sign flashes the whole time it runs.
+- Audible cues for a blind user: short high beep when listening starts,
+  a falling two-tone cue the instant it stops listening and starts
+  thinking, low beep when the whole exchange finishes, long buzz if it
+  failed (with a spoken reason where one exists — Warden unreachable, no
+  reply in time), and a double chirp when nothing usable was heard.
+
+MEMORIES — this app owns them too (Warden knows nothing about Steve).
+At startup it makes sure they're up to date, all by itself: cached
+facts load instantly, every .md under ~/.claude (memory.md, journal.md,
+all related files) is checked against the last scan — unchanged means
+move straight on; anything changed triggers a full rescan and
+re-classification with local granite 8b via Ollama. Facts new since
+the last scan are filed into the existing MARM memory server (MCP over
+loopback:8001, best-effort) so the agents can recall them too. When
+the memories are current the app — Petal, the companion's name —
+speaks "Petal ready." (he can't read a screen). Facts are injected
+into every turn as spoken context. No brain, no visualization —
+he can't see it.
+
+Run with the eyes_ears venv:
+
+    ./eyes_ears/.venv/bin/python eyes_ears/steve.py [--warden http://127.0.0.1:3200]
+
+Warden URL resolution: --warden, else ~/.config/jarvis/config.yaml →
+warden.base_url, else http://127.0.0.1:3200.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import webview  # pywebview, same engine as the main app
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # reuse the ears.* modules — never the main app itself
+
+from ears.audio import (  # noqa: E402
+    AudioPlayer,
+    AudioRecorder,
+    BeepGenerator,
+    find_device,
+)
+from ears.clap import ClapDetector  # noqa: E402
+from ears.stt import STT  # noqa: E402
+from ears.tts import TTS  # noqa: E402
+
+DEFAULT_WARDEN = "http://127.0.0.1:3200"
+REPLY_TIMEOUT_S = 300  # how long to wait for the orchestrator's reply
+
+# Voice mode also ends on its own — he never remembers the end phrase. The
+# recorder's record_until_silence returns empty ONLY when a whole listening
+# window (no_speech_timeout, 15s) passes with no confirmed speech: it records
+# straight through mid-speech pauses and closes an utterance only on 1s of
+# trailing silence, so a breath between sentences can never produce one. This
+# many empty windows IN A ROW — each right after she finished speaking, since
+# play_bytes returns only when playback is done — means he's done talking and
+# the mode ends with the low beep. One quiet window is just a pause: it only
+# re-arms the listen.
+SILENT_LISTENS_TO_END = 2
+
+# The Steve persona lives HERE — the standalone app owns it completely.
+# Warden itself has zero Steve knowledge (other people run Warden): this
+# block is prepended to every message so the orchestrator converses
+# instead of acting on rambling or nonsensical requests, and replies in
+# a form that works spoken aloud.
+STEVE_PROMPT = """[STEVE MODE]
+This turn is voice input from a blind user (Steve) using a single big-button interface. He rambles, changes topics mid-sentence, and sometimes asks for nonsensical or impossible things. Your reply is spoken aloud.
+
+PERSONA — you are Petal, a warm Northern companion in the Donna Noble mould: kind, a bit cheeky, reassuring. Call him "sweety" naturally now and then — not every sentence. You KNOW him: the ABOUT THE USER block below is what you remember about him and his life — use it in conversation like an old friend would, without listing it back at him.
+
+- Reply conversationally and briefly, in plain short sentences. No lists, no markdown, no emoji — the reply goes through text-to-speech.
+- Do NOT act on vague or rambling requests: no tasks, projects, reminders, jobs, messages, or file changes unless the request is explicit and unambiguous.
+- Petal never operates this computer on his behalf: never open, close, restart, install, or otherwise control any application, window, file, media player, or device — not to fix something, not as an ordinary favour like playing a film or turning something off. If he wants something on the machine controlled, tell him gently that isn't something you can do yourself.
+- If — and only if — he is CLEARLY AND DIRECTLY asking for something technical to be fixed, debugged, or changed (a broken app, a slow tool, a setting, a server): do NOT attempt it — never, no matter how he phrases it. A story, a passing complaint, or background chatter about something being broken, slow, or on the blink is NOT a fix request — just chat about it normally. For a genuine, direct ask: tell him warmly, in your own words, that you can't sort that one out yourself but you've passed it to Dominic and he'll look after it — always leave him something to do meanwhile (chat, read something, look something simple up, or just reassurance Dominic's on it), never a dead end. Then send exactly one email to dom.doss@gmail.com — his words, what he said happened, today's date — and say so OUT LOUD in the same reply (e.g. "I've sent that over to Dominic") so he knows it actually happened; never send it silently. If you already emailed Dominic about this same issue earlier in this conversation, do not send another — just remind him warmly that Dominic already knows.
+- Nonsensical or impossible requests: respond gently and briefly; do not attempt to fulfill them.
+- If the intent is unclear, ask ONE short clarifying question instead of acting.
+- Small talk and stories are fine — engage naturally."""
+
+# Whose machine is this? steve.py is written to run ON Steve's own computer,
+# but it is developed and tested on Dominic's desktop — where the local screen,
+# apps, TV and downloads are NOT his and he is not sitting in front of them.
+# The orchestrator has no way to tell the two deployments apart, so the host
+# fact is stated in every turn. Default is "not his machine": on a test box a
+# wrong assumption is harmless, whereas on his box the line below is simply
+# replaced. Set STEVE_MACHINE=1 in the environment on Steve's computer.
+IS_STEVE_MACHINE = os.environ.get("STEVE_MACHINE", "0").strip().lower() in ("1", "true", "yes")
+HOST_NOTE = (
+    "- THIS COMPUTER IS STEVE'S OWN: the local desktop, screen and speakers are his, "
+    "so anything you put on screen is in front of him — but he is blind, so it is the "
+    "spoken reply that reaches him, never the screen."
+    if IS_STEVE_MACHINE else
+    "- THIS IS NOT STEVE'S COMPUTER: it is Dominic's desktop, where this app is being "
+    "tested. Steve is not at this machine. He cannot see or hear anything on this screen "
+    "— only your spoken reply reaches him. Nothing here is his: the apps, windows, files, "
+    "TV, media player and downloads on this box belong to Dominic. His own TV, media and "
+    "downloads are on his own equipment, which is NOT reachable from here. Never open, "
+    "play, download or change anything locally as if he could see or use it, and never "
+    "tell him something is playing or downloading for him when it is happening here."
+)
+STEVE_PROMPT = STEVE_PROMPT + "\n" + HOST_NOTE
+
+# Backstop for the fix-request rule above: when his words look like a technical
+# fix/change request, _send appends a hard-rule block so the curation survives
+# even when the general prompt block has scrolled far back in context.
+#
+# An issue-word alone used to be enough to trigger this ("slow", "install",
+# "restart", "broken" etc. are all common, harmless words in an ordinary
+# ramble or story), which is why Petal was firing off bug-report emails
+# unprompted — he'd mention his telly was slow and she'd email Dominic about
+# it. Now it only fires when an issue word AND an explicit ask/imperative
+# shape are BOTH present in the same utterance, so a passing complaint or a
+# story never matches on its own.
+BUG_REPORT_EMAIL = "dom.doss@gmail.com"
+# 30 minutes: a repeat mention of the same kind of problem within this
+# window gets the "already reported" block instead of a fresh email — he
+# tends to bring the same grumble up more than once in a conversation.
+FIX_REPORT_COOLDOWN_S = 1800
+_FIX_ISSUE_RE = re.compile(
+    r"\b(fix|repai?r|broken|broke|bug|debug|error|crash(?:e[ds]?|ing)?|"
+    r"doesn'?t\s+(?:work|load|open|respond|start)|not\s+working|stopped\s+working|"
+    r"won'?t\s+(?:work|open|start|stop)|reinstall|uninstall|update|upgrade|reboot|restart|"
+    r"frozen|hang(?:s|ed|ing)?|slow|taking\s+(?:forever|ages|a\s+long\s+time))\b",
+    re.I,
+)
+_ASK_RE = re.compile(
+    r"\b(?:can|could|would|will)\s+you\b|\bplease\b|\bhelp\s+me\b|"
+    r"\bneed\s+(?:you\s+)?to\b|\b(?:can|could)\s+(?:someone|anyone)\b|"
+    r"^\s*(?:fix|sort|restart|reboot|repai?r|reinstall|update)\b|"
+    r"\b(?:fix|sort\s+out|restart|reboot|repai?r)\s+(?:it|this|that|the\s+\w+)\b",
+    re.I,
+)
+
+
+def is_fix_request(text: str) -> bool:
+    """A genuine ask for a technical fix, not just a passing mention. An
+    issue word by itself ("the telly's been slow lately") is ordinary
+    chatter; it only counts once there's also an explicit request or
+    imperative shape in the same utterance."""
+    return bool(_FIX_ISSUE_RE.search(text) and _ASK_RE.search(text))
+
+
+def fix_request_block(text: str) -> str:
+    """The appended hard rule for a detected fix request. Never blocks the
+    send — it only steers the orchestrator to refuse-and-report."""
+    return (
+        "TECHNICAL FIX REQUEST DETECTED in his words above — he is CLEARLY AND DIRECTLY "
+        "asking for something to be fixed, not just describing or complaining about it. "
+        "HARD RULE: do not attempt any fix, debug step, investigation, setting change, "
+        "install, update, or file change for it — no exceptions, however he phrased it, "
+        "and never open, close, restart, or otherwise operate anything on this machine. "
+        "Your entire reply to him: tell him warmly, in your own words, that you can't sort "
+        "that one out yourself but you've passed it to Dominic, and always leave him "
+        "something to do meanwhile — one simple thing Petal can actually do (chat, read "
+        "something out, look something simple up) or just reassurance Dominic's on it; "
+        "never a dead end. Then send exactly one email "
+        f"to {BUG_REPORT_EMAIL} with subject \"Bug report: <the thing>\", containing his "
+        "request in his words, what he said happened, and today's date. State OUT LOUD in "
+        "the same reply, in plain words, that you've emailed Dominic about it (for example "
+        "\"I've sent that over to Dominic\") — never send it silently; that is the only way "
+        "he can know it happened. Do not investigate on this machine; the email itself is "
+        "the handoff to Dominic. If his words turn out to be small talk or a story rather "
+        "than a direct request (e.g. he was talking about a slow movie), ignore this block "
+        "entirely and just chat."
+    )
+
+
+def fix_repeat_block() -> str:
+    """Appended instead of fix_request_block() when the same kind of fix
+    request already triggered an email recently this session (see
+    FIX_REPORT_COOLDOWN_S) — stops him bringing the same broken thing up
+    twice from firing a fresh email each time."""
+    return (
+        "TECHNICAL FIX REQUEST DETECTED again — but a bug report about this kind of issue "
+        "was already emailed to Dominic very recently in this conversation. Do NOT send "
+        "another email. Just tell him warmly that Dominic already knows and is on it, and "
+        "do not attempt any fix yourself."
+    )
+
+# ---------- Steve's own memories (scanned from ~/.claude, local 8b) ----------
+OLLAMA_URL = "http://127.0.0.1:11434"
+MEM_MODEL = "granite4.1:8b"  # local granite classifies the scan; the chat seat is the qwen one
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+MEM_CACHE = os.path.expanduser("~/.local/state/steve/last_scan")
+MARM_URL = os.environ.get("MARM_URL", "http://127.0.0.1:8001/mcp")
+MEM_MAX_FILES = 300            # .md files per scan
+MEM_MAX_FILE_BYTES = 200_000   # skip huge files
+MEM_LINES_PER_FILE = 6         # body lines sampled per file (frontmatter desc first)
+MEM_LINE_TRUNC = 200
+MEM_BATCH_CHARS = 9_000        # classifier batch size
+MEM_FACTS_MAX = 400
+MEM_RECALL_LIMIT = 12          # memories kept per turn, after the dump filter
+MEM_RECALL_FETCH = 24          # over-fetch — document dumps get dropped below
+
+MEM_SYSTEM = (
+    "Role: you extract lasting facts about the user from their personal memory files.\n\n"
+    "Input: lines from memory files — each line starts with its source file path.\n\n"
+    "Rules:\n"
+    "- A fact: people, family, routines, accounts, health, preferences, projects, environment\n"
+    "- One short sentence per fact, plain text\n"
+    "- Source: the file path at the start of the line the fact came from, verbatim\n"
+    "- Keep a fact only if it stays true over months\n"
+    'Output: ONLY the JSON {"facts": [{"source": "path", "fact": "sentence"}, ...]} — no other text.'
+)
+# Plan-narrative the 8b keeps and a memory is not (verified against its
+# dry-run output: "will be built", "wants Mercury to run", "will rely on").
+FUTURE_RE = re.compile(
+    r"\b(will\s+(?:be|use|rely|run|go|move|launch|land)|plans?\s+to|planning\s+to|going\s+to|wants?\s+to)\b",
+    re.I,
+)
+MEM_FORMAT = {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"source": {"type": "string"}, "fact": {"type": "string"}},
+        "required": ["source", "fact"],
+    }}},
+    "required": ["facts"],
+}
+
+
+def _ollama_chat(body: dict, timeout: int = 180) -> dict:
+    req = urllib.request.Request(
+        OLLAMA_URL + "/api/chat", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+
+def ollama_unload_all() -> None:
+    """Free the GPU for the scan — every loaded model out of VRAM first."""
+    try:
+        with urllib.request.urlopen(OLLAMA_URL + "/api/ps", timeout=5) as resp:
+            models = json.loads(resp.read().decode()).get("models") or []
+        for m in models:
+            req = urllib.request.Request(
+                OLLAMA_URL + "/api/generate",
+                data=json.dumps({"model": m.get("name"), "keep_alive": 0}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=30).read()
+    except Exception as e:
+        print(f"[steve] model unload skipped: {e}", file=sys.stderr)
+
+
+def scan_claude_lines(files: list[str]) -> list[str]:
+    """The given files — one 'path: line' per interesting line, bounded."""
+    lines: list[str] = []
+    for p in files:
+        try:
+            if os.path.getsize(p) > MEM_MAX_FILE_BYTES:
+                continue
+            with open(p, encoding="utf-8", errors="replace") as f:
+                md = f.read()
+        except OSError:
+            continue
+        rel = os.path.relpath(p, CLAUDE_DIR)
+        desc = (re.search(r'^description:\s*"?(.+?)"?\s*$', md, re.M) or [None, ""])[1].strip()
+        out = [f"{rel}: {desc}"] if desc else []
+        body = re.sub(r"^---[\s\S]*?---", "", md)
+        for raw in body.splitlines():
+            t = raw.strip().lstrip("-*# ").strip()
+            if not t or len(t) < 12:
+                continue
+            out.append(f"{rel}: {t[:MEM_LINE_TRUNC]}")
+            if len(out) > MEM_LINES_PER_FILE:
+                break
+        lines.extend(out)
+    return lines
+
+
+def classify_lines(lines: list[str]) -> list[str]:
+    """Durable facts via local granite 8b, batched under the model's context."""
+    facts: list[str] = []
+    batch: list[str] = []
+    chars = 0
+    for ln in lines:
+        if len(batch) >= 80 or chars + len(ln) > MEM_BATCH_CHARS:
+            facts.extend(_classify_chunk(batch))
+            batch, chars = [], 0
+        batch.append(ln)
+        chars += len(ln)
+    if batch:
+        facts.extend(_classify_chunk(batch))
+    # Dedup by normalized wording, and drop plan-narrative — the 8b keeps
+    # future-tense chatter ("will be built", "wants to run") that a memory
+    # is not. The 30b pipeline spends a model-judge pass on this; the .claude
+    # source is clean enough that a mechanical filter does the job.
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in facts:
+        f = f.strip()[:300]
+        key = re.sub(r"[^a-z0-9]+", " ", f.lower()).strip()
+        if not key or key in seen:
+            continue
+        if FUTURE_RE.search(f):
+            continue
+        seen.add(key)
+        out.append(f)
+        if len(out) >= MEM_FACTS_MAX:
+            break
+    return out
+
+
+def _classify_chunk(chunk: list[str]) -> list[str]:
+    try:
+        data = _ollama_chat({
+            "model": MEM_MODEL, "stream": False, "format": MEM_FORMAT,
+            "messages": [
+                {"role": "system", "content": MEM_SYSTEM},
+                {"role": "user", "content": "Lines:\n" + "\n".join(chunk)},
+            ],
+            "options": {"temperature": 0},  # granite guidance: temp 0 for extraction
+        })
+        content = (data.get("message") or {}).get("content") or ""
+        s, e = content.find("{"), content.rfind("}")
+        if s == -1 or e <= s:
+            return []
+        items = json.loads(content[s:e + 1]).get("facts") or []
+        # Each fact carries its source file path — the context reference the
+        # memory keeps in MARM: "(path) fact".
+        out = []
+        for f in items:
+            if not isinstance(f, dict):
+                continue
+            fact = str(f.get("fact") or "").strip()
+            src = str(f.get("source") or "").strip()
+            if fact:
+                out.append(f"({src}) {fact}" if src else fact)
+        return out
+    except Exception as e:
+        print(f"[steve] memory classify failed: {e}", file=sys.stderr)
+        return []
+
+
+def _marm_call(session, name: str, args: dict, timeout: int = 10) -> dict | None:
+    r, _ = _marm_rpc(session, {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": name, "arguments": args},
+    }, timeout=timeout)
+    if not r or not r.get("result"):
+        return None
+    blocks = [c.get("text") for c in (r["result"].get("content") or []) if isinstance(c, dict)]
+    for b in reversed(blocks):
+        s = (b or "").find("{")
+        if s != -1:
+            e = b.rfind("}")
+            if e > s:
+                try:
+                    return json.loads(b[s:e + 1])
+                except ValueError:
+                    continue
+    return None
+
+
+def marm_connect():
+    """Open the MCP connection to MARM (initialize + the courtesy
+    notification). Every memory operation goes through this path."""
+    init, session = _marm_rpc(None, {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "steve-app", "version": "1.0.0"},
+        },
+    })
+    if init is None:
+        raise RuntimeError("MARM initialize failed (not running?)")
+    _marm_rpc(session, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    return session
+
+
+def marm_recall_about(text: str) -> str:
+    """What MARM remembers that's relevant to what he just said. The bank
+    also holds bulk document dumps ('ingest ...' sessions — repo READMEs,
+    project docs, demo files) and Warden's own system docs: those are the
+    databank, not memories about him, so they never reach Petal's prompt —
+    the block is built from the results, not MARM's context_summary.
+    Generous timeout: during a scan the filing loop shares MARM, and this
+    just waits its turn."""
+    r = _marm_call(marm_connect(), "marm_smart_recall", {
+        "query": text, "search_all": True, "limit": MEM_RECALL_FETCH, "detail": 1,
+    }, timeout=60)
+    hits = [
+        h for h in (r or {}).get("results") or []
+        if not str(h.get("session_name") or "").startswith("ingest ")
+        and str(h.get("session_name") or "") not in
+        ("warden-system-knowledge", "marm_system")
+    ]
+    lines = [
+        f"[{str(h.get('context_type') or '').upper()}] {h.get('content')}"
+        for h in hits[:MEM_RECALL_LIMIT]
+    ]
+    return "\n".join(lines).strip()
+
+
+def marm_file_new(facts: list[str]) -> int:
+    """File facts into MARM as plain entries — MARM's own models classify
+    them. Dedup is MARM's own recall: a fact whose text comes back as the
+    top hit is already filed. Returns how many were filed."""
+    session = marm_connect()
+    filed = 0
+    for f in facts:
+        r = _marm_call(session, "marm_smart_recall", {
+            "query": f, "search_all": True, "limit": 1, "detail": 3,
+            "exact_mode": "exact",  # FTS lane: verbatim presence, no query embedding
+        }, timeout=60)
+        top = ((r or {}).get("results") or [{}])[0]
+        if str(top.get("content") or "").strip() == f:
+            continue
+        _marm_call(session, "marm_log_entry", {"entry": f}, timeout=60)
+        filed += 1
+    return filed
+
+
+def read_scan_ts() -> float:
+    try:
+        with open(MEM_CACHE, encoding="utf-8") as f:
+            return float(f.read().strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def write_scan_ts() -> None:
+    os.makedirs(os.path.dirname(MEM_CACHE), exist_ok=True)
+    with open(MEM_CACHE, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def _marm_rpc(session, body, timeout=10):
+    """One MCP-over-HTTP call against MARM (same protocol Warden's memory
+    writeback uses). Returns (parsed-json-or-None, session-id)."""
+    req = urllib.request.Request(
+        MARM_URL, data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **({"mcp-session-id": session} if session else {}),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        new_session = resp.headers.get("mcp-session-id")
+        ctype = resp.headers.get("content-type") or ""
+        text = resp.read().decode()
+    if "text/event-stream" in ctype:
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                text = line[5:].strip()
+                break
+    s = text.find("{")
+    if s == -1:
+        return None, new_session
+    return json.loads(text[s:text.rfind("}") + 1]), new_session
+
+
+def claude_files_since(ts: float) -> list[str]:
+    """.md files under ~/.claude changed since the last scan — mtimes only,
+    no reading. Empty list = memories fresh, instant startup. The scan is
+    incremental: one edited file costs one file, not a full pass."""
+    changed: list[str] = []
+    if not os.path.isdir(CLAUDE_DIR):
+        return changed
+    for root, dirs, names in os.walk(CLAUDE_DIR):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+        for n in names:
+            if not n.endswith(".md"):
+                continue
+            p = os.path.join(root, n)
+            try:
+                if os.path.getmtime(p) > ts:
+                    changed.append(p)
+            except OSError:
+                pass
+    return sorted(changed)[:MEM_MAX_FILES]
+
+
+def memory_startup_check(set_note, on_ready) -> None:
+    """Boot sequence, all by itself: re-extract only the memory files that
+    changed since the last scan, file their new facts into MARM (recall
+    dedup skips what's already filed); then the app announces it's ready
+    (spoken — the user is blind)."""
+    try:
+        changed = claude_files_since(read_scan_ts())
+        if changed:
+            set_note("Updating memories…")
+            ollama_unload_all()
+            fresh = classify_lines(scan_claude_lines(changed))
+            if fresh:
+                filed = marm_file_new(fresh)  # not best-effort itself (MARM down raises)
+                print(f"[steve] filed {filed} new facts into MARM", file=sys.stderr)
+            write_scan_ts()
+    except Exception as e:
+        # marm_file_new/_marm_rpc raise on a network failure (MARM not
+        # running, etc.) — this whole scan is documented as best-effort, but
+        # an uncaught exception here used to kill this background thread
+        # before on_ready() ran, so he'd wait forever with no "Petal ready."
+        # and no error either. Log it and still announce ready.
+        print(f"[steve] memory startup scan failed: {e}", file=sys.stderr)
+    set_note("")
+    on_ready()
+
+
+def warden_url_from_config() -> str:
+    """Config file is optional; only the URL key is read (PyYAML not assumed)."""
+    path = os.path.expanduser("~/.config/jarvis/config.yaml")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return ""
+    # Minimal scalar scan — no yaml dependency required.
+    section = ""
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")) and line.endswith(":"):
+            section = line[:-1].strip()
+        elif line.startswith((" ", "\t")) and section == "warden":
+            key, _, val = line.strip().partition(":")
+            if key.strip() == "base_url":
+                return val.strip().strip("\"'")
+    return ""
+
+
+# Spoken end signals, checked on every utterance (not just a silence
+# fallback) — "stop listening" was reported as not working at all: it was
+# never checked for, only the one fixed phrase below was. A blind user has
+# no other reliable way to end the loop than his own voice — the STOP
+# button needs sight or luck to find on a strip he can't see.
+VOICE_END_PHRASES = (
+    "thats all for now", "that is all for now",
+    "stop listening", "thats enough", "that is enough",
+    "be quiet", "goodbye", "bye now", "bye bye",
+)
+
+
+def voice_mode_done(text: str) -> bool:
+    """Any casing/punctuation of the phrases above ends voice mode at once.
+    A bare "stop" also ends it, but only for a short utterance (<=2 words)
+    — "stop" said in passing inside a longer ramble (e.g. a story) must not
+    cut the whole conversation out from under him."""
+    norm = re.sub(r"[^a-z0-9]+", " ", text.lower().replace("'", "")).strip()
+    if not norm:
+        return False
+    if any(p in norm for p in VOICE_END_PHRASES):
+        return True
+    words = norm.split()
+    return len(words) <= 2 and "stop" in words
+
+
+class SteveApp:
+    """One worker thread per turn; STOP cancels at any stage."""
+
+    def __init__(self, warden_url: str) -> None:
+        in_dev = find_device("input")
+        self.recorder = AudioRecorder(
+            sample_rate=48000,
+            channels=1,
+            silence_timeout=1.0,
+            max_duration=60.0,
+            aggressiveness=2,
+            input_device_index=in_dev,
+        )
+        self.player = AudioPlayer(
+            output_device=find_device("output"),
+            sample_rate=48000,
+        )
+        # Built before the STT/TTS load below, which is the riskiest part of
+        # startup (model files, GPU/driver, downloads) — so a load failure
+        # still has something to beep with. Blind user: the beeps ARE the
+        # feedback. High = go, low = done, long buzz = something failed.
+        self.beeps = BeepGenerator(sample_rate=48000)
+        # Same device split as the main app: Whisper on CPU keeps the GPU free
+        # for TTS (loading both on one GPU segfaults — see ears/main.py).
+        try:
+            self.stt = STT(model="base", device="cpu")
+            self.stt.warmup()  # load Whisper now, not during the first turn
+            self.tts = TTS(engine="kokoro")
+            warm = getattr(self.tts._impl, "warmup", None)
+            if warm:
+                warm()
+        except Exception as e:
+            # An uncaught exception here used to propagate straight out of
+            # main() with nothing spoken — a total silent crash is the worst
+            # outcome for a blind user, who'd have no way to know the app
+            # never came up. He can't fix this himself either way, but three
+            # buzzes at least tell him something is badly wrong instead of
+            # dead silence, before the process exits and Dominic sees the
+            # traceback in the logs.
+            print(f"[steve] startup failed loading STT/TTS: {e}", file=sys.stderr)
+            for _ in range(3):
+                try:
+                    self.player.play_bytes(self.beeps.error_beep())
+                    time.sleep(0.15)
+                except Exception:
+                    break
+            raise
+        self.player.play_bytes(self.beeps.start_beep())  # "online" cue
+
+        self.warden = warden_url.rstrip("/")
+        self._lock = threading.Lock()
+        self._worker = None  # live turn thread, None when idle
+        self._stop = threading.Event()
+        # True from _send() until the reply lands — STOP uses it to know
+        # whether a Warden turn is actually in flight and must be stopped.
+        self._awaiting_reply = False
+        # 0.0 = never reported yet this run — see FIX_REPORT_COOLDOWN_S.
+        self._last_fix_report_ts = 0.0
+        # 3 taps on the mic wake the conversation — same as the TALK button.
+        # Paused while a conversation runs (the recorder owns the mic then).
+        self.claps = ClapDetector(
+            on_double_clap=lambda: self.voice_start(),
+            can_fire=lambda: self._worker is None,
+            input_device=in_dev,
+            taps=3,
+        )
+        self.claps.start()
+        self._note = ""  # status-strip text while the startup scan runs
+        threading.Thread(
+            target=memory_startup_check,
+            args=(self._set_note, self._announce_ready),
+            daemon=True,
+        ).start()
+
+    def _set_note(self, note: str) -> None:
+        with self._lock:
+            self._note = note
+
+    def _announce_ready(self) -> None:
+        """Memories current — the app tells him so, out loud. Petal is HER
+        name — she announces herself, she never calls him petal."""
+        try:
+            audio = self.tts.synthesize("Petal ready.")
+            if audio:
+                self.player.play_bytes(audio)
+                return
+        except Exception:
+            pass
+        try:
+            self.player.play_bytes(self.beeps.stop_beep())
+        except Exception:
+            pass
+
+    def _speak_fail(self, text: str) -> None:
+        """Spoken explanation for a turn failure. A bare buzz tells him
+        something broke but never why — he can't see a status line, so the
+        reason has to be said out loud or it doesn't exist for him. Falls
+        back to the long buzz if TTS itself can't produce audio."""
+        try:
+            audio = self.tts.synthesize(text)
+            if audio:
+                self.player.play_bytes(audio)
+                return
+        except Exception:
+            pass
+        try:
+            self.player.play_bytes(self.beeps.error_beep())
+        except Exception:
+            pass
+
+    def _no_speech_cue(self) -> None:
+        """Distinct double-chirp for 'didn't catch that, go again' — must
+        read differently from the single start_beep ('go ahead, I'm
+        listening') or he can't tell the two apart by ear."""
+        try:
+            chirp = self.beeps.generate_beep(660, 0.05, 0.10, fade=True)
+            self.player.play_bytes(chirp)
+            time.sleep(0.05)
+            self.player.play_bytes(chirp)
+        except Exception:
+            pass
+
+    def _thinking_cue(self) -> None:
+        """Two-tone falling cue for 'mic's closed, your turn landed, I'm
+        thinking now' — the moment recording stops. Needed alongside the
+        single-tone start_beep (listening opens) so the open/close pair is
+        audibly distinct from each other and from _no_speech_cue's double
+        same-pitch chirp."""
+        try:
+            self.player.play_bytes(self.beeps.generate_beep(500, 0.07, 0.12, fade=True))
+            self.player.play_bytes(self.beeps.generate_beep(340, 0.09, 0.12, fade=True))
+        except Exception:
+            pass
+
+    # ----- Warden HTTP (urllib — no main-app client) -----
+    def _http(self, method: str, path: str, body: dict | None = None, timeout: int = 10):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            self.warden + path, data=data, method=method,
+            headers={"Content-Type": "application/json"} if data else {},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode() or "{}")
+
+    def _send(self, text: str) -> str:
+        """POST the turn as a plain owner message — the prompt block and what
+        MARM recalls about him ride in the message text, so Warden needs no
+        Steve handling. The block is wrapped in <!--hidden--> markers: the
+        orchestrator reads the full text, the chat view strips the block and
+        shows only his spoken words. Returns the stored message id (an
+        opaque string)."""
+        parts = ["<!--hidden-->", STEVE_PROMPT]
+        if is_fix_request(text):
+            now = time.time()
+            if now - self._last_fix_report_ts < FIX_REPORT_COOLDOWN_S:
+                parts.append(fix_repeat_block())
+            else:
+                parts.append(fix_request_block(text))
+                self._last_fix_report_ts = now
+        about = marm_recall_about(text)
+        if about:
+            parts.append("ABOUT THE USER — what you remember about him:\n" + about)
+        parts.append("He says:\n<!--/hidden-->")
+        parts.append(text)
+        resp = self._http("POST", "/api/messages", {"text": "\n\n".join(parts)})
+        return str(resp.get("id") or "")
+
+    def _await_reply(self, my_id: str) -> str | None:
+        """Poll history for the first bot message after ours — found by id
+        position in the returned list, so any id format works."""
+        deadline = time.time() + REPLY_TIMEOUT_S
+        while time.time() < deadline and not self._stop.is_set():
+            try:
+                resp = self._http("GET", "/api/messages?limit=30", timeout=5)
+                msgs = resp.get("messages", [])
+                start = -1
+                for i, m in enumerate(msgs):
+                    if str(m.get("id")) == my_id:
+                        start = i
+                        break
+                if start >= 0:
+                    for m in msgs[start + 1:]:
+                        if m.get("is_bot_message"):
+                            return str(m.get("content") or "").strip() or None
+            except (urllib.error.URLError, OSError, ValueError):
+                pass  # transient — keep polling
+            time.sleep(2)
+        return None
+
+    # ----- Turn worker -----
+    def _voice_loop(self) -> None:
+        """Voice mode: back and forth — listen, send, speak the reply —
+        until the stop sign is pressed, he says 'that's all for now', or
+        he goes quiet: he's done speaking when the mic hears nothing for
+        SILENT_LISTENS_TO_END listening windows in a row. The phrase alone
+        used to be the only end signal — he never remembered to say it."""
+        failed = False
+        silent = 0  # consecutive listening windows with no speech at all
+        try:
+            self.claps.pause()  # recorder owns the mic for the whole loop
+            while not self._stop.is_set():
+                self.player.play_bytes(self.beeps.start_beep())
+                wav = self.recorder.record_until_silence()
+                if self._stop.is_set():
+                    return
+                if not wav:
+                    # A whole window (~15s) with no confirmed speech — he's
+                    # being quiet, not pausing mid-sentence (the VAD records
+                    # through those and only closes a turn on 1s of trailing
+                    # silence, so a pause inside an utterance never lands
+                    # here). A run of these ends the mode; one only re-arms
+                    # the listen.
+                    silent += 1
+                    if silent >= SILENT_LISTENS_TO_END:
+                        break  # done speaking — hand the mic back
+                    self._no_speech_cue()  # heard nothing — audibly distinct from "go ahead"
+                    continue
+                silent = 0
+                self._thinking_cue()  # mic just closed — his turn landed, now she's thinking
+                text = (self.stt.transcribe(wav) or "").strip()
+                if self._stop.is_set():
+                    return
+                if not text:
+                    self._no_speech_cue()  # VAD heard speech but Whisper got nothing usable
+                    continue  # nothing said — listen again
+                if voice_mode_done(text):
+                    break
+                self._awaiting_reply = True  # a Warden turn is in flight
+                try:
+                    my_id = self._send(text)
+                except Exception as e:
+                    # Warden (or MARM, which _send also calls) unreachable —
+                    # a bare buzz here used to be all he got, with no way to
+                    # know why. Say so; TTS itself needs no network.
+                    self._awaiting_reply = False
+                    print(f"[steve] send failed: {e}", file=sys.stderr)
+                    if not self._stop.is_set():
+                        self._speak_fail("Sorry sweety, I can't get through right now. Try again in a bit.")
+                    failed = True
+                    break
+                if self._stop.is_set():
+                    # STOP fired while the message was still in flight — the
+                    # turn starts after it, so kill it now that it exists.
+                    self._kill_warden_turn()
+                    return
+                reply = self._await_reply(my_id)
+                self._awaiting_reply = False
+                if self._stop.is_set():
+                    return
+                if not reply:
+                    if not self._stop.is_set():
+                        self._speak_fail("Sorry sweety, that's taking too long. I didn't hear back.")
+                    failed = True  # asked, but no answer came back
+                    break
+                audio = self.tts.synthesize(reply)
+                if self._stop.is_set():
+                    return
+                if not audio:
+                    # TTS produced nothing for the reply — count the turn
+                    # as done (error beep below) instead of looping on a
+                    # voice that will never come. Synthesis/playback errors
+                    # raise and take the same exit via the except below.
+                    failed = True
+                    break
+                self.player.play_bytes(audio)
+                # play_bytes blocks until playback really finishes (or STOP
+                # aborts it) — she is done speaking here, and the loop goes
+                # back to listening with the silence counter at zero.
+        except Exception as e:
+            failed = True
+            print(f"[steve] voice mode failed: {e}", file=sys.stderr)
+        finally:
+            self._finish_turn(failed)
+            self.claps.resume()
+
+    def _finish_turn(self, failed: bool) -> None:
+        self._awaiting_reply = False  # belt-and-braces: never leave it stuck
+        try:
+            if failed and not self._stop.is_set():
+                self.player.play_bytes(self.beeps.error_beep())
+            elif not self._stop.is_set():
+                self.player.play_bytes(self.beeps.stop_beep())
+        except Exception:
+            pass
+        with self._lock:
+            self._worker = None
+
+    # ----- pywebview JS bridge -----
+    def voice_start(self) -> str:
+        with self._lock:
+            if self._worker is not None:
+                return json.dumps({"ok": True, "busy": True})
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._voice_loop, daemon=True)
+            self._worker.start()
+        return json.dumps({"ok": True, "busy": True})
+
+    def _kill_warden_turn(self) -> None:
+        """Stop the Warden turn this conversation started — before this,
+        STOP only silenced the app while the orchestrator kept burning until
+        the 5-minute reply timeout. hard=true (SIGKILL, same as the "stop"
+        panic word): the button has to actually stop it now; the next voice
+        message pays a few seconds of runner cold boot for that certainty.
+        Callers must only fire this when a turn is in flight — a stop while
+        idle would drop a stray interrupt file that kills the NEXT turn."""
+        try:
+            self._http(
+                "POST", "/api/chat/stop",
+                {"jid": "web:dashboard", "hard": True},
+                timeout=5,
+            )
+        except Exception:
+            pass  # warden unreachable — local cancels already happened
+
+    def stop(self) -> str:
+        self._stop.set()
+        try:
+            self.recorder.cancel()
+        except Exception:
+            pass
+        try:
+            self.player.cancel()
+        except Exception:
+            pass
+        if self._awaiting_reply:
+            self._kill_warden_turn()
+        return json.dumps({"ok": True})
+
+    def status(self) -> str:
+        busy = self._worker is not None and self._worker.is_alive()
+        with self._lock:
+            note = self._note
+        try:
+            self._http("GET", "/api/messages?limit=1", timeout=3)
+            ok = True
+        except Exception:
+            ok = False
+        return json.dumps({"ok": ok, "busy": busy, "note": note})
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Steve — standalone big-button voice app")
+    ap.add_argument("--warden", default="", help="Warden base URL (default: config warden.base_url)")
+    args = ap.parse_args()
+
+    url = args.warden or warden_url_from_config() or DEFAULT_WARDEN
+
+    app = SteveApp(url)
+    scr = webview.screens[0]  # property, not a call — park bottom-left, on top
+    window = webview.create_window(
+        "Steve",
+        os.path.join(HERE, "ui", "ptt.html"),
+        js_api=app,
+        width=880, height=200,  # horizontal strip: TALK | VOICE | STOP in a row
+        x=scr.x, y=scr.y + scr.height - 200,
+        on_top=True,  # always visible
+        resizable=True,
+        background_color="#050508",
+    )
+
+    def _on_closing() -> None:
+        # He has no visual confirmation the window is going away — a short
+        # tone at least tells him the app is really closing, not just gone
+        # unresponsive. should_lock=True on this pywebview event runs it
+        # synchronously, so the beep plays before the window is torn down.
+        try:
+            app.player.play_bytes(app.beeps.stop_beep())
+        except Exception:
+            pass
+
+    window.events.closing += _on_closing
+    webview.start()
+
+
+if __name__ == "__main__":
+    main()

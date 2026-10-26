@@ -4,7 +4,6 @@ import path from 'path';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE, TRIGGER_PATTERN, WORKSPACE_ROOT } from './config.js';
 import {
-  deleteTask,
   getDueTasks,
   getTaskById,
   getWorkTasks,
@@ -25,15 +24,54 @@ import { ScheduledTask } from './types.js';
  *
  * Co-authored-by: @community-pr-601
  */
+/**
+ * Parse a relative-duration schedule_value the HOST computes against now, so
+ * the model never does timestamp arithmetic. Granite (iris) was shifting
+ * digits between hour and minute — "2 minutes" from 11:10 → 13:12, not
+ * 11:12 — and its "time-tool check" was a no-op (same source/target TZ) that
+ * rubber-stamped the wrong value. With a duration, the model just transcribes
+ * "2 minutes" → "PT2M"; the host adds it to Date.now().
+ *
+ * Accepted forms:
+ *   - ISO-8601 duration: "PT2M", "PT1H30M", "P1D", "PT45S" (and combinations)
+ *   - "+<ms>": "+120000" (same convention as the `interval` type)
+ * Returns the duration in ms, or null if `value` is an absolute timestamp.
+ */
+export function parseRelativeDuration(value: string): number | null {
+  const v = String(value ?? '').trim();
+  if (v.startsWith('+')) {
+    const ms = parseInt(v.slice(1), 10);
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  const m =
+    /^P(?!$)(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(v);
+  if (!m) return null;
+  const [, Y, Mo, W, D, H, Mi, S] = m;
+  const ms =
+    (Y ? parseInt(Y, 10) * 365 * 86_400_000 : 0) +
+    (Mo ? parseInt(Mo, 10) * 30 * 86_400_000 : 0) +
+    (W ? parseInt(W, 10) * 7 * 86_400_000 : 0) +
+    (D ? parseInt(D, 10) * 86_400_000 : 0) +
+    (H ? parseInt(H, 10) * 3_600_000 : 0) +
+    (Mi ? parseInt(Mi, 10) * 60_000 : 0) +
+    (S ? parseInt(S, 10) * 1_000 : 0);
+  return ms > 0 ? ms : null;
+}
+
 export function computeNextRun(task: ScheduledTask): string | null {
   if (task.schedule_type === 'once') {
     // After the task has run at least once, there is no next run — return null
     // so updateTaskAfterRun marks it completed. On the initial creation call
-    // (task.last_run is null), convert the local schedule_value timestamp to a
-    // UTC ISO string so getDueTasks' `next_run <= now` comparison (which uses
-    // new Date().toISOString() = UTC) works correctly.
+    // (task.last_run is null), compute next_run. For a relative duration
+    // (PT2M / +120000) the host adds it to now; for an absolute local
+    // timestamp it converts to a UTC ISO string so getDueTasks' `next_run <=
+    // now` comparison (which uses new Date().toISOString() = UTC) works.
     if (task.last_run) return null;
     if (!task.schedule_value) return null;
+    const relMs = parseRelativeDuration(task.schedule_value);
+    if (relMs !== null) {
+      return new Date(Date.now() + relMs).toISOString();
+    }
     const d = new Date(task.schedule_value);
     return isNaN(d.getTime()) ? null : d.toISOString();
   }
@@ -156,37 +194,8 @@ export async function buildDigestContext(span = 'hourly'): Promise<string> {
   } catch (err) { lines.push(`\nActive work tasks: unavailable (${String((err as any)?.message ?? err)})`); }
 
   // Weather via keyless wttr.in, only if the bio names a location
-  const locMatch = bio.match(/^Location:\s*(.+)$/m);
-  const loc = locMatch?.[1]?.replace(/#.*$/, '').trim();
-  if (loc) {
-    try {
-      const r = await fetch(`https://wttr.in/${encodeURIComponent(loc)}?format=j1`, {
-        signal: AbortSignal.timeout(8000),
-      });
-      if (r.ok) {
-        const w = (await r.json()) as any;
-        const parts: string[] = [];
-        const cur = w.current_condition?.[0];
-        if (cur) parts.push(`Now: ${cur.temp_C}°C, ${(cur.weatherDesc?.[0]?.value || '').trim()}, humidity ${cur.humidity}%`);
-        const allHours: any[] = (w.weather || []).flatMap((d: any) => d.hourly || []);
-        const curHour = now.getHours();
-        let idx = allHours.findIndex(h => Math.floor(parseInt(h.time, 10) / 100) >= curHour);
-        if (idx < 0) idx = 0;
-        const next = allHours.slice(idx, idx + 3);
-        if (next.length) {
-          const peak = next.reduce((a, b) => (parseInt(b.tempC, 10) > parseInt(a.tempC, 10) ? b : a));
-          const hh = (t: string) => String(parseInt(t, 10) / 100).padStart(2, '0') + ':00';
-          const rain = next.find(h => parseInt(h.chanceofrain, 10) > 40);
-          parts.push(
-            `Next hours: ${next.map(h => `${hh(h.time)} ${h.tempC}°C`).join(', ')}` +
-            (parseInt(peak.tempC, 10) >= 28 ? ` — peaks at ${peak.tempC}°C around ${hh(peak.time)}` : '') +
-            (rain ? ` — rain ${rain.chanceofrain}% around ${hh(rain.time)}` : ''),
-          );
-        }
-        if (parts.length) lines.push(`\nWeather (${loc}):\n${parts.join('\n')}`);
-      }
-    } catch (err) { lines.push(`\nWeather: unavailable (${String((err as any)?.message ?? err)})`); }
-  }
+  const parts = await fetchWeatherLines(bio, now);
+  if (parts.length) lines.push(`\nWeather (${bio.match(/^Location:\s*(.+)$/m)?.[1]?.replace(/#.*$/, '').trim()}):\n${parts.join('\n')}`);
 
   // "Look Out For" — free-text notes the user maintains from the digest panel
   // (LOOK_OUT_FOR.md in the workspace root): things they're watching for (a
@@ -211,6 +220,225 @@ export async function buildDigestContext(span = 'hourly'): Promise<string> {
   } catch { /* no lookout file */ }
 
   return lines.join('\n');
+}
+
+/**
+ * Weather via keyless wttr.in, only if the bio names a location. Returns the
+ * rendered parts ("Now: …" / "Next hours: …"), empty when there is no location
+ * or the fetch fails. Shared by buildDigestContext (prompt INPUT) and
+ * buildDeterministicDigest (digest weather block) so both show the same data.
+ */
+async function fetchWeatherLines(bio: string, now: Date): Promise<string[]> {
+  const locMatch = bio.match(/^Location:\s*(.+)$/m);
+  const loc = locMatch?.[1]?.replace(/#.*$/, '').trim();
+  if (!loc) return [];
+  try {
+    const r = await fetch(`https://wttr.in/${encodeURIComponent(loc)}?format=j1`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return [];
+    const w = (await r.json()) as any;
+    const parts: string[] = [];
+    const cur = w.current_condition?.[0];
+    if (cur) parts.push(`Now: ${cur.temp_C}°C, ${(cur.weatherDesc?.[0]?.value || '').trim()}, humidity ${cur.humidity}%`);
+    const allHours: any[] = (w.weather || []).flatMap((d: any) => d.hourly || []);
+    const curHour = now.getHours();
+    let idx = allHours.findIndex(h => Math.floor(parseInt(h.time, 10) / 100) >= curHour);
+    if (idx < 0) idx = 0;
+    const next = allHours.slice(idx, idx + 3);
+    if (next.length) {
+      const peak = next.reduce((a, b) => (parseInt(b.tempC, 10) > parseInt(a.tempC, 10) ? b : a));
+      const hh = (t: string) => String(parseInt(t, 10) / 100).padStart(2, '0') + ':00';
+      const rain = next.find(h => parseInt(h.chanceofrain, 10) > 40);
+      parts.push(
+        `Next hours: ${next.map(h => `${hh(h.time)} ${h.tempC}°C`).join(', ')}` +
+        (parseInt(peak.tempC, 10) >= 28 ? ` — peaks at ${peak.tempC}°C around ${hh(peak.time)}` : '') +
+        (rain ? ` — rain ${rain.chanceofrain}% around ${hh(rain.time)}` : ''),
+      );
+    }
+    return parts;
+  } catch { return []; }
+}
+
+/**
+ * Build the digest JSON deterministically from real data — no LLM anywhere.
+ * Same sources buildDigestContext feeds the model (read_emails, calendar,
+ * work tasks, wttr.in weather, LOOK_OUT_FOR.md), but assembled by code into
+ * the exact shape the dashboard digest panel renders. A block with no data
+ * gets its empty-state value; nothing is ever invented.
+ */
+export async function buildDeterministicDigest(
+  span: 'hourly' | 'daily' | 'weekly',
+  readEmails: (args: any) => Promise<any>,
+): Promise<Record<string, any>> {
+  const now = new Date();
+  const winMs = span === 'hourly' ? 3600_000 : span === 'daily' ? 24 * 3600_000 : 7 * 24 * 3600_000;
+  const sinceIso = new Date(now.getTime() - winMs).toISOString();
+  const beforeIso = now.toISOString();
+
+  // ── Emails (the same read_emails the agents use) ─────────────────────────
+  let emailItems: string[] = [];
+  let emailFailed = false;
+  try {
+    const res = await readEmails({ since: sinceIso, before: beforeIso, limit: 200, preview_only: true });
+    if (res?.ok && Array.isArray(res.emails)) {
+      const cap = span === 'hourly' ? 10 : span === 'daily' ? 20 : 25;
+      emailItems = res.emails.slice(0, cap).map((e: any) => {
+        const base = `From: ${e.from || '?'}: ${e.subject || '(no subject)'}`;
+        const t = new Date(e.date).getTime();
+        return Number.isNaN(t)
+          ? base
+          : `${base} (${new Date(t).toLocaleString('en-US', { timeZone: TIMEZONE })})`;
+      });
+    } else {
+      emailFailed = true;
+      emailItems = [`Email unavailable: ${String(res?.error || 'fetch failed')}`];
+    }
+  } catch (err: any) {
+    emailFailed = true;
+    emailItems = [`Email unavailable: ${String(err?.message ?? err)}`];
+  }
+  const nEmails = emailFailed ? 0 : emailItems.length;
+  const inboxItems = emailFailed
+    ? emailItems
+    : (nEmails ? emailItems : ['No new mail.']);
+
+  // ── Calendar ──────────────────────────────────────────────────────────────
+  let calItems: string[] = [];
+  try {
+    const start = span === 'hourly'
+      ? now.toISOString()
+      : span === 'daily'
+        ? new Date(now.getTime() - 6 * 3600_000).toISOString()
+        : new Date(now.getTime() - winMs).toISOString();
+    const end = span === 'hourly'
+      ? new Date(now.getTime() + 2 * 3600_000).toISOString()
+      : span === 'daily'
+        ? new Date(now.getTime() + 48 * 3600_000).toISOString()
+        : new Date(now.getTime() + winMs).toISOString();
+    calItems = listCalendarEvents({ start, end }).slice(0, 25)
+      .map(e => `${e.start_time} → ${e.end_time || '?'}: ${e.title}${e.location ? ' @ ' + e.location : ''}`);
+  } catch { calItems = []; }
+  const nCal = calItems.length;
+  const calBlock = nCal
+    ? calItems
+    : [span === 'hourly' ? 'Nothing in the next 2 hours.' : span === 'daily' ? 'Nothing on the calendar today.' : 'Nothing on the calendar this week.'];
+
+  // ── Active work tasks ─────────────────────────────────────────────────────
+  let taskItems: string[] = [];
+  try {
+    taskItems = getWorkTasks().filter(t => t.status !== 'done').slice(0, 25)
+      .map(t => `[${t.status || 'todo'}] ${t.title}${t.project_id ? ' (project ' + t.project_id + ')' : ''}`);
+  } catch { taskItems = []; }
+  const nTasks = taskItems.length;
+  const taskBlock = nTasks ? taskItems : ['No active tasks.'];
+
+  // ── Weather (only if the bio names a location) ─────────────────────────────
+  let bio = '';
+  try {
+    const bioPath = path.join(
+      WORKSPACE_ROOT.replace(/^~(?=\/|$)/, process.env.HOME ?? ''),
+      'USER_BIO.md',
+    );
+    bio = fs.readFileSync(bioPath, 'utf-8').trim();
+  } catch { /* no bio file */ }
+  const weatherLines = await fetchWeatherLines(bio, now);
+  const weatherText = weatherLines.join('\n');
+
+  // ── Look Out For: substring match against real data ────────────────────────
+  const alerts: string[] = [];
+  try {
+    const lookoutPath = path.join(
+      WORKSPACE_ROOT.replace(/^~(?=\/|$)/, process.env.HOME ?? ''),
+      'LOOK_OUT_FOR.md',
+    );
+    const lookout = fs.existsSync(lookoutPath)
+      ? fs.readFileSync(lookoutPath, 'utf-8').trim()
+      : '';
+    for (const item of lookout.split('\n').map(l => l.trim()).filter(Boolean)) {
+      const needles = [...emailItems, ...calItems, ...taskItems, weatherText]
+        .find(s => s.toLowerCase().includes(item.toLowerCase()));
+      if (needles) alerts.push(`${item} - matched by ${needles}`);
+    }
+  } catch { /* no lookout file */ }
+
+  // ── Title ──────────────────────────────────────────────────────────────────
+  const dateStr = now.toLocaleDateString('en-CA', { timeZone: TIMEZONE }); // YYYY-MM-DD
+  const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: TIMEZONE });
+  const title = span === 'hourly'
+    ? `${dateStr} ${timeStr}`
+    : span === 'daily'
+      ? dateStr
+      : `Week of ${new Date(now.getTime() - winMs).toLocaleDateString('en-CA', { timeZone: TIMEZONE })}`;
+
+  // ── Summary (templated, grounded) ─────────────────────────────────────────
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  let summary = '';
+  let review = '';
+  let tomorrow = '';
+  if (span === 'hourly') {
+    const bits: string[] = [];
+    if (nEmails) bits.push(`${plural(nEmails, 'new email')} this hour.`);
+    if (nCal) bits.push(`${plural(nCal, 'calendar event')} in the next 2 hours.`);
+    summary = bits.length ? bits.join(' ') : 'Quiet hour — no new email.';
+  } else if (span === 'daily') {
+    const bits: string[] = [];
+    if (emailFailed) bits.push('Email is unavailable.');
+    else if (nEmails) bits.push(`${plural(nEmails, 'email')} since yesterday.`);
+    else bits.push('The inbox is quiet.');
+    if (nCal) bits.push(`${plural(nCal, 'calendar event')} today.`);
+    if (nTasks) bits.push(`${plural(nTasks, 'active task')}.`);
+    summary = `Good morning. ${bits.join(' ')}`;
+    review = (nEmails || nCal || nTasks)
+      ? `${emailFailed ? 'Email unavailable' : plural(nEmails, 'email')}, ${plural(nCal, 'calendar event')}, ${plural(nTasks, 'active task')}.`
+      : '';
+    const tomorrowEvents = calItems.filter(e => {
+      const t = new Date(e.split(' → ')[0]).getTime();
+      const tomorrow = new Date(now.getTime() + 24 * 3600_000).toLocaleDateString('en-CA', { timeZone: TIMEZONE });
+      return !Number.isNaN(t) && new Date(t).toLocaleDateString('en-CA', { timeZone: TIMEZONE }) === tomorrow;
+    });
+    if (tomorrowEvents.length) {
+      const titles = tomorrowEvents.map(e => e.split(': ').slice(1).join(': '));
+      tomorrow = `Tomorrow: ${titles.join(', ')}.`;
+    }
+  } else {
+    const bits: string[] = [];
+    if (nEmails) bits.push(`${plural(nEmails, 'email')} this week.`);
+    else bits.push('A quiet week — no new email.');
+    if (nCal) bits.push(`${plural(nCal, 'calendar event')}.`);
+    if (nTasks) bits.push(`${plural(nTasks, 'active task')}.`);
+    summary = bits.join(' ');
+    review = (nEmails || nCal || nTasks)
+      ? `${emailFailed ? 'Email unavailable' : plural(nEmails, 'email')}, ${plural(nCal, 'calendar event')}, ${plural(nTasks, 'active task')}.`
+      : '';
+  }
+
+  const inboxLabel = span === 'weekly' ? 'Email Activity' : 'Recent Emails';
+  const tasksLabel = span === 'weekly' ? 'Tasks' : 'Active Tasks';
+  const blocks: Record<string, any>[] = [];
+  if (span !== 'hourly') {
+    blocks.push({ icon: 'review', label: span === 'daily' ? 'Day in Review' : 'Week in Review', type: 'prose', text: review });
+  }
+  blocks.push({ icon: 'inbox', label: inboxLabel, type: 'list', items: inboxItems });
+  blocks.push({ icon: 'calendar', label: 'Calendar', type: 'list', items: calBlock });
+  blocks.push({ icon: 'tasks', label: tasksLabel, type: 'list', items: taskBlock });
+  blocks.push({ icon: 'weather', label: 'Weather', type: 'prose', text: weatherText });
+  if (span === 'daily') {
+    blocks.push({ icon: 'tomorrow', label: 'Tomorrow', type: 'prose', text: tomorrow });
+  }
+  blocks.push({ icon: 'nudge', label: 'Nudge', type: 'prose', text: '' });
+
+  const digest: Record<string, any> = {
+    title,
+    summary,
+    alerts,
+    blocks,
+  };
+  if (span === 'hourly') {
+    digest.actionable_tasks = [];
+    digest.actionable_events = [];
+  }
+  return digest;
 }
 
 async function runTask(
@@ -250,64 +478,98 @@ async function runTask(
     }
   }
 
-  // A schedule is just a prompt on a crontab. Inject it into the chat as a
-  // regular message attributed to Automation; the normal message pipeline picks
-  // it up, so the orchestrator and the user both see it — indistinguishable
-  // from the user typing the prompt. Prefix the trigger word only when the
-  // group requires one. The model is whatever the orchestrator is already
-  // configured to use — tasks don't carry their own.
-  const group = Object.values(deps.registeredGroups()).find(
-    (g) => g.folder === (task.group_folder || 'owner'),
-  );
-  const content =
-    group?.requiresTrigger && !TRIGGER_PATTERN.test(prompt)
-      ? `@${ASSISTANT_NAME} ${prompt}`
-      : prompt;
+  // Two firing modes:
+  //
+  // 1. REMINDERS (every non-heartbeat task): the chamber prompt — set by iris
+  //    at creation time — fires directly into chat as a visible notification.
+  //    No seat turn, no model reply. The message is stored with
+  //    is_bot_message=true + idea='' so getMessagesForDashboard shows it but
+  //    getNewMessages/getMessagesSince (which filter is_bot_message=0) skip it,
+  //    so the message loop never routes it to the seat. The user sees
+  //    exactly what was chambered, the moment it's due — no rephrasing, no
+  //    duplicate, no model latency.
+  //
+  // 2. HEARTBEAT (id 'heartbeat-*'): a system automation that EXECUTES the
+  //    group's HEARTBEAT.md instructions, not a display notification. It keeps
+  //    the inject-and-poke path: idea='scheduled' (hidden from the chat view)
+  //    + enqueueMessageCheck so processOwnerMessages → getMessagesSince picks
+  //    it up and the seat runs the instructions. Iris digests are
+  //    already skipped in the scheduler loop (fired by checkDigestsDue).
+  const isAutomation = task.id.startsWith('heartbeat-');
 
-  // is_from_me:true marks it owner-side; is_bot_message:false (the default) so
-  // the message loop's pending query — which filters is_bot_message = 0 — picks
-  // it up. The agent's reply then lands in the chat like any other response.
-  try {
-    storeMessage({
-      id: `automation-${task.id}-${Date.now()}`,
-      chat_jid: task.chat_jid,
-      sender: 'automation',
-      sender_name: 'Automation',
-      content,
-      timestamp: new Date().toISOString(),
-      is_from_me: true,
-      is_bot_message: false,
-      // Tag as a scheduled/automation message so getMessagesForDashboard (which
-      // excludes non-empty `idea`) keeps it out of /api/messages → the Direct
-      // Line chat. getNewMessages doesn't filter on `idea`, so the orchestrator
-      // still picks the prompt up and runs the task (e.g. Iris digests).
-      idea: 'scheduled',
-    });
-  } catch (err) {
-    logger.warn({ taskId: task.id, err }, 'Failed to store Automation chat message');
+  if (isAutomation) {
+    const group = Object.values(deps.registeredGroups()).find(
+      (g) => g.folder === (task.group_folder || 'owner'),
+    );
+    const content =
+      group?.requiresTrigger && !TRIGGER_PATTERN.test(prompt)
+        ? `@${ASSISTANT_NAME} ${prompt}`
+        : prompt;
+    try {
+      storeMessage({
+        id: `automation-${task.id}-${Date.now()}`,
+        chat_jid: task.chat_jid,
+        sender: 'automation',
+        sender_name: 'Automation',
+        content,
+        timestamp: new Date().toISOString(),
+        is_from_me: true,
+        is_bot_message: false,
+        // Hidden from the chat view (getMessagesForDashboard excludes non-empty
+        // idea); processOwnerMessages picks it up via getMessagesSince, whose
+        // default filter includes idea='scheduled' (see db.ts).
+        idea: 'scheduled',
+      });
+    } catch (err) {
+      logger.warn({ taskId: task.id, err }, 'Failed to store Automation chat message');
+    }
+    // Poke the message queue so the seat runs the instructions now.
+    deps.queue.enqueueMessageCheck(task.chat_jid);
+  } else {
+    try {
+      storeMessage({
+        id: `automation-${task.id}-${Date.now()}`,
+        chat_jid: task.chat_jid,
+        sender: 'automation',
+        sender_name: '⏰ Reminder',
+        content: `⏰ ${prompt}`,
+        timestamp: new Date().toISOString(),
+        is_from_me: false,
+        // is_bot_message=true so the message loop (getNewMessages /
+        // getMessagesSince, both filter is_bot_message=0) NEVER routes this to
+        // the seat — it's a display-only notification, not an
+        // instruction to execute.
+        is_bot_message: true,
+        // idea='' so getMessagesForDashboard shows it in the chat view.
+        idea: '',
+      });
+      logger.info({ taskId: task.id }, 'Reminder fired directly into chat');
+    } catch (err) {
+      logger.warn({ taskId: task.id, err }, 'Failed to store reminder chat message');
+    }
+    // No enqueueMessageCheck — the message is the notification, not a prompt
+    // for the seat. is_bot_message=true keeps the loop off it.
   }
-
-  // Poke the normal message queue so the injected prompt is processed now
-  // rather than on the next poll tick.
-  deps.queue.enqueueMessageCheck(task.chat_jid);
 
   logTaskRun({
     task_id: task.id,
     run_at: new Date().toISOString(),
     duration_ms: Date.now() - startTime,
     status: 'success',
-    result: 'Prompt injected into chat',
+    result: isAutomation ? 'Prompt injected into chat' : 'Reminder fired into chat',
     error: null,
   });
 
   const nextRun = computeNextRun(task);
 
-  // One-time tasks auto-delete after firing; recurring tasks get next_run recomputed.
+  // One-time tasks persist as 'completed' (next_run=null → updateTaskAfterRun
+  // sets status='completed') so fired timer reminders stay visible in the
+  // reminders list instead of vanishing. Recurring tasks recompute next_run.
   if (task.schedule_type === 'once') {
-    deleteTask(task.id);
-    logger.info({ taskId: task.id }, 'One-time task auto-deleted after firing');
+    updateTaskAfterRun(task.id, null, 'Reminder fired into chat');
+    logger.info({ taskId: task.id }, 'One-time reminder fired and marked completed');
   } else {
-    updateTaskAfterRun(task.id, nextRun, 'Prompt injected into chat');
+    updateTaskAfterRun(task.id, nextRun, 'Reminder fired into chat');
   }
 }
 
@@ -317,7 +579,7 @@ async function runTask(
  * digest gets the SAME grounding as a scheduled one: real calendar + work
  * tasks + bio + weather + notes pulled from the DB (not Iris's own tools,
  * which hit Radicale and fail when Kontact isn't provisioned). The prompt is
- * injected into the owner chat and the orchestrator routes it to Iris.
+ * injected into the owner chat and the seat routes it to Iris.
  *
  * runTask reschedules a cron task to computeNextRun (the next cron time
  * after now) — which is exactly where it was headed anyway, so a manual run
@@ -372,6 +634,16 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           try {
             const nextRun = computeNextRun(currentTask);
             if (nextRun) updateTaskAfterRun(task.id, nextRun, 'skipped (fired by checkDigestsDue)');
+          } catch { /* ignore */ }
+          continue;
+        }
+        // Sentry scans likewise: the host's checkSentryDue() (src/index.ts)
+        // fires the peek/deep scans directly as background sentry spawns. The
+        // rows exist for visibility + cron editing; skip to avoid double-fire.
+        if (task.id.startsWith('sentry-')) {
+          try {
+            const nextRun = computeNextRun(currentTask);
+            if (nextRun) updateTaskAfterRun(task.id, nextRun, 'skipped (fired by checkSentryDue)');
           } catch { /* ignore */ }
           continue;
         }

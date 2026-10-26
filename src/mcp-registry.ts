@@ -4,11 +4,20 @@ import { fileURLToPath } from 'url';
 
 export interface McpServerConfig {
   name: string;
-  command: string;
-  args: string[];
+  // stdio only: the subprocess to spawn.
+  command?: string;
+  args?: string[];
   env?: Record<string, string>;
-  transport: 'stdio';
+  // sse/http only: the remote endpoint. 'http' is the newer MCP Streamable
+  // HTTP transport (one endpoint, no bridge subprocess needed) — used for a
+  // server that already speaks MCP natively over HTTP, e.g. a browser
+  // extension's local endpoint. 'sse' is the older two-endpoint transport.
+  url?: string;
+  transport: 'stdio' | 'sse' | 'http';
   enabled: boolean;
+  /** Optional component: never connected at boot — the agent-runner dials it
+   * on demand only when a tool on this server is actually invoked. */
+  lazy?: boolean;
   /** Optional human-readable description shown to the agent in the skill index.
    * When omitted, a generic "MCP server <name> (<command> <args>)" line is used. */
   description?: string;
@@ -24,6 +33,27 @@ const PLASMA_SERVER_PATH = path.join(
 // Browser automation is native (agent-runner browser_* tools over CDP) — no
 // playwright MCP server in the seed.
 const DEFAULT_SEED: McpServerConfig[] = [
+  {
+    // MARM is a default component (since 2026-09-22): the seat's
+    // long-term semantic memory. Install.sh provisions the server + service;
+    // on a box without it the boot-connect failure is caught per server and
+    // only this entry is skipped — Warden runs identically.
+    name: 'marm',
+    // PATH-relative on purpose. install.sh upserts the absolute binary path
+    // into data/mcp-servers.json after installing (systemd --user PATH can
+    // miss ~/.local/bin); the seed works wherever marm-memory is on PATH.
+    command: 'marm-memory',
+    args: ['stdio'],
+    transport: 'stdio',
+    enabled: true,
+    // The short-lived per-turn stdio child must NOT build the concept graph —
+    // that is the long-lived HTTP service's job (marm-memory.service on
+    // 127.0.0.1:8001). Both share concept_build_lock in marm_memory.db and
+    // fight over it otherwise (concept_worker deferred reason=graph_busy).
+    env: { CONCEPT_AUTO_INDEX: 'false' },
+    description:
+      'MARM long-term memory: hybrid BM25+semantic recall (marm_smart_recall) + concept graph. The HTTP server for memory writeback runs separately (marm-memory.service) on 127.0.0.1:8001.',
+  },
   {
     name: 'plasma',
     command: 'node',

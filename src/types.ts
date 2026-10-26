@@ -38,18 +38,20 @@ export const OWNER_JID = 'owner@local';
 
 export interface AgentInput {
   prompt: string;
-  orchestratorModel?: string; // Warden (orchestrator) model
-  model?: string;             // Atlas model
+  /** Max tokens one model reply may generate (settings: local:max_output_tokens). Blank = the runner's default. */
+  maxOutputTokens?: string;
+  model?: string;             // Atlas — the chat seat's model
   vulkanModel?: string;    // Vulkan (coding) model
+  supervisorModel?: string; // Supervisor (completion-verdict) model; blank = inherit Atlas
+  supervisorEnabled?: boolean; // Supervisor completion verdict on/off (default true)
   // Per-agent models — every agent has its own concrete model selected from the
   // Agents-panel dropdown (no blank, no runtime fallback). The host resolves each
   // from its router_state key; the agent-runner uses it directly and errors if empty.
-  byteModel?: string;
-  dexterModel?: string;
   irisModel?: string;
   artemisModel?: string;
-  drivingForce?: string;        // orchestrator preamble preset id (data/driving-forces/)
-  contextClearAt?: string;      // ISO timestamp; orchestrator history before this is dropped
+  sentryModel?: string;
+  drivingForce?: string;        // seat preamble preset id (data/driving-forces/)
+  contextClearAt?: string;      // ISO timestamp; seat history before this is dropped
   councilSkepticModel?: string;     // Council Skeptic seat model (optional, falls back to model)
   councilPragmatistModel?: string;   // Council Pragmatist seat model
   councilSynthesistModel?: string;  // Council Synthesist seat model
@@ -59,7 +61,17 @@ export interface AgentInput {
   timeoutMs: number;
   memoryContext?: string;
   showThinking?: boolean | string;
+  /** Default apps: capability -> 'builtin' | 'mcp:<server>'. An MCP server named here replaces that capability's built-in tools. */
+  defaultApps?: Record<string, string>;
+  /** The agent's own name as set for the dash — spoken in the seat's own prompt. */
+  assistantName?: string;
+  /** Tools exempt from relevance ranking. */
+  pinnedTools?: string[];
   verbose?: boolean;
+  /** Autonomous background turn (e.g. the BotNet sweep): processed normally, but
+   *  its prompt and output must NOT persist into the seat's live conversation —
+   *  the runner rolls it back out of `messages` when the turn ends. */
+  sideTurn?: boolean;
 }
 
 export interface AgentOutput {

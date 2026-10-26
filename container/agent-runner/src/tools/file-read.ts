@@ -11,7 +11,7 @@ import { log, cleanFilePath, writeIpcFile, waitForResult, TASKS_DIR } from '../i
 //    user "attached" by pointing the chat at a local file/dir). Warden has no
 //    sandbox, so the agent can read any local path the user has access to.
 //  - everything else → resolved relative to the workspace (existing behavior).
-function resolveFilePath(rawPath: string): string {
+export function resolveFilePath(rawPath: string): string {
     const cleanedPath = cleanFilePath(rawPath);
     if (rawPath.startsWith('~')) {
         return path.join(os.homedir(), rawPath.slice(1));
@@ -24,13 +24,13 @@ function resolveFilePath(rawPath: string): string {
 
 registry.register({
     name: 'Read',
-    description: 'Read a file from the workspace or any local path. Accepts a workspace-relative path (e.g. "notes.md", "attachments/photo.jpg"), an absolute local path (a path starting with "/" or "~/"), or a directory (returns a listing of its contents). For image files (png, jpg, jpeg, gif, webp), this gives you vision — you will see the image contents. Always use Read on images instead of Bash/PIL. Use this when the user points you at a local file or directory to look at.',
+    description: '{"what":"read a text file, list a directory, or view an image","paths":"workspace-relative, absolute, or ~/ under home","images":"you see the image — the one way, before Bash"}',
     schema: {
         type: 'object',
         properties: {
-            file_path: { type: 'string', description: 'Path to read: workspace-relative ("notes.md", "attachments/photo.jpg"), absolute local (starts with "/" or "~/"), or a directory.' },
-            offset: { type: 'number', description: 'Line number to start from (text files only)' },
-            limit: { type: 'number', description: 'Number of lines to read (text files only)' },
+            file_path: { type: 'string', description: '{"what":"the file to read","format":"workspace-relative, absolute (starts with /), or ~/ under home","directory":"a directory returns a listing of its contents"}' },
+            offset: { type: 'number', description: '{"what":"first line to read","unit":"line number","default":1,"text_files":"only"}' },
+            limit: { type: 'number', description: '{"what":"how many lines to read","default":"all remaining","text_files":"only"}' },
         },
         required: ['file_path'],
     },
@@ -54,8 +54,6 @@ registry.register({
                     return `Error listing directory ${args.file_path}: ${err.message}`;
                 }
             }
-            try { fs.writeFileSync('/workspace/ipc/status.json', JSON.stringify({ phase: 'tool', tool: 'Read', label: `Reading: ${args.file_path}`, ts: Date.now() })); } catch {}
-            try { fs.appendFileSync('/workspace/ipc/activity.log', JSON.stringify({ type: 'tool', name: 'Read', label: `Reading: ${args.file_path}`, ts: Date.now() }) + '\n'); } catch {}
             const ext = path.extname(filePath).toLowerCase();
             const probe = Buffer.alloc(512);
             const fd = fs.openSync(filePath, 'r');

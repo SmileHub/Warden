@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { registry } from '../tool-registry.js';
-import { writeIpcFile, waitForResult, TASKS_DIR, IPC_DIR, cleanFilePath } from '../ipc-helpers.js';
+import { writeCallback } from '../index.js';
+import { resolveUserPath } from '../ipc-helpers.js';
 
 // --- Chat tools ---
 registry.register({
@@ -13,7 +14,17 @@ registry.register({
     },
     handler: async (args, context) => {
         try {
-            const dbPath = process.env.MESSAGES_DB_PATH || path.join(process.env.WARDEN_ROOT || path.join(process.env.HOME || '~', 'dockbox'), 'store', 'messages.db');
+            // The host sets MESSAGES_DB_PATH in its process.env at startup
+            // (src/config.ts → STORE_DIR), and spawns this child with
+            // `...process.env`, so the canonical DB path is inherited. WARDEN_ROOT
+            // is a legacy fallback. Never fall back to a hard-coded ~/dockbox path
+            // — that directory doesn't exist on this host and the silent failure
+            // starves the orchestrator of history across turns.
+            const dbPath = process.env.MESSAGES_DB_PATH
+                || (process.env.WARDEN_ROOT ? path.join(process.env.WARDEN_ROOT, 'store', 'messages.db') : '');
+            if (!dbPath) {
+                return 'Error reading chat history: MESSAGES_DB_PATH is not set (the host did not propagate the DB path to this child).';
+            }
             const Database = (await import('better-sqlite3')).default;
             const db = new Database(dbPath, { readonly: true });
             const limit = Math.min(args.limit || 50, 200);
@@ -35,25 +46,6 @@ registry.register({
 });
 
 registry.register({
-    name: 'ping_user',
-    description: 'Send a notification ping to a user.',
-    schema: {
-        type: 'object',
-        properties: {
-            user_id: { type: 'string' },
-            message: { type: 'string' },
-        },
-        required: ['user_id', 'message'],
-    },
-    handler: async (args, _context) => {
-        writeIpcFile(TASKS_DIR, { type: 'ping_user', userId: args.user_id, message: args.message, timestamp: new Date().toISOString() });
-        return `Ping sent to ${args.user_id}.`;
-    },
-    toolset: 'chat',
-    tier: 'both',
-});
-
-registry.register({
     name: 'attach_file',
     description: 'Send a file to the chat as a downloadable attachment.',
     schema: {
@@ -66,50 +58,22 @@ registry.register({
         required: ['path'],
     },
     handler: async (args, context) => {
-        let filePath = args.path;
-        if (filePath.startsWith('/tmp/')) {
-            const basename = path.basename(filePath);
-            try {
-                fs.copyFileSync(filePath, path.join(process.cwd(), basename));
-                filePath = basename;
-            } catch {
-                return `Error: could not copy file from ${filePath}`;
-            }
-        }
-        const full = path.resolve(process.cwd(), cleanFilePath(filePath));
-        if (!full.startsWith(process.cwd())) return 'Error: path must be relative to workspace';
-        if (!fs.existsSync(full)) return `Error: file not found at ${filePath}`;
-        const relPath = path.relative(process.cwd(), full);
-        const tag = args.type === 'image' ? `[Image: ${relPath}]` : `[File: ${relPath}]`;
+        // Resolve like a shell would: ~ → home, absolutes stay absolute (the
+        // agent can already Read/Edit files outside the workspace, so the old
+        // "path must be relative to workspace" refusal just rejected the very
+        // files users ask to attach, e.g. ~/Projects/site/index.html).
+        const filePath = resolveUserPath(args.path);
+        if (!fs.existsSync(filePath)) return `Error: file not found at ${args.path}`;
+        const tag = args.type === 'image' ? `[Image: ${filePath}]` : `[File: ${filePath}]`;
         const text = args.message ? `${args.message}\n\n${tag}` : tag;
-        writeIpcFile(path.join(IPC_DIR, 'messages'), {
+        // Deliver through the live stdio callback channel — the old
+        // writeIpcFile(IPC_DIR/messages) path was dead (the host no longer
+        // polls the IPC dir), so attachments silently vanished there.
+        writeCallback('send_message', {
             type: 'message', chatJid: context.chatJid, text, groupFolder: context.groupFolder, timestamp: new Date().toISOString(),
         });
-        return `File attached: ${filePath}`;
+        return `File attached: ${args.path}`;
     },
     toolset: 'chat',
     tier: 'both',
-});
-
-registry.register({
-    name: 'set_user_email',
-    description: "Set the user's email address for password resets and notifications.",
-    schema: {
-        type: 'object',
-        properties: { email: { type: 'string', description: 'Email address to set' } },
-        required: ['email'],
-    },
-    handler: async (args, _context) => {
-        const email = args.email?.trim();
-        if (!email) return 'Error: email is required';
-        writeIpcFile(TASKS_DIR, { type: 'set_user_email', email, timestamp: new Date().toISOString() });
-        const data = await waitForResult('set-email-');
-        if (data) {
-            if (data.error) return `Error: ${data.error}`;
-            return 'Email updated to ' + email;
-        }
-        return 'Email update timed out.';
-    },
-    toolset: 'chat',
-    tier: 'public',
 });

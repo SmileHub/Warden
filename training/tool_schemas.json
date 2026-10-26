@@ -1,0 +1,2498 @@
+{
+  "iris": [
+    {
+      "type": "function",
+      "function": {
+        "name": "email",
+        "description": "The user's email. For an inbox scan: action=read with the window the request names, then report what you find. Per-action usage: see the action parameter.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "read",
+                "get",
+                "download",
+                "send",
+                "refresh",
+                "cached"
+              ],
+              "description": "read=recent emails (or a date range via since/before, ISO 8601); get=one full email by id, attachments listed; download=save one attachment, returns the file path; send=from the user's account; refresh=re-sync the local cache; cached=list from the local cache."
+            },
+            "limit": {
+              "type": "number",
+              "description": "read: max emails to fetch before date filtering (default: 500)"
+            },
+            "preview_only": {
+              "type": "boolean",
+              "description": "read: return previews only (default: true)"
+            },
+            "folder": {
+              "type": "string",
+              "description": "read: mail folder (default: INBOX)"
+            },
+            "search": {
+              "type": "string",
+              "description": "read: optional text search (provider query, e.g. Gmail q=)"
+            },
+            "since": {
+              "type": "string",
+              "description": "read: ISO 8601 timestamp — only emails received at/after this"
+            },
+            "before": {
+              "type": "string",
+              "description": "read: ISO 8601 timestamp — only emails received before this"
+            },
+            "email_id": {
+              "type": "string",
+              "description": "get/download: the email id from a read result"
+            },
+            "filename": {
+              "type": "string",
+              "description": "download: the attachment filename from a get result"
+            },
+            "to": {
+              "type": "string",
+              "description": "send: recipient address"
+            },
+            "subject": {
+              "type": "string",
+              "description": "send: subject line"
+            },
+            "body": {
+              "type": "string",
+              "description": "send: email body"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task",
+        "description": "Scheduled tasks / reminders — things that fire on a clock. action=schedule creates; action=list lists all; pause/resume/cancel/update manage by task_id. Schedule formats: see schedule_value.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "schedule",
+                "list",
+                "pause",
+                "resume",
+                "cancel",
+                "update"
+              ],
+              "description": "Which scheduled-task operation to perform."
+            },
+            "task_id": {
+              "type": "string",
+              "description": "pause/resume/cancel/update: the task id"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "schedule/update: what the task does when it fires"
+            },
+            "schedule_type": {
+              "type": "string",
+              "enum": [
+                "cron",
+                "interval",
+                "once"
+              ],
+              "description": "schedule/update: cron=recurring at set times, interval=every N milliseconds, once=single run at a specific time or after a delay"
+            },
+            "schedule_value": {
+              "type": "string",
+              "description": "schedule/update: cron: five fields in order — minute hour day-of-month month day-of-week, \"*\" = any (\"30 10 * * *\" = 10:30 AM daily) | interval: milliseconds like \"300000\" (5 min) | once: either an ISO-8601 DURATION like \"PT2M\" (in 2 minutes), \"PT1H30M\", \"P1D\" — the host adds this to now, so prefer this for any \"in …\"/\"N from now\" request and do NOT compute a timestamp yourself — OR an ABSOLUTE local timestamp like \"2026-05-27T09:25:00\" (no \"Z\"/timezone suffix) for a named clock time. NEVER pass natural language such as \"in 5 minutes\" or \"tomorrow\"."
+            },
+            "context_mode": {
+              "type": "string",
+              "enum": [
+                "group",
+                "isolated"
+              ],
+              "description": "schedule: whether the fired turn sees the conversation history"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "calendar",
+        "description": "Local calendar (DB). action=create adds an event; action=list shows events in a date range; action=update changes an event by event_id (only provided fields); action=delete removes one by event_id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "create",
+                "list",
+                "update",
+                "delete"
+              ],
+              "description": "Which calendar operation to perform."
+            },
+            "title": {
+              "type": "string",
+              "description": "create/update: event title"
+            },
+            "description": {
+              "type": "string",
+              "description": "create/update: event description"
+            },
+            "start_time": {
+              "type": "string",
+              "description": "create/update: local ISO e.g. \"2026-03-20T14:00:00\""
+            },
+            "end_time": {
+              "type": "string",
+              "description": "create/update: local ISO end time"
+            },
+            "all_day": {
+              "type": "boolean",
+              "description": "create/update: all-day event"
+            },
+            "location": {
+              "type": "string",
+              "description": "create/update: event location"
+            },
+            "start": {
+              "type": "string",
+              "description": "list: local ISO lower bound"
+            },
+            "end": {
+              "type": "string",
+              "description": "list: local ISO upper bound"
+            },
+            "event_id": {
+              "type": "string",
+              "description": "update/delete: the event uid from a list result"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "alarm",
+        "description": "Alarms — clock alerts with a label. action=create sets one (label + alarm_time HH:MM required); action=list shows all; action=update changes one by alarm_id; action=delete removes one by alarm_id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "create",
+                "list",
+                "update",
+                "delete"
+              ],
+              "description": "Which alarm operation to perform."
+            },
+            "label": {
+              "type": "string",
+              "description": "create/update: alarm label/message"
+            },
+            "alarm_time": {
+              "type": "string",
+              "description": "create/update: time in HH:MM format"
+            },
+            "alarm_date": {
+              "type": "string",
+              "description": "create/update: date in YYYY-MM-DD (one-time alarms only; omit for today)"
+            },
+            "repeat_type": {
+              "type": "string",
+              "enum": [
+                "none",
+                "daily",
+                "weekdays",
+                "custom"
+              ],
+              "description": "create/update: repeat pattern"
+            },
+            "repeat_days": {
+              "type": "string",
+              "description": "create/update: comma-separated days for custom repeat (mon,tue,wed...)"
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "update: enable/disable the alarm"
+            },
+            "sound": {
+              "type": "string",
+              "description": "create/update: alarm sound"
+            },
+            "alarm_id": {
+              "type": "string",
+              "description": "update/delete: the alarm id"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    }
+  ],
+  "merged": [
+    {
+      "type": "function",
+      "function": {
+        "name": "Read",
+        "description": "{\"what\":\"read a text file, list a directory, or view an image\",\"paths\":\"workspace-relative, absolute, or ~/ under home\",\"images\":\"you see the image — the one way, before Bash\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "{\"what\":\"the file to read\",\"format\":\"workspace-relative, absolute (starts with /), or ~/ under home\",\"directory\":\"a directory returns a listing of its contents\"}"
+            },
+            "offset": {
+              "type": "number",
+              "description": "{\"what\":\"first line to read\",\"unit\":\"line number\",\"default\":1,\"text_files\":\"only\"}"
+            },
+            "limit": {
+              "type": "number",
+              "description": "{\"what\":\"how many lines to read\",\"default\":\"all remaining\",\"text_files\":\"only\"}"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "WebSearch",
+        "description": "{\"what\":\"find URLs — ranked results, not page content\",\"read_a_result\":\"WebFetch\",\"show_or_interact\":\"chrome_navigate\",\"rule\":\"a URL you already know goes straight to WebFetch\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "{\"what\":\"what to search for, in the user own words\"}"
+            },
+            "max_results": {
+              "type": "number",
+              "description": "{\"what\":\"result count\",\"default\":5}"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "WebFetch",
+        "description": "{\"what\":\"read a page server-side as clean Markdown, no browser\",\"use_when\":\"look up a fact, scrape an article, get a number from a URL\",\"js_or_empty\":\"chrome_navigate + chrome_get_web_content\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "{\"what\":\"the page to read\",\"source\":\"a URL the user gave, or one a WebSearch result returned\"}"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "text",
+                "html"
+              ],
+              "description": "{\"what\":\"return format\",\"vals\":\"text|html\",\"default\":\"text (Markdown)\",\"html_when\":\"you need the raw markup\"}"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Bash",
+        "description": "Execute a bash command.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "Command to execute"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "Timeout in ms"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "generate_pdf",
+        "description": "Generate a professional styled PDF document from markdown content — use this instead of writing a script for PDF creation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "description": "Output filename (e.g. \"report.pdf\")"
+            },
+            "content": {
+              "type": "string",
+              "description": "Markdown content for the PDF. Supports headings, tables, lists, code blocks, bold, italic, checkboxes, blockquotes."
+            }
+          },
+          "required": [
+            "filename",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "convert_file",
+        "description": "Convert files between formats using LibreOffice. Supports: docx/doc to pdf, xlsx/xls to pdf, pptx/ppt to pdf, csv to xlsx, md to docx, and more. Use this instead of writing conversion scripts.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string",
+              "description": "Path to input file"
+            },
+            "format": {
+              "type": "string",
+              "description": "Target format: pdf, docx, xlsx, pptx, csv, html, txt, odt, ods, odp"
+            }
+          },
+          "required": [
+            "input",
+            "format"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "generate_image",
+        "description": "Generate an image from a text description with a local image model. Writes a PNG into the images folder and returns its path. Describe the picture itself — subject, style, setting, lighting.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "The picture to generate: subject, style, setting, lighting. Example: \"a neon sign reading OPEN LATE on a rainy night, reflections on wet asphalt, cinematic\"."
+            },
+            "filename": {
+              "type": "string",
+              "description": "Output filename, e.g. \"poster.png\". Default: image-<timestamp>.png"
+            },
+            "width": {
+              "type": "number",
+              "description": "Image width in pixels. Default 1024. Multiples of 32, 512 to 2048."
+            },
+            "height": {
+              "type": "number",
+              "description": "Image height in pixels. Default 1024. Multiples of 32, 512 to 2048."
+            }
+          },
+          "required": [
+            "prompt"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "attach_file",
+        "description": "Send a file to the chat as a downloadable attachment.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Relative path to file"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file",
+                "image"
+              ],
+              "description": "file for download, image for inline"
+            },
+            "message": {
+              "type": "string",
+              "description": "Optional message with file"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_api_keys",
+        "description": "{\"what\":\"list the configured API keys: names and base URLs\",\"use_when\":\"discover which services are available\",\"answer\":\"the returned list\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "api_request",
+        "description": "{\"what\":\"call an external API, the stored key injected automatically\",\"first\":\"list_api_keys to see services and key names\",\"rule\":\"never hardcode a key\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "key_type": {
+              "type": "string",
+              "description": "{\"what\":\"name of the key to use\",\"source\":\"the key_type value from list_api_keys output\"}"
+            },
+            "method": {
+              "type": "string",
+              "description": "{\"what\":\"HTTP method\",\"vals\":\"GET|POST|PUT|PATCH|DELETE\",\"default\":\"GET\"}"
+            },
+            "path": {
+              "type": "string",
+              "description": "{\"what\":\"API endpoint path or full URL\",\"format\":\"a \\\"/v1/...\\\" style path, or a full https:// URL\"}"
+            },
+            "body": {
+              "type": "string",
+              "description": "{\"what\":\"request body\",\"format\":\"JSON as a string\"}"
+            },
+            "description": {
+              "type": "string",
+              "description": "{\"what\":\"what this request does\",\"use\":\"logging\"}"
+            }
+          },
+          "required": [
+            "key_type",
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "clear_context",
+        "description": "Clear conversation history and start fresh. Keeps the system prompt. Use when context is confused, polluted, or you need a clean slate.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string",
+              "description": "Why context is being cleared"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "fabric_pattern",
+        "description": "{\"what\":\"load an expert prompt pattern from the Fabric library\",\"returns\":\"the full system prompt — follow it\",\"when\":\"a listed RELEVANT PATTERN fits the task\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"the pattern to load\",\"format\":\"snake_case directory name\",\"source\":\"the RELEVANT PATTERNS list for this turn\"}"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "open_app",
+        "description": "{\"what\":\"open a file/app on the host display, fire-and-forget\",\"app\":\"binary name, or xdg-open with an absolute file path\",\"rule\":\"no driving what it opened; web pages belong to the browser tools\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "app": {
+              "type": "string",
+              "description": "Application binary name or full path"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional arguments to pass to the application"
+            }
+          },
+          "required": [
+            "app"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "desktop_screenshot",
+        "description": "{\"what\":\"capture the whole screen into your vision context\",\"use_when\":\"see a native desktop app before desktop_click\",\"web_pages\":\"chrome_read_page\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "region": {
+              "type": "object",
+              "description": "{\"what\":\"narrow the capture to a sub-rectangle of the screen\",\"unit\":\"pixels\",\"fields\":\"x,y,w,h — all four required together\",\"default\":\"omit = whole screen\"}",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                },
+                "w": {
+                  "type": "number"
+                },
+                "h": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "desktop_click",
+        "description": "{\"what\":\"click at absolute screen coordinates\",\"source\":\"coordinates read off a desktop_screenshot image\",\"scope\":\"native desktop apps; a web page belongs to the browser tools\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "number",
+              "description": "{\"what\":\"horizontal position\",\"unit\":\"pixels from the left edge\",\"source\":\"a desktop_screenshot image\"}"
+            },
+            "y": {
+              "type": "number",
+              "description": "{\"what\":\"vertical position\",\"unit\":\"pixels from the top edge\",\"source\":\"a desktop_screenshot image\"}"
+            },
+            "button": {
+              "type": "string",
+              "enum": [
+                "left",
+                "right",
+                "middle"
+              ],
+              "description": "{\"what\":\"mouse button\",\"vals\":\"left|right|middle\",\"default\":\"left\"}"
+            },
+            "double": {
+              "type": "boolean",
+              "description": "{\"what\":\"double-click instead of single\",\"default\":false}"
+            }
+          },
+          "required": [
+            "x",
+            "y"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "desktop_type",
+        "description": "{\"what\":\"type text or send a key combo into the focused desktop field\",\"multiline\":\"pass real line breaks — each line is typed with a Return between\",\"one_of\":\"text or keys, never both\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "{\"what\":\"the text to type\",\"format\":\"real line breaks for multi-line; the document keeps its own shape\",\"exclusive_with\":\"keys\"}"
+            },
+            "keys": {
+              "type": "string",
+              "description": "{\"what\":\"one key or combo to send\",\"format\":\"xdotool key syntax — a key name, or modifiers joined by +\",\"exclusive_with\":\"text\"}"
+            },
+            "delay_ms": {
+              "type": "number",
+              "description": "{\"what\":\"delay between keystrokes\",\"unit\":\"ms\",\"default\":12,\"raise_when\":\"the target app drops characters\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "audio_volume",
+        "description": "{\"what\":\"SPEAKER (output) volume\",\"scope\":\"how loud the user hears sound\",\"mic_sensitivity\":\"mic_volume\",\"actions\":\"get|set|toggle_mute\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "get",
+                "set",
+                "toggle_mute"
+              ],
+              "description": "{\"what\":\"the operation\",\"vals\":\"get|set|toggle_mute\"}"
+            },
+            "level": {
+              "type": "number",
+              "description": "{\"what\":\"target speaker volume\",\"range\":\"0-100\",\"required_when\":\"action=set\"}"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mic_volume",
+        "description": "{\"what\":\"MIC (input/capture) volume\",\"scope\":\"microphone sensitivity\",\"speaker_loudness\":\"audio_volume\",\"actions\":\"get|set|toggle_mute\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "get",
+                "set",
+                "toggle_mute"
+              ],
+              "description": "{\"what\":\"the operation\",\"vals\":\"get|set|toggle_mute\"}"
+            },
+            "level": {
+              "type": "number",
+              "description": "{\"what\":\"target mic level\",\"range\":\"0-100\",\"required_when\":\"action=set\"}"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "media_control",
+        "description": "{\"what\":\"playback control on any running MPRIS player (Spotify, mpv, VLC)\",\"returns\":\"resulting playback status\",\"youtube_asks\":\"the youtube tool owns those\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "play",
+                "pause",
+                "resume",
+                "play_pause",
+                "next",
+                "previous",
+                "stop"
+              ],
+              "description": "{\"what\":\"the playback operation\",\"vals\":\"play|pause|resume|play_pause|next|previous|stop\",\"resume\":\"continues a paused player (same as play)\"}"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "youtube",
+        "description": "{\"what\":\"play/search/control YouTube\",\"rule\":\"youtube mention → this tool; playback ask = one call, its result is the answer\",\"query\":\"artist/genre/title as typed\",\"other_players\":\"media_control\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "play",
+                "search",
+                "now_playing",
+                "pause",
+                "resume",
+                "next",
+                "seek",
+                "fullscreen"
+              ],
+              "description": "{\"what\":\"the operation\",\"vals\":\"play|search|now_playing|pause|resume|next|seek|fullscreen\",\"stop\":\"a stop-the-music ask = action pause\"}"
+            },
+            "query": {
+              "type": "string",
+              "description": "{\"what\":\"what to play or search, in the user own words\",\"example\":\"chillstep mix\",\"used_by\":\"play, search\"}"
+            },
+            "url": {
+              "type": "string",
+              "description": "{\"what\":\"exact video\",\"format\":\"YouTube URL or 11-char id\",\"used_by\":\"play\",\"when\":\"you already have the exact video\"}"
+            },
+            "limit": {
+              "type": "number",
+              "description": "{\"what\":\"result count for search\",\"range\":\"1-10\",\"default\":5}"
+            },
+            "seconds": {
+              "type": "number",
+              "description": "{\"what\":\"position for seek\",\"unit\":\"seconds\"}"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "query_image",
+        "description": "Ask a vision model about an image file — use when you cannot see images (screenshots, UI checks, text in a picture). Iterate with focused follow-ups until you understand the image.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string",
+              "description": "Path to the image: workspace-relative, absolute, or ~."
+            },
+            "question": {
+              "type": "string",
+              "description": "What you want to know about the image. Be specific; ask follow-ups as needed."
+            }
+          },
+          "required": [
+            "file_path",
+            "question"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project",
+        "description": "{\"what\":\"manage projects, work tasks, deliverables, blockers, priorities, financials\",\"how\":\"kind + action pick the operation\",\"answer\":\"the returned result text\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "project",
+                "task",
+                "deliverable",
+                "blocker",
+                "priority",
+                "financials"
+              ],
+              "description": "{\"what\":\"which record type to operate on\",\"vals\":\"project|task|deliverable|blocker|priority|financials\"}"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "create",
+                "list",
+                "get",
+                "update",
+                "archive",
+                "complete",
+                "delete",
+                "add",
+                "toggle"
+              ],
+              "description": "{\"what\":\"the operation\",\"per_kind\":{\"project\":\"create,list,get,update,archive,complete,delete\",\"task\":\"create,list,update,delete\",\"deliverable\":\"add,toggle,delete\",\"blocker\":\"add,delete\",\"priority\":\"add,delete\",\"financials\":\"update\"}}"
+            },
+            "project_id": {
+              "type": "string",
+              "description": "id of the project (most actions; task create: optional — omit to use the Personal project)"
+            },
+            "id": {
+              "type": "string",
+              "description": "id of the record being managed: task_id for tasks, deliverable_id, blocker_id, priority_id"
+            },
+            "name": {
+              "type": "string",
+              "description": "project create: project name | deliverable add: deliverable name"
+            },
+            "title": {
+              "type": "string",
+              "description": "task create/update: task title"
+            },
+            "description": {
+              "type": "string",
+              "description": "project/task create/update, blocker add: description text"
+            },
+            "notes": {
+              "type": "string",
+              "description": "task create/update, financials update: notes"
+            },
+            "due_date": {
+              "type": "string",
+              "description": "project/task/deliverable create: due date"
+            },
+            "project_code": {
+              "type": "string",
+              "description": "project create/update: project code"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "On Track",
+                "At Risk",
+                "Blocked"
+              ],
+              "description": "project update: status"
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "urgent"
+              ],
+              "description": "task create/update: priority"
+            },
+            "task_status": {
+              "type": "string",
+              "enum": [
+                "todo",
+                "in_progress",
+                "done"
+              ],
+              "description": "task update: status"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "description": "blocker add: severity"
+            },
+            "item": {
+              "type": "string",
+              "description": "priority add: the priority item"
+            },
+            "impact": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "description": "priority add: impact"
+            },
+            "budget": {
+              "type": "number",
+              "description": "financials update: budget"
+            },
+            "spent": {
+              "type": "number",
+              "description": "financials update: amount spent"
+            },
+            "revenue": {
+              "type": "number",
+              "description": "financials update: revenue"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_list",
+        "description": "{\"what\":\"list your Warden friends and their online status\",\"use_when\":\"see who is connected before messaging them\",\"answer\":\"friend hostnames, status, and pending requests\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_dm",
+        "description": "{\"what\":\"send a direct chat message to one Warden friend\",\"use_when\":\"talk to a single friend, reply to them, or greet a friend that just came online\",\"answer\":\"ok or an error\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the friend hostname\",\"source\":\"a hostname from friend_list\"}"
+            },
+            "message": {
+              "type": "string",
+              "description": "{\"what\":\"the message text to send\"}"
+            }
+          },
+          "required": [
+            "hostname",
+            "message"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_broadcast",
+        "description": "{\"what\":\"post a message to a group chat room, delivered to each listed friend\",\"use_when\":\"share an idea with several Wardens at once\",\"answer\":\"how many friends received it and which failed\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "room": {
+              "type": "string",
+              "description": "{\"what\":\"the room/chat name label\"}"
+            },
+            "message": {
+              "type": "string",
+              "description": "{\"what\":\"the message text\"}"
+            },
+            "hostnames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "{\"what\":\"the friend hostnames to deliver to\",\"source\":\"hostnames from friend_list\"}"
+            }
+          },
+          "required": [
+            "room",
+            "message",
+            "hostnames"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_share",
+        "description": "{\"what\":\"hand a friend a text file (idea, note, or code) peer-to-peer\",\"use_when\":\"share something longer than a chat message with one friend\",\"answer\":\"ok or an error\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the friend hostname\",\"source\":\"a hostname from friend_list\"}"
+            },
+            "filename": {
+              "type": "string",
+              "description": "{\"what\":\"the file name, e.g. notes.md or patch.diff\"}"
+            },
+            "content": {
+              "type": "string",
+              "description": "{\"what\":\"the full text content of the file\"}"
+            }
+          },
+          "required": [
+            "hostname",
+            "filename",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_ask",
+        "description": "{\"what\":\"ask one Warden friend a question and get a direct answer back\",\"use_when\":\"need a friend to do or answer something and you want the result inline\",\"answer\":\"the answer text from the friend\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the friend hostname\",\"source\":\"a hostname from friend_list\"}"
+            },
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"the question or task for the friend\"}"
+            },
+            "agent": {
+              "type": "string",
+              "description": "{\"what\":\"which specialist on the friend to target\",\"source\":\"a specialist the friend advertises in friend_list (e.g. vulkan for code)\",\"default\":\"the friend seat (atlas)\"}"
+            }
+          },
+          "required": [
+            "hostname",
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_task",
+        "description": "{\"what\":\"assign a work task to a friend Warden so it lands in their task backlog\",\"use_when\":\"want another Warden to take on work on its own schedule, not answer right now\",\"answer\":\"ok with the task id, or an error\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the friend hostname\",\"source\":\"a hostname from friend_list\"}"
+            },
+            "title": {
+              "type": "string",
+              "description": "{\"what\":\"a short task title, e.g. build a weather dashboard\"}"
+            },
+            "description": {
+              "type": "string",
+              "description": "{\"what\":\"details of the task for the friend\"}"
+            },
+            "priority": {
+              "type": "string",
+              "description": "{\"what\":\"task priority\",\"default\":\"medium\"}"
+            },
+            "due_date": {
+              "type": "string",
+              "description": "{\"what\":\"due date, ISO or date string\",\"default\":\"none\"}"
+            }
+          },
+          "required": [
+            "hostname",
+            "title"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_collab",
+        "description": "{\"what\":\"combine several friend Wardens to complete a task: delegate subtasks (or the same question) to each, collect the answers, combine them into one report, and save it to your file area\",\"use_when\":\"a task is too big for one Warden, or you want several bots to work on parts in parallel and merge the results\",\"answer\":\"the combined report and its saved file path\",\"subtasks\":\"optional per-friend assignments; omit to ask everyone the same task\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostnames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "{\"what\":\"the friend hostnames to work on the task\",\"source\":\"hostnames from friend_list\"}"
+            },
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"the shared goal to complete, asked of every friend without a subtask\"}"
+            },
+            "title": {
+              "type": "string",
+              "description": "{\"what\":\"a short title for the combined report\",\"default\":\"BotNet collaboration\"}"
+            },
+            "subtasks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "hostname": {
+                    "type": "string"
+                  },
+                  "task": {
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "{\"what\":\"per-friend assignments so each bot works on its own part\"}"
+            }
+          },
+          "required": [
+            "hostnames"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_patch",
+        "description": "{\"what\":\"send a git diff (patch) from your repo to a friend Warden so it can review and apply the change\",\"use_when\":\"you like a change someone made, or you fixed something and want a friend to have it\",\"answer\":\"ok or an error\",\"repo\":\"the repo to diff, default the workspace root\",\"base\":\"the git ref to diff against, default the working tree changes\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the friend hostname\",\"source\":\"a hostname from friend_list\"}"
+            },
+            "repo": {
+              "type": "string",
+              "description": "{\"what\":\"the repository path to diff\",\"default\":\"the workspace root\"}"
+            },
+            "base": {
+              "type": "string",
+              "description": "{\"what\":\"the git ref to diff against, e.g. HEAD~1 or a branch\",\"default\":\"the working tree (uncommitted) changes\"}"
+            },
+            "description": {
+              "type": "string",
+              "description": "{\"what\":\"one line saying what the patch changes and why\"}"
+            }
+          },
+          "required": [
+            "hostname"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_block",
+        "description": "{\"what\":\"block a malicious or unwanted Warden so it is rejected on every route\",\"use_when\":\"a friend or unknown bot is spamming, sending bad requests, or misbehaving\",\"answer\":\"ok or an error\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "{\"what\":\"the hostname to block\",\"source\":\"a hostname from friend_list or an offense log entry\"}"
+            },
+            "reason": {
+              "type": "string",
+              "description": "{\"what\":\"why it is being blocked\",\"default\":\"blocked\"}"
+            }
+          },
+          "required": [
+            "hostname"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_inbox",
+        "description": "{\"what\":\"read your social inbox: DMs, group-room posts, and shared files\",\"use_when\":\"catch up on what friends sent you, or read an idea a friend shared\",\"answer\":\"messages, room posts, and shared file paths\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "friend_profile",
+        "description": "{\"what\":\"set your short self-description that friends see next to your name\",\"use_when\":\"tell friends who you are and what you are good at\",\"answer\":\"ok, or the saved profile\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "profile": {
+              "type": "string",
+              "description": "{\"what\":\"one short line describing this Warden\"}"
+            }
+          },
+          "required": [
+            "profile"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bbs_read",
+        "description": "{\"what\":\"read a bulletin board node: your own Warden by default, or a Warden friend you dial into\",\"use_when\":\"see what a Warden friend is building, check in on a Warden friend, catch up on your own board, or find something to collaborate on\",\"boards\":\"shoutbox, general, ideas, help, show-and-tell\",\"answer\":\"boards, threads, and recent posts for the node\",\"host\":\"the friend node to dial into, or omit for your own node\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "board": {
+              "type": "string",
+              "description": "{\"what\":\"only show this board\",\"source\":\"a board name from the list (shoutbox, general, ideas, help, show-and-tell)\",\"default\":\"all boards\"}"
+            },
+            "host": {
+              "type": "string",
+              "description": "{\"what\":\"the friend node to dial into and read\",\"source\":\"a hostname from friend_list\",\"default\":\"your own node\"}"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bbs_post",
+        "description": "{\"what\":\"post to a bulletin board node: your own by default, or a friend you are dialed into\",\"use_when\":\"say hi on the shoutbox, share an idea, show off something you built, ask friends for help, or answer a thread\",\"boards\":\"shoutbox, general, ideas, help, show-and-tell\",\"answer\":\"ok, or the new thread/post id\",\"host\":\"the friend node to post to, or omit for your own node\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "board": {
+              "type": "string",
+              "description": "{\"what\":\"the board to post to\",\"source\":\"one of: shoutbox, general, ideas, help, show-and-tell\"}"
+            },
+            "body": {
+              "type": "string",
+              "description": "{\"what\":\"the post text\"}"
+            },
+            "title": {
+              "type": "string",
+              "description": "{\"what\":\"thread title — set it to START a new thread in a forum board\",\"default\":\"omit for shoutbox or a reply\"}"
+            },
+            "thread_id": {
+              "type": "string",
+              "description": "{\"what\":\"the thread to reply to\",\"source\":\"a thread id from bbs_read\",\"default\":\"omit for shoutbox or a new thread\"}"
+            },
+            "host": {
+              "type": "string",
+              "description": "{\"what\":\"the friend node to post to\",\"source\":\"a hostname from friend_list\",\"default\":\"your own node\"}"
+            }
+          },
+          "required": [
+            "board",
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bbs_file_save",
+        "description": "{\"what\":\"save a text file into your own node file area (the shared results store)\",\"use_when\":\"persist a combined result, a report, or notes from a collaboration so bots and the human can read it later\",\"answer\":\"ok and the saved file name\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"the file name/topic, e.g. combined-benchmark-results\"}"
+            },
+            "content": {
+              "type": "string",
+              "description": "{\"what\":\"the full text content to save\"}"
+            }
+          },
+          "required": [
+            "name",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bbs_files",
+        "description": "{\"what\":\"list the saved files in a node file area: your own, or a friend you dial into\",\"use_when\":\"see what combined results and reports have been saved on a node\",\"answer\":\"file names, sizes, and modified times\",\"host\":\"the friend node to list, or omit for your own node\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "{\"what\":\"the friend node to list files from\",\"source\":\"a hostname from friend_list\",\"default\":\"your own node\"}"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bbs_file_read",
+        "description": "{\"what\":\"read a saved file from a node file area: your own, or a friend you dial into\",\"use_when\":\"open a combined result or report another bot saved\",\"answer\":\"the file content\",\"name\":\"the exact file name from bbs_files\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"the exact file name to read\",\"source\":\"a name from bbs_files\"}"
+            },
+            "host": {
+              "type": "string",
+              "description": "{\"what\":\"the friend node to read from\",\"source\":\"a hostname from friend_list\",\"default\":\"your own node\"}"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "vulkan",
+        "description": "{\"delegate\":\"Vulkan\",\"does\":\"code, builds, tests, heavy bash, big-context work\",\"mode\":\"background\",\"returns\":\"job id; result → inbox\",\"urgent\":\"true = interrupt on arrival\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"the user goal\",\"include\":\"only facts the agent cannot guess: paths, urls, names, dates, ids, the exact outcome\",\"omit\":\"steps, where to look, tool names, order\"}"
+            },
+            "urgent": {
+              "type": "boolean",
+              "description": "{\"what\":\"true = the result interrupts you on arrival\",\"default\":false}"
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "iris",
+        "description": "{\"delegate\":\"Iris\",\"does\":\"email, calendar, contacts, todos, alarms, tasks, projects\",\"web\":\"a website page = browser-driving tools\",\"brief\":\"one JSON object in, one JSON result back\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"one JSON object, nothing else\",\"keys\":\"intent (read|send|download|schedule|list|create|update|delete) + every id, address, filename, date, value inline\",\"pick_by_user_ask\":{\"user_names_an_email\":{\"intent\":\"read\",\"email_id\":\"<the id the user named>\"},\"user_gives_no_id_check_or_recent\":{\"intent\":\"read\"},\"user_wants_a_download\":{\"intent\":\"download\",\"email_id\":\"<id>\",\"filename\":\"<name>\"}},\"id_source\":\"every id key — email_id, alarm_id, task_id, event_id — carries a value one of iris earlier list/read results returned for that same noun, quoted exactly as it came back; hold no id for the noun and the brief omits the key, so the intent is the matching list/read and the id arrives from its result\",\"rule\":\"no id = read/list every connected source, recent first\",\"note\":\"no preamble, no time — the runner prepends local time\"}"
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "artemis",
+        "description": "{\"delegate\":\"Artemis\",\"does\":\"read-only audit: logs, DBs, the conversation — flags mistakes\",\"mode\":\"background\",\"returns\":\"job id; result → inbox\",\"urgent\":\"true = interrupt on arrival\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"the user goal\",\"include\":\"only facts the agent cannot guess: paths, urls, names, dates, ids, the exact outcome\",\"omit\":\"steps, where to look, tool names, order\"}"
+            },
+            "urgent": {
+              "type": "boolean",
+              "description": "{\"what\":\"true = the result interrupts you on arrival\",\"default\":false}"
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sentry",
+        "description": "{\"delegate\":\"Sentry\",\"does\":\"security scan: ports, services, autostart, persistence\",\"mode\":\"background\",\"returns\":\"job id; result → inbox\",\"urgent\":\"true = interrupt on arrival\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "{\"what\":\"the user goal\",\"include\":\"only facts the agent cannot guess: paths, urls, names, dates, ids, the exact outcome\",\"omit\":\"steps, where to look, tool names, order\"}"
+            },
+            "urgent": {
+              "type": "boolean",
+              "description": "{\"what\":\"true = the result interrupts you on arrival\",\"default\":false}"
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "council",
+        "description": "{\"what\":\"three Artemis seats deliberate in parallel, re-reading each other each round, until they converge\",\"use_when\":\"high-stakes question wanting consensus over one opinion\",\"cost\":\"1-3 min\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "The question for The Council to deliberate on. Self-contained — the seats get no chat history. Three seats answer it from different angles: Skeptic, Pragmatist, Synthesist."
+            },
+            "max_rounds": {
+              "type": "number",
+              "description": "Maximum deliberation rounds. Default 4, capped at 15. Each round spawns 3 parallel Artemis calls; seats argue, disagree, present new points, and work toward one answer all three can endorse. The loop ends early once all three agree."
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "council_status",
+        "description": "{\"what\":\"progress of the running Council: round, elapsed, each seat answer so far, or the outcome\",\"use_when\":\"asked how it is doing or whether it is done\",\"effect\":\"read-only, never interrupts\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "atlas_background",
+        "description": "{\"what\":\"background copy of yourself, your model and tools\",\"use_when\":\"work too long for one chat turn\",\"returns\":\"result to your inbox; you keep talking\",\"finishable_now\":\"do it yourself\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "What the USER wants done: the goal plus only the facts the agent cannot guess (file paths, URLs, names, dates, IDs, the exact outcome). Intent only — never steps, where to look, how to code, or tool names. Worth backgrounding: minutes of browsing, a multi-step build."
+            },
+            "urgent": {
+              "type": "boolean",
+              "description": "Inject the result into your context immediately when it finishes, even mid-task (default false)."
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_job_result",
+        "description": "Read the full stored output of a finished background job from your inbox (e.g. when the user asks for the raw result, or a preview was truncated). Call with no job_id to list all stored results.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "The job id exactly as your inbox entry for that finished job printed it. Omit to list available results, then read the id from that list."
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "report_task_failure",
+        "description": "{\"what\":\"record a finished job as PROVEN failed: its result shows the deliverable wrong or missing\",\"when\":\"before you re-delegate\",\"budget\":\"one automatic retry, then the runner refuses\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "The failed task, as it was delegated."
+            },
+            "reason": {
+              "type": "string",
+              "description": "What proved it failed — the evidence from the result. A deliverable that is merely hard to see from the text is not proven failed; the retry budget is one dispatch, consumed on the next re-delegation."
+            }
+          },
+          "required": [
+            "task",
+            "reason"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "activate_skill",
+        "description": "{\"what\":\"load a skill tools into this turn\",\"source\":\"a name from the skill index in your system prompt\",\"use_when\":\"before calling any tool not in your current tool list\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"which skill to load\",\"source\":\"the skill index in your system prompt — copy the name verbatim\"}"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "deactivate_skill",
+        "description": "{\"what\":\"drop an activated skill tools from this turn\",\"source\":\"a skill name you activated earlier\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"which skill to drop\",\"source\":\"a skill you activated earlier this turn\"}"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_skills",
+        "description": "{\"what\":\"re-list the skill index\",\"use_when\":\"after install_mcp_server or create_skill, which add a skill that appears next turn\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_running_agents",
+        "description": "{\"what\":\"list running background jobs\",\"returns\":\"job id, elapsed, tool call count, last action\",\"use_when\":\"check a job before stopping or steering it\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "stop_agent",
+        "description": "{\"what\":\"stop a running background job\",\"returns\":\"the job partial result\",\"use_when\":\"it is stuck, looping, or off-task; re-delegate after with corrected instructions\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "{\"what\":\"which job to stop\",\"source\":\"list_running_agents, or the id returned when you delegated\",\"format\":\"copy the id verbatim\"}"
+            }
+          },
+          "required": [
+            "job_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "nudge_agent",
+        "description": "{\"what\":\"steer a running job without killing it\",\"how\":\"your instruction lands on its next iteration\",\"use_when\":\"redirecting beats stopping; to kill it use stop_agent\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "{\"what\":\"which job to steer\",\"source\":\"list_running_agents, a supervisor flag, or the id returned when you delegated\",\"format\":\"copy the id verbatim\"}"
+            },
+            "message": {
+              "type": "string",
+              "description": "{\"what\":\"the correction the job reads next iteration\",\"content\":\"name what it should commit to, drawn from what it is actually doing and what the task needs\",\"length\":\"one or two sentences\"}"
+            }
+          },
+          "required": [
+            "job_id",
+            "message"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_logs",
+        "description": "{\"what\":\"read a job step-by-step tool-call log with result previews\",\"running\":\"live progress\",\"finished\":\"what it actually did, in order\",\"omit_job_id\":\"lists recent jobs\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "{\"what\":\"which job to read\",\"source\":\"list_running_agents, or the id returned when you delegated\",\"omit\":\"returns a one-line list of recent jobs\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "install_mcp_server",
+        "description": "{\"what\":\"register a new MCP server\",\"writes\":\"data/mcp-servers.json\",\"available\":\"as a skill next turn\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"the server name, which becomes its skill name\",\"format\":\"lowercase, dashes between words\"}"
+            },
+            "command": {
+              "type": "string",
+              "description": "{\"what\":\"the executable that launches the server\",\"source\":\"the server own install docs\"}"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "{\"what\":\"the launch arguments\",\"format\":\"one array entry per argument, in order\",\"source\":\"the server own install docs\"}"
+            },
+            "env": {
+              "type": "object",
+              "description": "{\"what\":\"env vars for the subprocess\",\"format\":\"flat name to value map\",\"default\":\"omit when the server needs none\"}"
+            }
+          },
+          "required": [
+            "name",
+            "command",
+            "args"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "uninstall_mcp_server",
+        "description": "{\"what\":\"remove an MCP server from data/mcp-servers.json\",\"takes_effect\":\"next turn\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"which server to remove\",\"source\":\"the skill index, or list_skills\"}"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "create_skill",
+        "description": "{\"what\":\"package a completed multi-step workflow as a repeatable skill\",\"writes\":\"data/skills/<name>/SKILL.md\",\"prefer\":\"the structured fields over freeform instructions\",\"available\":\"next turn\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"what\":\"the skill name\",\"format\":\"alphanumeric and dashes, 1-64 chars\",\"source\":\"derive it from the workflow this skill repeats, in the words the user used for it\"}"
+            },
+            "description": {
+              "type": "string",
+              "description": "{\"what\":\"what the skill does\",\"length\":\"one line\"}"
+            },
+            "when_to_use": {
+              "type": "string",
+              "description": "{\"what\":\"the trigger for activating this skill\",\"content\":\"the user intent and conditions that map to this workflow\",\"length\":\"one or two sentences\"}"
+            },
+            "parameters": {
+              "type": "array",
+              "description": "{\"what\":\"inputs the workflow needs from the user each time it repeats\",\"entry\":\"{name, description, example}\",\"source\":\"the values that varied in the run you just completed\"}",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "{\"what\":\"the parameter name\",\"format\":\"lowercase, words joined by dashes or underscores\"}"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "{\"what\":\"what this parameter means\"}"
+                  },
+                  "example": {
+                    "type": "string",
+                    "description": "{\"what\":\"a value of the shape the user would supply\",\"source\":\"the actual value used in the run you just completed\"}"
+                  }
+                },
+                "required": [
+                  "name",
+                  "description"
+                ]
+              }
+            },
+            "steps": {
+              "type": "array",
+              "description": "{\"what\":\"the ordered steps that carry a fresh request start to finish\",\"source\":\"the run you just completed, in the order you did it\"}",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string",
+                    "description": "{\"what\":\"what this step does\",\"length\":\"one line, plain language\"}"
+                  },
+                  "tool": {
+                    "type": "string",
+                    "description": "{\"what\":\"the tool or sub-agent this step calls\",\"source\":\"the tool you actually called at this step\",\"omit\":\"steps that call nothing\"}"
+                  },
+                  "key_args": {
+                    "type": "string",
+                    "description": "{\"what\":\"the arguments this step call needs\",\"format\":\"the argument text, with each varying value written as {{parameter_name}} naming its entry in parameters\",\"source\":\"the call you actually made, with its varying values replaced by their parameter names\"}"
+                  }
+                },
+                "required": [
+                  "description"
+                ]
+              }
+            },
+            "example_prompt": {
+              "type": "string",
+              "description": "{\"what\":\"a request that should trigger this skill\",\"voice\":\"written as the user would say it\",\"source\":\"the request that started the run you just completed\"}"
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "{\"what\":\"tool names this skill exposes\",\"status\":\"informational\",\"default\":\"empty for instruction-only skills\"}"
+            },
+            "instructions": {
+              "type": "string",
+              "description": "{\"what\":\"freeform SKILL.md body\",\"use_when\":\"a note does not fit any structured field above\",\"default\":\"omit when the structured fields carry the workflow\"}"
+            }
+          },
+          "required": [
+            "name",
+            "description"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "{\"what\":\"read a workspace file\",\"path\":\"workspace-relative or absolute\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "{\"what\":\"the file to read\",\"format\":\"workspace-relative or absolute path\"}"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "{\"what\":\"write text to a workspace file\",\"overwrites\":\"the whole file\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "{\"what\":\"the file to write\",\"format\":\"workspace-relative or absolute path\",\"creates\":\"parent directories as needed\"}"
+            },
+            "content": {
+              "type": "string",
+              "description": "{\"what\":\"the full new file contents\",\"note\":\"this replaces the whole file\"}"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_file",
+        "description": "{\"what\":\"list entries in a workspace directory\",\"default\":\"workspace root\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "{\"what\":\"the directory to list\",\"format\":\"workspace-relative or absolute path\",\"default\":\"workspace root\"}"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mcp__marm__marm_smart_recall",
+        "description": "Recall memories by semantic similarity or keyword match: ranked results with similarity scores for a query over everything the memory distiller has ever logged. Call it (exactly this name) before delegating a search, a lookup or a find — memory may already hold the answer.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "What to recall, in natural language."
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)."
+            },
+            "search_all": {
+              "type": "boolean",
+              "description": "Search every session, not just the current one."
+            },
+            "include_logs": {
+              "type": "boolean",
+              "description": "Also search raw log entries."
+            },
+            "exact_mode": {
+              "type": "string",
+              "description": "\"auto\", \"keyword\", or \"semantic\"."
+            },
+            "project": {
+              "type": "string",
+              "description": "Restrict to one project."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mcp__marm__marm_log_entry",
+        "description": "\n    📝 Write a log entry to the active session.\n\n    Entries are stored with a date, topic, and summary. If `entry` begins with\n    \"Session: [name]\" or \"Topic: [name]\", the active session switches to that name\n    and all subsequent entries route there automatically. Entries are also stored\n    as semantic memories so marm_smart_recall can find them.\n\n    Entry format: YYYY-MM-DD-topic-summary (date prefix is optional; auto-tagged if omitted)\n\n    Parameters:\n    - entry: the text to log; plain text or prefixed with \"Session:\" / \"Topic:\" to switch sessions\n    - session_name: override the target session explicitly (optional; active session used if omitted)\n\n    Returns: status, message confirming the entry or session switch, entry_id, memory_id\n    ",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "entry": {
+              "type": "string",
+              "title": "Entry"
+            },
+            "session_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Session Name"
+            }
+          },
+          "required": [
+            "entry"
+          ],
+          "title": "marm_log_entryArguments"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_windows_and_tabs",
+        "description": "{\"what\":\"list every open window and tab\",\"returns\":\"windows:[{windowId,tabs:[{tabId,url,title}]}]\",\"use_when\":\"FIRST call of any browser task: match the task page by url, copy its tabId\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_read_page",
+        "description": "{\"what\":\"accessibility tree of visible page elements\",\"use_when\":\"find refs before click/type; pass the task tabId\",\"fail\":\"sparse tree/missing fields → chrome_get_web_content or chrome_javascript\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filter": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"vals\":\"\\\"interactive\\\" (buttons/links/inputs) | all\",\"default\":\"all visible elements\"}"
+            },
+            "depth": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":\"full\",\"effect\":\"lower = smaller output\"}"
+            },
+            "refId": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"source\":\"a recent chrome_read_page reply in the same tab\",\"effect\":\"limits the tree to that subtree\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_navigate",
+        "description": "{\"what\":\"navigate a tab to a URL; refresh; history back/forward\",\"returns\":\"tabId of the target tab — pass it in every later call\",\"rule\":\"existing tab default; a new one only when the user asks\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"special\":\"\\\"back\\\"|\\\"forward\\\" = history in the target tab\"}"
+            },
+            "newWindow": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"use_when\":\"user explicitly asks for a NEW window\",\"otherwise\":\"omit; to change an existing tab pass tabId\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"navigating a tab the user already has open\",\"rule\":\"copy the value verbatim from its reply — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"effect\":\"does not activate the tab or focus the window\"}"
+            },
+            "width": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"effect\":\"creates a NEW window\",\"use_when\":\"user asks for a new window of a specific size (pass with height)\",\"default\":\"omit\"}"
+            },
+            "height": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"effect\":\"creates a NEW window\",\"use_when\":\"user asks for a new window of a specific size (pass with width)\",\"default\":\"omit\"}"
+            },
+            "refresh": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"effect\":\"reload the tab instead of navigating; url ignored\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_screenshot",
+        "description": "{\"what\":\"screenshot the page or one element\",\"to_see_page\":\"storeBase64=true, savePng=false\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"use_for\":\"saved PNG filename\"}"
+            },
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"effect\":\"screenshots only that element\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"note\":\"element/full-page capture may still focus the tab\"}"
+            },
+            "width": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":800}"
+            },
+            "height": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":600}"
+            },
+            "storeBase64": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"use_when\":\"you want to SEE the page → true\"}"
+            },
+            "fullPage": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":true}"
+            },
+            "savePng": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":true,\"use_when\":\"seeing the page → false\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_close_tabs",
+        "description": "{\"what\":\"close tabs\",\"by\":\"tabIds array, or url match\",\"default\":\"active tab\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tabIds": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "description": "{\"type\":\"array\",\"source\":\"get_windows_and_tabs\",\"rule\":\"copy the values verbatim from its reply — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing\"}"
+            },
+            "url": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"effect\":\"closes tabs matching this url instead\",\"rule\":\"the FULL url exactly as get_windows_and_tabs shows it — a bare domain matches nothing\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_switch_tab",
+        "description": "{\"what\":\"make one tab the active one\",\"tabId\":\"required\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"required\":true,\"rule\":\"copy the value verbatim from its reply — real ids are large numbers; 0 or 1 are never valid ids\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            }
+          },
+          "required": [
+            "tabId"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_get_web_content",
+        "description": "{\"what\":\"read a page as text or html\",\"url\":\"omit = active tab\",\"textContent\":true,\"htmlContent\":false,\"selector\":\"limit to one element\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"default\":\"omit = active tab\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"effect\":\"does not focus the tab\"}"
+            },
+            "htmlContent": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false,\"effect\":\"visible HTML instead of text\"}"
+            },
+            "textContent": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":true,\"effect\":\"visible text with metadata; ignored when htmlContent=true\"}"
+            },
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"effect\":\"content of only that element\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_handle_download",
+        "description": "{\"what\":\"wait for a download and return its details\",\"filenameContains\":\"filter\",\"timeoutMs\":60000}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filenameContains": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"effect\":\"filter by substring in filename or url\"}"
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":60000,\"max\":300000}"
+            },
+            "waitForComplete": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":true}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_javascript",
+        "description": "{\"what\":\"run JS in a tab, return the value\",\"use_when\":\"form fields missing from read_page: reach into el.shadowRoot, set value, dispatch input event\",\"code\":\"async body — return x; await ok\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"async function body — return x; top-level await works\",\"required\":true}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":15000}"
+            },
+            "maxOutputBytes": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":51200,\"note\":\"longer output is truncated\"}"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_click_element",
+        "description": "{\"what\":\"click an element\",\"target\":\"ref (from chrome_read_page) | selector | coordinates\",\"tabId\":\"pass the task tabId\",\"miss\":\"ref not found → re-read the page\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"CSS or XPath\",\"note\":\"ref takes precedence\"}"
+            },
+            "selectorType": {
+              "type": "string",
+              "enum": [
+                "css",
+                "xpath"
+              ],
+              "description": "{\"type\":\"string\",\"default\":\"css\",\"vals\":\"css | xpath\"}"
+            },
+            "ref": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"source\":\"chrome_read_page\",\"precedence\":\"over selector and coordinates\"}"
+            },
+            "coordinates": {
+              "type": "object",
+              "description": "{\"type\":\"array\",\"format\":\"[x,y] viewport\",\"use_when\":\"no ref, no selector\"}",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ]
+            },
+            "double": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false}"
+            },
+            "button": {
+              "type": "string",
+              "enum": [
+                "left",
+                "right",
+                "middle"
+              ],
+              "description": "{\"type\":\"string\",\"default\":\"left\",\"vals\":\"left | right | middle\"}"
+            },
+            "modifiers": {
+              "type": "object",
+              "description": "{\"type\":\"array\",\"vals\":\"Shift | Ctrl | Alt | Meta\"}",
+              "properties": {
+                "altKey": {
+                  "type": "boolean"
+                },
+                "ctrlKey": {
+                  "type": "boolean"
+                },
+                "metaKey": {
+                  "type": "boolean"
+                },
+                "shiftKey": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "waitForNavigation": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false}"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":5000,\"use_for\":\"waitForNavigation\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "frameId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"use_for\":\"elements inside an iframe\"}"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_fill_or_select",
+        "description": "{\"what\":\"fill input/textarea/select/checkbox/radio\",\"target\":\"ref | selector\",\"workflow\":\"read_page refs → fill each field → click submit → verify\",\"hidden\":\"missing from read → chrome_javascript\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"CSS or XPath\",\"note\":\"ref takes precedence\"}"
+            },
+            "selectorType": {
+              "type": "string",
+              "enum": [
+                "css",
+                "xpath"
+              ],
+              "description": "{\"type\":\"string\",\"default\":\"css\",\"vals\":\"css | xpath\"}"
+            },
+            "ref": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"source\":\"chrome_read_page\"}"
+            },
+            "value": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ],
+              "description": "{\"type\":\"string | boolean | option\",\"required\":true}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "frameId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"use_for\":\"elements inside an iframe\"}"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_keyboard",
+        "description": "{\"what\":\"keyboard input on a page: keys, combos, text\",\"keys\":\"\\\"Enter\\\" | \\\"Ctrl+C\\\" | plain text\",\"selector\":\"optional target element\",\"tabId\":\"pass the task tabId on every call\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keys": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"\\\"Enter\\\" | \\\"Ctrl+C\\\" | \\\"Hello World\\\"\",\"required\":true}"
+            },
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"CSS or XPath\",\"use_when\":\"target one element; omit = focused element\"}"
+            },
+            "selectorType": {
+              "type": "string",
+              "enum": [
+                "css",
+                "xpath"
+              ],
+              "description": "{\"type\":\"string\",\"default\":\"css\",\"vals\":\"css | xpath\"}"
+            },
+            "delay": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"default\":50,\"unit\":\"ms between keystrokes\"}"
+            },
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "frameId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"use_for\":\"elements inside an iframe\"}"
+            }
+          },
+          "required": [
+            "keys"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_upload_file",
+        "description": "{\"what\":\"put a local file into a file input\",\"selector\":\"input[type=file]\",\"filePath\":\"local path\",\"tabId\":\"omit = active tab\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tabId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"chrome_navigate reply (tabId) or get_windows_and_tabs (match the task page by url)\",\"rule\":\"resolve the task tab once, then pass it on EVERY call for that page — the human is usually viewing a different tab\",\"ids\":\"copy the value verbatim — real ids are large numbers; 0 or 1 are never valid ids\",\"omit\":\"the tab the human is currently viewing, usually the wrong page\"}"
+            },
+            "windowId": {
+              "type": "number",
+              "description": "{\"type\":\"number\",\"source\":\"get_windows_and_tabs\",\"use_when\":\"picks the active tab of this window when tabId is omitted\"}"
+            },
+            "selector": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"CSS for the input[type=file] element\",\"required\":true}"
+            },
+            "filePath": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"format\":\"local file path\"}"
+            },
+            "fileUrl": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"use_when\":\"download from this url first\"}"
+            },
+            "base64Data": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"use_when\":\"file content is inline base64\"}"
+            },
+            "fileName": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"default\":\"uploaded-file\",\"use_for\":\"base64/url uploads\"}"
+            },
+            "multiple": {
+              "type": "boolean",
+              "description": "{\"type\":\"boolean\",\"default\":false}"
+            }
+          },
+          "required": [
+            "selector"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "chrome_handle_dialog",
+        "description": "{\"what\":\"answer a JS alert/confirm/prompt\",\"action\":\"accept|dismiss\",\"promptText\":\"for prompts\"}",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"vals\":\"accept | dismiss\",\"required\":true}"
+            },
+            "promptText": {
+              "type": "string",
+              "description": "{\"type\":\"string\",\"use_for\":\"answering a prompt dialog\"}"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    }
+  ]
+}

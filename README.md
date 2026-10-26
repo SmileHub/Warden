@@ -20,7 +20,6 @@
 **[🔊 Audio Pipeline](#modular-audio-pipeline-runsh)** ·
 **[🗣️ Voice](#%EF%B8%8F-voice-assistant)** ·
 **[🛰️ Satellite](#-satellite-pi-audio-relay)** ·
-**[🛡️ Security Mode](#-security-mode)** ·
 **[🚀 Quick Start](#%EF%B8%8F-quick-start)**
 
 </div>
@@ -37,7 +36,7 @@ Warden is an AI agent with **the same access as your user account**. It executes
 
 This is the warning the dashboard shows on first launch. It is not a joke and it is not boilerplate. Do not run Warden on a machine you care about unless you have read the code, understood the risks, and accepted that you are handing a language model the keys to your computer.
 
-Now that *that's* out of the way — I'm currently running it on my laptop and my desktop, just rawdogging the system, and it has been solid. `sudo` prompts pop up graphically (polkit catches them), and in practice it doesn't stray out of its workspace unless it's actively searching for files or the like. Is this stupid in theory? Yes, absolutely. Does it work in practice? So far, yes — for now. Just back things up from time to time, in case.
+Now that *that's* out of the way — I'm currently running it on my desktop, just rawdogging the system, and it has been solid. `sudo` prompts pop up graphically (polkit catches them), and in practice it doesn't stray out of its workspace unless it's actively searching for files or the like. Is this stupid in theory? Yes, absolutely. Does it work in practice? So far, yes — for now. Just back things up from time to time, in case.
 
 ---
 
@@ -49,98 +48,104 @@ Warden is a personal AI assistant that lives on your desktop. It runs local mode
 
 ## Architecture
 
-### The Orchestrator
+### The Seat
 
-A single LLM — the **orchestrator** — runs the show. It's the only thing you talk to, and it's deliberately *small*: it can run on an **e4b** (`gemma4:latest`) locally on Ollama — but a **31B cloud model is recommended**. It doesn't write your reports, doesn't browse the web, doesn't run shell commands. It reads your message, works out what you actually want, hands a clean brief to the right specialist, and then **babysits** that specialist until the job is done — cutting loose the ones that go sideways and re-briefing the ones that fail. A small model supervising a frontier model, and it doesn't fuck up.
+A single LLM — **Warden**, the captain's first officer — runs the show, and it is the only thing you talk to. It both answers and does the work: the browser, the desktop, the shell, files and the web are its own hands, not a specialist's. It hands off only what genuinely belongs to another seat — email and scheduling to Iris, heavy code to Vulkan, audits to Artemis — and work too long for a chat turn to a background copy of itself.
+
+This used to be two seats: a deliberately small router that never touched the internet, delegating every hands-on step to Atlas. That split cost a round trip and a brief on every action, and the router could only describe work it could not see. The router and Atlas are now one seat, running one model, with one prompt.
 
 ```
-You → Orchestrator (small; e4b local works, 31B cloud recommended) → Atlas (large, cloud) → result → Orchestrator → You
-                                   → Vulkan (coding, background)
-                                   → Iris (email/calendar/digest)
-                                   → Dexter (scheduling)
-                                   → Byte (projects)
-                                   → Mercury (memory)
-                                   → Oculus (security)
-                                   → Artemis (audit)
-                                   → The Council (deliberation)
+You → Warden ─ does it itself: browser, desktop, shell, files, web ─→ You
+              └─ hands off what it does not own:
+                   → Iris   (email, calendar, reminders, alarms)
+                   → Vulkan (code and builds, background)
+                   → Artemis(audit, background)
+                   → Sentry (security scans, background)
+                   → Council(deliberation)
+                   → atlas_background (a copy of itself, for long work)
 ```
 
-> 💡 **The orchestrator never touches the internet directly.** It doesn't browse, search, or fetch URLs. It delegates. That separation lets the orchestrator stay small while the internet-connected agents run on the biggest models available.
+> 💡 **Tools are not carried in context all the time.** Every seat but Iris gets a per-turn ranked set — the always-needed core plus what the task actually calls for — out of a pool that now includes every installed MCP server. A capability that doesn't surface is one `list_skills` + `activate_skill` away, so nothing is lost; it just stops being paid for on turns that never touch it. Iris is exempt: it runs the small fine-tuned toolcall model, trained on exactly one fixed tool list, so a list that changed per turn would put it off-distribution.
 
 #### A small model is enough — that's the whole point
 
-This is the counterintuitive part: the orchestrator is the cheapest model in the stack, and that's by design. Its job isn't generation, it's **classification and composition**. Every turn it answers a small set of questions: *what does the user want, which specialist owns it, what does that specialist need to know to start cold, and is anything I'm currently babysitting going sideways?* None of that needs a frontier model. An e4b nails it — locally, in well under a second per turn, on hardware you already own — so the thing you talk to most carries no per-turn cloud cost.
+This is the counterintuitive part: the seat can be the cheapest model in the stack, and that's by design. Most turns are **classification and composition** — what does the user want, which specialist owns it, what does that specialist need to know to start cold, is anything I'm babysitting going sideways? — plus hands-on work that a good small model already nails (open a page, run a command, edit a file). None of that needs a frontier model. An e4b handles it — locally, in well under a second per turn, on hardware you already own — so the thing you talk to most carries no per-turn cloud cost.
 
-**e4b works; 31B cloud is recommended.** The e4b is the floor, and the whole point is that the bar for "good enough to supervise" is low — it routes and composes briefs, it doesn't generate. But supervision has a failure mode the e4b will hit eventually: when a sub-agent returns narration that *looks* like a result (a timestamp computation written as prose, an "I'll do that" with no tool call), an e4b orchestrator will sometimes take it at face value and relay it to you as done. A 31B cloud orchestrator reads the same non-result and notices nothing was actually produced. So: run the e4b if you want it all local and free; run the 31B cloud if you want the babysitting to actually catch sub-agents that bluff.
+**e4b works; 31B cloud is recommended.** The e4b is the floor, and the whole point is that the bar for "good enough to run the show" is low — it replies, routes, and composes briefs. But supervision has a failure mode the e4b will hit eventually: when a sub-agent returns narration that *looks* like a result (a timestamp computation written as prose, an "I'll do that" with no tool call), an e4b seat will sometimes take it at face value and relay it to you as done. A 31B cloud seat reads the same non-result and notices nothing was actually produced. (Loop-killing is the one supervision job that doesn't depend on the seat's smarts at all — a deterministic churn detector handles it regardless of model size; see [Babysitting the sub-agents](#babysitting-the-sub-agents).) So: run the e4b if you want it all local and free; run the 31B cloud if you want the babysitting to actually catch sub-agents that bluff.
 
-The expensive generation lives one layer down, in the specialists. Atlas, Vulkan, and Artemis default to a large cloud model; the three Council seats each run their own model. The orchestrator stays out of that. It states **what** needs to happen and stops — it never prescribes **how** (no URLs, no search queries, no "go to X then click Y"), because it can't even see the specialists' tools. That discipline is exactly what lets a small model supervise a frontier one without getting in the way: it can't micromanage what it can't see, so it doesn't try.
+The expensive generation splits two ways. Work the seat keeps — browser, desktop, shell, files — runs on the seat's own model. Work it delegates goes to the specialists, each on its own model: Vulkan, Artemis, and the three Council seats. A delegation is a self-contained **WHAT** brief — the seat states what needs to happen and stops, never prescribing **how** (no URLs, no search queries, no "go to X then click Y"). That discipline is what lets a small model supervise a frontier one without getting in the way: the brief carries the goal, and the specialist owns the execution.
 
 #### Babysitting the sub-agents
 
-Delegation is not fire-and-forget. When the orchestrator hands work to Atlas, Atlas runs **in the background** — the orchestrator gets a job ID back immediately and stays free to handle your next message. While those jobs run, the orchestrator supervises them on a fixed **30-second monitor tick**. On every tick it checks up on each running job — reads the synthetic status line (elapsed time, tool-call count, what the job last did and how many seconds ago) and decides whether the work is **on track**, **veering off / doing the wrong thing**, or **stuck and looping**. On track, it leaves the job alone; veering or stuck, it calls `stop_agent` and re-delegates with a corrected brief. When a job **finishes**, the result lands in an **inbox**.
+Delegation is not fire-and-forget. When the seat hands long work to a background copy of itself, the job runs **in the background** — the seat gets a job ID back immediately and stays free to handle your next message. While those jobs run, supervision is **on-demand, not automated**:
 
-Crucially, that supervision runs **silently**. The tick's prose ("Atlas is on track…") is canned filler — it doesn't go to your chat. Progress lives in the dashboard instead: the real status line each job emits on every tool call streams into a **grouped, collapsible Live Activity panel** (one summary line when collapsed, the recent history when expanded), so you watch what's actually happening without a parade of chat bubbles. The chat only carries **completed-task reports** (and interventions) — you ask once, the orchestrator drives the whole chain end to end, and you hear from it when there's something finished to tell you.
+**There is no running-job supervisor.** The periodic LLM self-audit watchdog that used to tick every few minutes and flag running jobs as **on track / off-rails / crashed** has been **cut out** — the ticker never arms, the tick function is a no-op, and the dashboard Supervisor row (model + on/off + cadence) is removed. It was **unneeded**: the seat's chain-following is now strong enough to drive a job end to end on its own — delegate → drain the finished-job inbox → confirm the result against the ask → chain the next step, or re-delegate on failure — so a second model watching the running job added false positives without value. And it was actively **harmful** on local hardware: a 3b model cannot reliably tell a slow read-or-compose from veering, so it kept flagging healthy background jobs (a read-first pass, a long idle while a 27b composes a large file) and the standing escalation rule killed them and handed the work to Vulkan — and even after the ticker was no-op'd, the seat's prompt still made it *role-play* supervisor flags about its own legitimate read-only delegations and stop them. **You supervise on demand:** ask the seat how a job is doing and it looks (`list_running_agents` / `agent_logs` / `read_job_result`), assesses the recent calls itself, and can `stop_agent` + re-delegate on its own judgment. It just no longer wakes itself up to do it. (The one thing that still runs on the supervisor model is the **completion verdict** on finished jobs — see below.)
 
-The inbox is the backbone of the async model. Finished jobs drop their full output there, and at the end of each turn the orchestrator drains it, digests what actually matters in its own voice, and chains any follow-up work the results call for — so a multi-step ask (plan → council → revise) runs end to end without you having to say "and?" or "continue" between steps. If a job **failed**, the failure routes back to the orchestrator automatically — it reads the full output, works out what went wrong, and re-delegates with a reworked brief (a different approach, a corrected URL, a missing detail — whatever the output showed was broken). You only hear about a failure if it can't be recovered; after the same task has failed the same way twice, the orchestrator stops retrying and tells you instead. Urgent results can even **interrupt a turn mid-flight**, so a finished job you're waiting on never sits behind whatever else happens to be running.
+**A deterministic churn detector.** The thing that actually stops a looping job is in code, not the LLM. The runner counts consecutive **read-only calls** (Read, Grep, Glob, Bash, WebSearch, …) with no deliverable produced. At 12 in a row it injects a *commit nudge* into the agent's next turn — "you have enough context, stop searching, write the deliverable now." If the agent keeps searching after the nudge — 10 more read-only calls — the runner aborts the job itself. Crucially, the post-nudge count is **decoupled from writes**: a single `Edit` in a sea of reads no longer resets the abort clock, so "churn punctuated by an occasional token write" can't dodge the kill. When a background job is stopped this way it **auto-escalates to Vulkan** on the same task (and burns the one retry credit so the seat can't double-dispatch on top of it). Artemis is exempt — it's read-only by design, so "lots of reads" is its job, not a loop. (Full mechanics: [docs/notes/supervision-and-churn.md](docs/notes/supervision-and-churn.md).)
 
-The net effect: you ask once, and the orchestrator owns the outcome — prompting the specialists, supervising them, cutting off the ones that drift, and correcting course until the job is done or it's genuinely stuck.
+When a job **finishes**, the result lands in an **inbox**.
+
+Crucially, supervision stays out of your chat. The churn detector's commit nudge is injected into the agent's own turn, not your conversation. Progress lives in the dashboard instead: the real status line each job emits on every tool call streams into a **grouped, collapsible Live Activity panel** (one summary line when collapsed, the recent history when expanded), so you watch what's actually happening without a parade of chat bubbles. The chat only carries **completed-task reports** (and interventions) — you ask once, the seat drives the whole chain end to end, and you hear from it when there's something finished to tell you.
+
+The inbox is the backbone of the async model. Finished jobs drop their full output there, and at the end of each turn the seat drains it, digests what actually matters in its own voice, and chains any follow-up work the results call for — so a multi-step ask (plan → council → revise) runs end to end without you having to say "and?" or "continue" between steps. If a job **failed**, the failure routes back to the seat automatically — it reads the full output, works out what went wrong, and re-delegates with a reworked brief (a different approach, a corrected URL, a missing detail — whatever the output showed was broken). You only hear about a failure if it can't be recovered; after the same task has failed the same way twice, the seat stops retrying and tells you instead. Urgent results can even **interrupt a turn mid-flight**, so a finished job you're waiting on never sits behind whatever else happens to be running.
+
+The net effect: you ask once, and the seat owns the outcome — prompting the specialists, supervising them, cutting off the ones that drift, and correcting course until the job is done or it's genuinely stuck.
 
 #### One conversation, one voice
 
-You have one conversation, with one assistant. Atlas, Iris, Dexter, and the rest never see your messages and never speak to you — the orchestrator is the only voice in the chat. It works out what you actually need, composes a self-contained brief for the right specialist, and reports back in its own words when the work is done.
+You have one conversation, with one assistant. Vulkan, Iris, and the rest never see your messages and never speak to you — the seat is the only voice in the chat. It works out what you actually need, composes a self-contained brief for the right specialist, and reports back in its own words when the work is done.
 
-![The orchestrator rewrites casual requests into clean task briefs before delegating](docs/screenshots/fabric.webp)
+![The seat rewrites casual requests into clean task briefs before delegating](docs/screenshots/fabric.webp)
 
 Your raw message never reaches a specialist. *"hey can you set the volume to like fifty percent"* goes in; *"Set the system volume to 50 percent"* is what gets delegated. Every request is rewritten into a precise, self-contained brief — typos, slang, and missing context resolved — so the executing model starts from a clean statement of the goal instead of guessing at your phrasing.
 
 ### Sub-Agents
 
-Each sub-agent has its own system prompt and toolset. Byte, Dexter, Iris, Mercury, and Oculus share one model (the dashboard's **Toolcall model**); Atlas, Vulkan, Artemis, and each Council seat keep their own. They don't share context — the orchestrator composes a self-contained task string with everything the sub-agent needs.
+Each sub-agent has its own system prompt and toolset. Iris and Sentry share one model (the dashboard's **Toolcall model**); Vulkan, Artemis, and each Council seat keep their own, and a background copy of the seat runs on the seat's own settings. They don't share context — the seat composes a self-contained task string with everything the sub-agent needs.
 
 | Agent | Model | Tools | Role |
 |-------|-------|-------|------|
 | **Atlas** | Local or cloud | Shell, browser (DOM control), desktop, files, web search/fetch, documents | Execution — anything that touches the internet or runs commands. |
 | **Vulkan** | Local or cloud | Read, Edit, Grep, Glob, Bash, build & test runs | Coding, scripting, building, heavy bash — editing source, running builds and tests, refactoring, complex shell pipelines. Runs in the background like Atlas. |
-| **Iris** | Local or cloud (local recommended) | Email, calendar, contacts, todos | Personal information management. |
-| **Dexter** | Local or cloud (local recommended) | Calendar events (create / list / update / delete) + scheduled tasks (create / list / pause / resume / cancel / update; cron, interval, once) | Scheduling & calendar — builds perfect schedule entries and calendar events; never executes the scheduled tasks. |
-| **Byte** | Local or cloud (local recommended) | Projects, deliverables, blockers, work tasks, time tracking | Work management. |
-| **Mercury** | Local or cloud (local recommended) | Memory summarization + RAG injection | Distills long conversations and memory into the context window each turn. |
+| **Iris** | Local or cloud (local recommended) | Email, calendar, contacts, todos, scheduling, projects & work tasks | Personal information management — email digests, calendar events, scheduled tasks (cron, interval, once), projects, deliverables, and work tasks. |
 | **Artemis** | Local or cloud | Read-only file access | Critical review — audits conversations and decisions. |
 | **The Council** | 3×, local or cloud | Read-only file access | Three independent seats (Skeptic, Pragmatist, Synthesist) deliberate in parallel on high-stakes decisions. |
-| **Oculus** | Local (light, vision-optional) | `awareness_log`, `security_log`, `send_message`, `alert_security`, `open_security_alert`, `dismiss_security_flag`, `webcam_capture`, arm/disarm | Single background security & situational-awareness agent. Receives structured JSON AWARENESS events from the laptop camera, applies the editable `eyes_ears/oculus.md` rules, and decides per event: alert (send a captioned frame + open the red alert), greet (friendly arrival), or stay silent. Also owns arming/disarming and the security log. **AWARENESS events route directly to `/api/awareness`, never through the chat message path.** |
+| **Sentry** | Local or cloud (local recommended) | Bash (read-only), `sentry_report` | Background security scanner — periodically inventories the PC (listening sockets, network connections, running services, autostart, user crontab, enabled units, processes) with no elevated permissions, diffs against a learned baseline, and reports only when something new or suspicious appears. Runs an hourly peek and a daily deep scan; can also be dispatched on demand ("run a security scan"). |
 
-> 🎛️ **Atlas, Vulkan, Artemis, and each Council seat have their own model.** **Byte, Dexter, Iris, Mercury, and Oculus share one *Toolcall model*** (a single model + ctx row in the dashboard). Pick local Ollama or cloud per role — the same pipeline handles both. With `max_loaded_models=2`, the Orchestrator (always kept alive) and the Toolcall model (if its keep-alive checkbox is on) stay resident in VRAM; Atlas keep-alive can be enabled separately. Any third model evicts the least-recently-used resident.
+> 🎛️ **The Atlas seat, Vulkan, Artemis, and each Council seat have their own model.** **Iris and Sentry share one *Toolcall model*** (a single model + ctx row in the dashboard). Pick local Ollama or cloud per role — the same pipeline handles both. With `max_loaded_models=3` (see [Tuning the Ollama daemon](#tuning-the-ollama-daemon)), the Atlas seat (always kept alive) and the Toolcall model (if its keep-alive checkbox is on — this covers Iris/Sentry) stay resident in VRAM, with room for a third resident model (a separately-enabled model whose keep-alive is on). The supervisor model no longer holds a resident slot — its running-job tick was cut out; it only runs the occasional completion verdict on finished jobs. Any fourth model evicts the least-recently-used resident. The keep-alive re-pin that runs every minute only maintains models that are **loaded** — it snapshots Ollama's `/api/ps` first and never re-spawns a model that was deliberately unloaded, so a pinned model can't fight something big (like the training loop's 17 GB analyst) for VRAM after you cleared it on purpose.
 
 ![The Agents panel: every sub-agent with its model, status, and toolset](docs/screenshots/agents.png)
 
 ![The Council: three seats deliberate in parallel on a decision](docs/screenshots/council.png)
 
-![A Council verdict is returned to the orchestrator](docs/screenshots/council-verdict.png)
+![A Council verdict is returned to the seat](docs/screenshots/council-verdict.png)
 
-### ⏰ Scheduling — Dexter
+### ⏰ Scheduling — Iris
 
-**Dexter is the scheduling and calendar agent. Its entire job is to create and manage schedule entries and calendar events — it never executes the scheduled tasks.**
+**Iris owns the scheduling and calendar side of personal information management. It creates and manages schedule entries and calendar events — it never executes the scheduled tasks.**
 
-The orchestrator owns the intent; Dexter owns the timing. When something needs to happen later, the orchestrator gives Dexter a **prompt** (what to run) and a **when** (the timing intent). Dexter's sole job is to translate that into one flawless schedule entry and hand it to the scheduler. Nothing more. When the ask is an appointment rather than a fire-later task, Dexter writes a **calendar event** (start/end time, location) the same way.
+The seat owns the intent; Iris owns the timing. When something needs to happen later, the seat gives Iris a **prompt** (what to run) and a **when** (the timing intent). For scheduling, Iris's sole job is to translate that into one flawless schedule entry and hand it to the scheduler. Nothing more. When the ask is an appointment rather than a fire-later task, Iris writes a **calendar event** (start/end time, location) the same way.
 
-**What Dexter does:**
+**What Iris does:**
 - Picks the right `schedule_type` — `cron` (recurring at specific times), `interval` (every N ms), or `once` (a single future timestamp) — and writes the `schedule_value` in its exact format.
 - Does the time arithmetic in your **local timezone**, walking the offset digit by digit and verifying computed-time minus now equals the requested interval before committing.
-- Stores the prompt verbatim — at fire time that prompt is injected into the running chat as a message from "Scheduler", and the **orchestrator runs it** like any other message, with full context and all its tools. Dexter set up the schedule; the orchestrator does the work.
+- Stores the prompt verbatim — at fire time that prompt is injected into the running chat as a message from "Scheduler", and the **seat runs it** like any other message, with full context and all its tools. Iris set up the schedule; the seat does the work.
 - Manages the lifecycle of existing entries — list, pause, resume, cancel, update.
 - Creates, lists, updates, and deletes **calendar events** (appointments with start/end time, location) — the calendar side of timing.
+- Everything else personal: email, contacts, todos, projects, and work tasks.
 
-**What Dexter does not do:**
+**What Iris does not do:**
 - It does not execute the scheduled task. Ever. It writes the entry and stops.
-- It does not gather data or do research — if a scheduled prompt needs facts (a price, a status, a number), the orchestrator delegates that to Atlas first and hands Dexter the result to bake into the prompt.
-- It does not diagnose why a task did or didn't fire — that's Artemis's job. Dexter only touches the entry if it needs fixing or recreating.
-- It does not own todos or contacts — those are Iris. A *todo* is a list item; a *reminder that fires at a time* or a *calendar appointment* is Dexter.
+- It does not gather data or do research — if a scheduled prompt needs facts (a price, a status, a number), the seat gathers them first and hands Iris the result to bake into the prompt.
+- It does not diagnose why a task did or didn't fire — that's Artemis's job. Iris only touches the entry if it needs fixing or recreating.
 
 **Model:** basic structured output — a small local model (granite) is plenty. The reliability lives in the prompt and the format validation, not in a big model.
 
-The schedule-value format is where scheduling breaks in every system that has one, so Dexter is built to be obsessive about it: it validates the cron expression, rejects malformed intervals and timestamps, refuses timezone suffixes on `once`, and double-checks its own offset math. The point is that the entry is correct the first time, every time, on a model that costs nothing to run.
+The schedule-value format is where scheduling breaks in every system that has one, so Iris is built to be obsessive about it: it validates the cron expression, rejects malformed intervals and timestamps, refuses timezone suffixes on `once`, and double-checks its own offset math. The point is that the entry is correct the first time, every time, on a model that costs nothing to run.
 
-> 🪨 **Dexter and Iris are prompted specifically for `granite4.1:8b`.** Their system prompts are tuned to that 8B model — temperature 0, deterministic keyword→tool rules, and **no few-shot examples** (granite pattern-matches example shapes: shown only `schedule_task(...)` examples, it would call `schedule_task` to "delete" instead of `cancel_task`). When editing either prompt, keep that target in mind: drive behavior with explicit rules and tool-selection mappings, never examples, and verify against `granite4.1:8b` — a prompt that reads cleanly on a big cloud model can mis-fire on the 8B local one.
+> 🪨 **The toolcall agents (Iris, Sentry) are prompted for `granite4.1:3b`.** Their system prompts are tuned to that 3B model — temperature 0, deterministic keyword→tool rules, and **no few-shot examples** (granite pattern-matches example shapes: shown only `schedule_task(...)` examples, it would call `schedule_task` to "delete" instead of `cancel_task`). When editing any of these prompts, keep that target in mind: drive behavior with explicit rules and tool-selection mappings, never examples, and verify against `granite4.1:3b` — a prompt that reads cleanly on a big cloud model can mis-fire on the 3B local one.
+
+> ⚠️ **Stock granite doesn't cut it — the fine-tuned `toolcall-ft` model is effectively required.** The toolcall agents need the LoRA fine-tune built from `training/` (`toolcall-ft` in Ollama; see `training/README` / `Modelfile.toolcall-ft` for building it). Reliable tool-call transcription on this 41-tool surface was trained in — a stock model won't reproduce it. On a fresh install without the LoRA weights it just wouldn't work, even with the 8B stock model swapped in.
 
 ### Persistent Runner
 
@@ -154,15 +159,15 @@ The schedule-value format is where scheduling breaks in every system that has on
 
 ### 🎯 Delegation Discipline
 
-The orchestrator is trained to state **WHAT**, never **HOW**. It doesn't see the sub-agents' tools. It can't prescribe URLs, search queries, or step-by-step instructions. The system prompt explicitly forbids it:
+The seat is trained to state **WHAT**, never **HOW**, in every delegation. It doesn't prescribe URLs, search queries, or step-by-step instructions for the specialists. The system prompt explicitly forbids it:
 
 > *"Atlas is the internet model. It runs on a larger, more capable model than you. Never tell Atlas how to use the internet — no URLs, no search queries, no 'go to X then click Y.' Give it the goal and the facts, and stop."*
 
-This is reinforced at three layers: the orchestrator's system prompt, the Atlas tool description (what the orchestrator sees when deciding to call it), and Atlas's own system prompt (which tells it to ignore prescribed steps).
+This is reinforced at three layers: the seat's system prompt, the delegate tool descriptions (what the seat sees when deciding to call them), and the specialists' own system prompts (which tell them to ignore prescribed steps).
 
 ### 🎯 Driving Forces
 
-The orchestrator's reasoning posture is a dashboard dropdown, not a fixed trait. A **Driving Force** preset rewrites the orchestrator's preamble with a different bias — and switching it clears the orchestrator's context, so the new persona starts a fresh conversation instead of inheriting the old one's thread. The built-in presets:
+The seat's reasoning posture is a dashboard dropdown, not a fixed trait. A **Driving Force** preset rewrites the seat's preamble with a different bias — and switching it clears the seat's context, so the new persona starts a fresh conversation instead of inheriting the old one's thread. The built-in presets:
 
 | Preset | Bias |
 |--------|------|
@@ -179,7 +184,7 @@ The presets are plain markdown in `data/driving-forces/` — add your own and it
 
 ### 🧵 Fabric Pattern Integration
 
-Warden ships with 258 expert prompt patterns from the Fabric library. Every turn, the user's message is keyword-extracted and the top 5 most relevant patterns are injected into the system prompt by name and description. The orchestrator loads the full pattern on demand and bakes its framing into the Atlas task brief — giving the larger model the structure it needs without the orchestrator micromanaging the execution.
+Warden ships with 258 expert prompt patterns from the Fabric library. Every turn, the user's message is keyword-extracted and the top 5 most relevant patterns are injected into the system prompt by name and description. The seat loads the full pattern on demand and bakes its framing into its own work and the briefs it hands out — structure without micromanaging the execution.
 
 ### 🎲 Dynamic Tool Selection
 
@@ -194,12 +199,42 @@ The tool loop has multiple circuit breakers to prevent common failure modes:
 - **Circling detection** — consecutive useless rounds (no tool calls, no output) trigger a forced no-tools round to extract an answer
 - **Degenerate output filter** — word-mash / garbled output from misconfigured models is detected and suppressed
 - **Verifier sub-agent** — after effectful work (file writes, edits), a verifier pass confirms the changes
+- **Deterministic churn detection** — N consecutive read-only calls (Read/Grep/Glob/Bash/WebSearch — the `RESEARCH` set) with no deliverable produced → inject a "stop searching, write now" commit nudge; 10 more read-only calls after the nudge → the runner aborts the job itself (12/10 thresholds; artemis is exempt). The post-nudge count ignores writes, so churn punctuated by an occasional `Edit` can't evade the abort. A stopped **Atlas** auto-escalates to **Vulkan** on the same task. *(See [docs/notes/supervision-and-churn.md](docs/notes/supervision-and-churn.md).)*
+- **One-atlas-at-a-time gate** — a new Atlas dispatch aborts any already-running Atlas (the new task supersedes) before spawning, so the seat can't double-launch a background job on the same file and clobber edits. Vulkan is exempt (the churn-escalation spawns it while Atlas winds down).
+- **Atlas first-turn thinking** — Atlas thinks on its first iteration only (plan what it needs, then act), paired with a **READ ONCE** prompt rule (read each named file once; don't re-Read it to find the next edit target — that re-reading *is* the loop). Later iterations keep thinking off to preserve context.
+- **Supervisor watchdog (cut out)** — the periodic LLM self-audit that flagged running jobs and let the seat nudge/stop has been removed. It was unneeded once the seat's chain-following could drive a job end to end on its own, and a 3b model kept false-flagging healthy slow reads/composes. The seat still monitors **on demand** (ask it, and it looks + can stop/retry on its own), and the completion verdict still judges finished jobs. Only the deterministic churn detector stops jobs automatically.
 
 ### 📝 Memory System
 
-The orchestrator writes directly to `MEMORY.md`, `TODO.md`, and `HEARTBEAT.md` — no delegation needed. These files are loaded into context every turn.
+The seat writes directly to `MEMORY.md`, `TODO.md`, and `HEARTBEAT.md` — no delegation needed. These files are loaded into context every turn.
 
-After every conversation, a **memory writeback** pass runs automatically: a local model reads the last ~30 messages of the chat, distills durable facts (preferences, decisions, context the agent should carry forward), and appends them to `MEMORY.md` with a dated entry in `JOURNAL.md`. The distilled facts are visible to the agent on the very next turn — no manual note-taking, no "remember this" prompts. The writeback is fire-and-forget (never blocks the message loop), throttled to once per chat per 15 minutes, and auto-compacts `MEMORY.md` when it grows too large. Both files live at `WORKSPACE_ROOT` — the same place the orchestrator loads from every turn, and the same place Mercury writes `MERCURY_MEMORY.md`.
+After every conversation, a **memory writeback** pass runs automatically: a local model reads the last ~30 messages of the chat, distills durable facts (preferences, decisions, context the agent should carry forward), and appends them to `MEMORY.md` with a dated entry in `JOURNAL.md`. The distilled facts are visible to the agent on the very next turn — no manual note-taking, no "remember this" prompts. The writeback is fire-and-forget (never blocks the message loop), throttled to once per chat per 15 minutes, and auto-compacts `MEMORY.md` when it grows too large. Both files live at `WORKSPACE_ROOT` — the same place the seat loads from every turn, and the same place Mercury writes `MERCURY_MEMORY.md`.
+
+#### 🪞 Mercury — rolling conversation memory
+
+Mercury is the working-memory layer for the live conversation — how a fresh seat (after a restart or context clear) knows what the current thread is about without replaying an ever-growing transcript.
+
+- **Rolling compaction.** On a cadence (default every 30 min, or 5 min after you go quiet — never mid-turn), a local model reads the last ~45 messages, keeps the newest ~12 verbatim, and compresses the rest into a concise state-of-the-conversation note written to `MERCURY_MEMORY.md`. Every turn's prompt starts with that summary merged into the system prompt, cache-prefix-stable.
+- **RAG over recent history.** A follow-up that references something older than the verbatim window ("what did I say about the filter two hours ago?") pulls keyword-matched turns from the last ~120 messages into a `<mercury_context>` block. Retrieval is deliberately conservative, because raw old turns injected carelessly once hijacked a turn — the model answered a fresh question by replaying a day-old exchange verbatim, matched on a single shared keyword: a query with 3+ keywords must now match ≥2 of them, score ties break toward the *newest* message, every retrieved line carries its timestamp, and the block is labeled background-only with the current ask explicitly prioritized.
+- **Filed to MARM when present.** Each compaction also files the summary into MARM (session `mercury`, `marm_log_entry`, deduped on unchanged text) so the rolling state stays semantically recallable even after the 120-message horizon passes. Fire-and-forget and fail-open: MARM down or absent changes nothing — Mercury and its RAG work standalone and are always the default recall path.
+
+#### 🧬 MARM — semantic long-term recall (default-on)
+
+[MARM Memory](https://github.com/Lyellr88/marm-memory) (by [Lyellr88](https://github.com/Lyellr88)) is the default long-term memory server: local-first recall beyond what `MEMORY.md` can hold. Warden runs identically without it — every MARM path is fail-open — but with it installed you get:
+
+- **Nothing is forgotten.** `MEMORY.md` auto-compacts and drops older lines; MARM keeps every distilled fact the writeback has ever logged, recallable by relevance.
+- **Semantic recall, injected automatically.** Every turn, the runner asks MARM for the memories most relevant to the incoming message and injects the top hits into the seat's prompt — recall doesn't depend on the model remembering to ask. Hybrid BM25 + embedding search, so "why did the streaming app white-page" finds the memory written as "router DNS hijack blocked stremio.com." The seat can still call `marm_smart_recall` directly for a deeper dig.
+- **Linked ideas.** MARM's concept graph connects the logged facts into entity → predicate → entity relations, so separate ideas are pieced together instead of sitting in a flat list.
+
+**Default-on since 2026-09-22.** `install.sh` installs the server (`uv tool install marm-mcp-server`; requires uv), provisions a `marm-memory.service` systemd --user unit (MCP HTTP at `127.0.0.1:8001`, wired into `warden.service` via the `warden.service.d/marm.conf` drop-in so it starts with Warden), and registers the `marm` stdio entry in `data/mcp-servers.json` with the absolute binary path (systemd's minimal PATH can miss `~/.local/bin`; a fresh install's seeded config uses `marm-memory` from PATH and upserts to the absolute path on install). Opt out with `INSTALL_MARM=0 ./install.sh` and/or disable the `marm` entry in `data/mcp-servers.json`. Optional: pin the concept-graph topic model with `MARM_TOPIC_MODEL=<model> install.sh` when the server default isn't right for your models (`ollama list`).
+
+The seat is granted `mcp__marm__*` tools — the one MCP server it calls directly, since recall is assistant state, not hands-on work. The `# LONG-TERM RECALL` prompt section is emitted only when the `marm` entry is enabled, so a disabled MARM never leaves the model advertised tools it doesn't have. Data lives in `~/.marm/`.
+
+How it integrates (all built in, none of it requires touching Warden's core):
+
+- The memory writeback mirrors every distilled fact into MARM (`marm_log_entry`, over MCP HTTP) right after appending to `MEMORY.md` — fire-and-forget, with a 10s timeout: MARM down or absent changes nothing. In the other direction, `marm-recall.ts` auto-recalls the top MARM matches for each incoming message (2.5s timeout, ≤3 hits, ≤900 chars, fail-open) and injects them into the seat's prompt as a `# RECALLED MEMORIES` section.
+- Mercury compaction files each rolling summary into MARM as well (`marm_log_entry`, session `mercury`, deduped on unchanged text) — the conversation's recent state becomes long-term recallable under the same fail-open contract.
+- The voice app's center panel is the **memory galaxy** (`eyes_ears/ui/memory-galaxy.html`): a 3D constellation of MARM's concept graph — nodes are entities extracted from stored memories, edges are walked relations. Clicking a node opens its details in a separate popup window. The built graph is cached (15 min), so a UI restart doesn't re-probe MARM. With MARM off or the concept graph unbuilt, the galaxy falls back to its built-in demo constellation.
 
 ### 💓 Heartbeat
 
@@ -211,9 +246,10 @@ Under the hood, the heartbeat is a real scheduled task (`heartbeat-owner`) persi
 
 ### 🗜️ Context Compaction
 
-The orchestrator keeps its running context lean by design, not by a giant ceiling. After every turn its persistent conversation collapses to chat-history-only — the last few turns' final responses (~1K each) — and drops all the tool calls, tool results, and system injections that produced them. Mercury is pinned; long-term memory isn't relied on for the working window. Trimming is group-aware (it drops whole tool-call→result groups, so it keeps fewer messages without orphaning a tool result), and each tool result is capped at ~1K tokens. Two manual resets sit on top:
+The seat keeps its running context lean by design, not by a giant ceiling. After every turn its persistent conversation collapses to chat-history-only — the last few turns' final responses (~1K each) — and drops all the tool calls, tool results, and system injections that produced them. Mercury is pinned; long-term memory isn't relied on for the working window. Trimming is group-aware (it drops whole tool-call→result groups, so it keeps fewer messages without orphaning a tool result), and each tool result is capped at ~1K tokens. Two manual resets sit on top:
 
-- **New Thought** (chat header) clears the orchestrator's context server-side — the next message starts a fresh conversation, no accumulated history.
+- **New Thought** (chat header) clears the seat's context server-side — the next message starts a fresh conversation, no accumulated history.
+- **Clear Conversation** (chat header) goes further: it deletes the stored message log for the chat too, wipes the rolling Mercury summary, and sets the context-clear marker — the next message starts from a genuinely empty history, database included.
 - **Idle auto-clear** (Settings → Model Configuration → *Idle clear*, default 30 min) drops context automatically when your last message was older than the threshold. `0` disables it.
 
 ### ✏️ Self-Editing
@@ -234,14 +270,17 @@ Every model selection in the dashboard is per-role:
 
 | Role | Recommended | Why |
 |------|-------------|-----|
-| **Orchestrator** | e4b local works; **31B cloud recommended** | Fast, cheap routing + supervision. e4b is the floor; 31B cloud catches sub-agents that bluff a result. Keep-alive is on by default. |
+| **Atlas (the seat)** | e4b local works; **31B cloud recommended** | Fast, cheap routing + hands-on work + supervision. e4b is the floor; 31B cloud catches sub-agents that bluff a result. Keep-alive is on by default. |
+| **Supervisor (watchdog)** | Small local (e.g. granite4.1:3b) | **The running-job self-audit tick is cut out** (see above). The model still runs the **completion verdict** on finished jobs — tool-less, a few hundred tokens per call, falls back to the seat model if unset. The dashboard Supervisor row is removed. |
 | **Atlas** | Cloud (deepseek, glm) | Heavy lifting — internet access, shell, browser, complex reasoning. Keep-alive optional. |
 | **Vulkan** | Cloud (default) | Coding, builds, tests, refactoring, heavy shell pipelines. Keep-alive optional. |
-| **Toolcall agents** | Local (recommended) | Byte, Dexter, Iris, Mercury, and Oculus share one model + ctx row. Run them local; save cloud for Atlas and the Council. |
+| **Toolcall agents** | Local (recommended) | Iris and Sentry share one model + ctx row. Run them local; save cloud for Atlas and the Council. |
 | **Artemis** | Cloud (default) | Read-only audit. Keep-alive optional. |
 | **Council seats** | Cloud ×3 (different models) | Diverse perspectives for deliberation. |
 
 Every role can be flipped to local or cloud from the dashboard — same pipeline, no code change — so the column above is a recommendation, not a constraint.
+
+> ⚠️ **Kimi is not recommended right now.** Kimi loops on read-heavy / long-running subagent tasks (atlas, vulkan, artemis) — it re-issues the same read-only call repeatedly instead of converging, and it leaks its chain-of-thought as untagged text when thinking is disabled (which is why any `/^kimi/i` model is forced to `think:true` every request). The deterministic churn detector still catches read-only-call loops on kimi, but **artemis is churn-exempt**, so a looping kimi-artemis runs to the iteration cap unchecked. The currently-tested fleet is **atlas = a local thinking model, the rest = glm, no kimi**. Use glm (or a local thinking model for atlas) for subagent work; save kimi for the seat if you use it at all.
 
 All of this is configured from the dashboard's Settings panel — assistant name, model per role, Ollama URL, and keep-alive toggles:
 
@@ -265,21 +304,81 @@ The agent-runner speaks Ollama's native HTTP API and talks to Ollama directly �
 
 **Optional — piping in Claude:** `src/credential-proxy.ts` (port 3001) is in the codebase but **not wired in by default**. It exists for one case: routing to Anthropic's Claude. It translates Ollama-native requests ↔ Anthropic format and injects the Claude API key so the agent-runner never sees it. If you want Claude, wire the proxy in and point the agent-runner at it; otherwise everything stays on native Ollama.
 
+**Supervisor model & per-iteration thinking.** The running-job self-audit tick is **cut out**; the **completion verdict** still runs on a separate `SUPERVISOR_MODEL` (falls back to the seat model) — a small, tool-less call, so a local model is ideal. Sub-agents think on a per-iteration rule: **Atlas thinks on its first turn only** (plan, then act — paired with the READ-ONCE prompt rule against the re-reading loop); **kimi thinks every turn** (it leaks reasoning as untagged text when thinking is off, so `/^kimi/i` models are forced on); every other sub-agent iteration is `think:false`. The seat has its own dashboard `thinkingMode` (`max` = every turn, `true` = first turn, off otherwise) and thinks on turn 1 by default. Never send `think:true` to a Granite model — Ollama rejects it, so the Granite toolcall agents (iris/sentry) stay on `think:false`.
+
 ---
 
 ## 🌐 Real Browser Automation
 
-Warden connects to your actual Chrome via Playwright and the Chrome DevTools Protocol (port 9222). Your real profile — cookies, sessions, saved passwords, extensions — everything is intact.
+Warden browses through **your actual Chrome** — the one you're logged into, with cookies, sessions, and extensions intact. There is no Warden-owned browser, no headless puppet, no CDP port: the single path is a Chrome extension bridge.
 
-The browser tools operate on **DOM accessibility snapshots**, not screenshots. Each element gets a `[ref=e12]` identifier. The agent clicks, types, and navigates by ref — fast, precise, and cheap. Screenshots exist only for visual verification of end states.
+The chain: the **chrome-mcp-server** extension (unpacked copy at `chrome-mcp-server-1.0.0/`) runs in your real Chrome and spawns the **mcp-chrome-bridge** native host (`npm install -g mcp-chrome-bridge`, serving MCP on `127.0.0.1:12306`). Warden's **browser gate** (`src/browser-mcp-gate.ts`) owns the single upstream connection to that host and re-serves it statelessly at `POST /mcp/browser` on `:3200` — the agent-runner never touches 12306 directly.
 
-Chrome runs as a persistent process with its own watchdog. It survives agent restarts. Sign into Google once; the profile persists forever.
+The browser is an **optional component that never blocks anything**. It's dialed on demand — only when a browser/web tool is actually invoked — and the gate fails fast (5s) if the bridge is down, so no request can hang on it. Warden boots, chats, and runs every non-web turn with the bridge completely absent.
+
+For the full contract (lazy connect, fail-to-default toolsets, the diagnostics ladder, and the one-command repair via `scripts/restart-browser-bridge.sh`), see `CLAUDE.md` → *Browser capability*.
 
 ---
 
 ## 🖱️ Desktop Control
 
 Warden controls your actual desktop — mouse movement, keystrokes, window management. Wayland via ydotool, X11 via xdotool. It discovers your display environment automatically, even when started from systemd with no `DISPLAY` set.
+
+---
+
+## 🧰 The Custom Toolset
+
+Almost none of Warden's tools are generic wrappers — they're purpose-built, one layer above the real system, and they work out of the box because they bind to what's already there: your real Chrome profile, your real audio hardware, your real CalDAV calendar, your real media players. No adapters to configure, no credentials to paste twice, no "integration setup."
+
+The design rule for the action tools is **one tool per noun, one `action` parameter** (a 2026-09 collapse of 41 flat tools): `email`, `task`, `calendar`, `alarm`, `project` — each a single schema whose `action` selects the operation. Small models stay in-distribution, and every new operation is one enum value, not a new tool.
+
+### 🌐 Browser automation (via the extension bridge)
+
+The live surface is the extension's own `chrome_*` toolset (~27 tools: `chrome_navigate`, `chrome_read_page`, `chrome_computer`, tab management, key presses, …) served through the Warden gate. The `youtube` tool (`container/agent-runner/src/tools/youtube.ts`) drives pages through the `McpPage` adapter on top of it — navigate + script-eval are the required pair, with tab-list and key-press tools upgrading fidelity when present. If the bridge is down, the tool reports that as a terminal fact and the turn ends — browser failure never takes down chat or any other capability.
+
+### 🖱️ Desktop & apps
+
+`desktop_screenshot` · `desktop_click` · `desktop_type` · `open_app` — sees and steers native apps (settings windows, media players) with pixel coordinates, auto-detecting Wayland vs X11; `open_app` fire-and-forgets files to their OS-default app.
+
+### 🔊 Media & audio
+
+`audio_volume` (speakers) · `mic_volume` · `media_control` (play/pause/skip) — anything exposing MPRIS: a browser YouTube tab, Spotify, mpv, VLC. Dedicated tools, not `amixer`/`playerctl` shell noise.
+
+`youtube` — play, search, and **control** the real Chrome YouTube tab through the browser bridge: now-playing, pause/resume, next, seek, fullscreen. Any ask mentioning YouTube routes here and the tool result is the reply; a "stop the music" ask maps to `action: pause`, and the prompt's control rule forbids ever *stating* a playback change without the call that made it — that exact zero-tool-call hallucination (seat claimed "paused" while the music kept playing) is what the mapping was added for (2026-09-21).
+
+### 👁️ Vision
+
+`query_image` — ask questions about any image on disk, answered locally. `read_image` + `webcam_capture` + `desktop_screenshot` feed frames into the agent's vision context automatically.
+
+### ✉️ Communications
+
+`email` (read/send/cache, date-windowed) — your real IMAP inbox · `contacts` — full CRUD (`list_contacts`, `search_contacts`, `get_contact`, `create_contact`, `update_contact`, `delete_contact`) · `calendar` — CalDAV events, Kontact/Google-synced.
+
+### ⏰ Scheduling & time
+
+`alarm` · `task` (schedule/list/update/pause/resume/cancel — cron, interval, one-shot) · `start_timer` · `stop_timer` · `log_time` — durations are parsed host-side (ISO-8601 `PT2M`), never by the model doing clock math. Fired reminders land in chat directly, and the Alarms view shows every once/cron/interval job including fired ones.
+
+### 📋 Projects, work & todos
+
+`project` (kind + action over projects and work tasks) · `list_todos` · `create_todo` · `complete_todo` · `delete_todo`.
+
+### 📄 Documents
+
+`generate_pdf` — build a PDF from scratch · `convert_file` — DOCX/XLSX/HTML/markdown conversions, no external services.
+
+### 🧠 Context & chat plumbing
+
+`get_chat_history` · `attach_file` (deliver a generated file to the user) · `send_message` · `clear_context` — the agent manages its own thread weight.
+
+### 🛡️ Sentry
+
+`sentry_report` — the software-security scanner (read-only sockets/services/crontab audit, one inventory submission, host logs the scan and relays findings).
+
+### 🔌 The rest
+
+`api_request` + `list_api_keys` — your own stored provider credentials, used directly · `fabric_pattern` — Daniel Miessler's fabric patterns hot-plugged into prompts · `Bash` — a persistent shared shell where `cd` sticks.
+
+Every tool above is registered with a toolset and routed to agents by role ([Dynamic Tool Selection](#-dynamic-tool-selection)) — vulkan gets code tools and physically cannot screenshot-loop, sentry gets read-only audit tools and nothing else, atlas gets the browser and the media hardware.
 
 ---
 
@@ -294,14 +393,15 @@ The dashboard includes:
 | | | |
 |---|---|---|
 | 💬 **Chat** | Main conversation interface | 🗂️ **Projects** | Deliverables, blockers, financials |
-| 📁 **Files** | Browse, upload, download, manage | 🔒 **Vault** | PII-scrubbed file storage |
-| 🔑 **API Keys** | Provider credentials | ⏰ **Scheduled Tasks** | Cron/interval/once automation |
-| 💓 **Heartbeat** | Standing instructions on schedule | ⏰ **Alarms** | Reminders with sound + desktop notify |
-| ⚡ **Actions** | One-touch prompt buttons | 📱 **SMS** | Twilio send/receive |
-| 🎤 **Talk** | Voice transcription | ✉️ **Email** | IMAP inbox + send |
-| 📅 **Calendar** | CalDAV synced with Kontact | 📝 **Notes** | Obsidian-style markdown vault |
-| 🧩 **Skills & MCP** | Hot-pluggable capabilities | 📈 **Agent Activity** | Live verbose status + collapsible progress panel |
-| 📜 **Process Logs** | Live log tail | 📰 **Digest** | Hourly/daily/weekly grounded briefings |
+| 📁 **Files** | Browse, upload, download, manage | ⏰ **Scheduled Tasks** | Cron/interval/once automation |
+| 🔑 **API Keys** | Provider credentials | ⏰ **Alarms** | Reminders with sound + desktop notify |
+| 💓 **Heartbeat** | Standing instructions on schedule | ⚡ **Actions** | One-touch prompt buttons |
+| ✉️ **Email** | IMAP inbox + send |
+| 🎤 **Talk** | Voice transcription | 📝 **Notes** | Obsidian-style markdown vault |
+| 📅 **Calendar** | CalDAV synced with Kontact | 🧩 **Skills & MCP** | Hot-pluggable capabilities |
+| 📈 **Agent Activity** | Live verbose status + collapsible progress panel | 📜 **Process Logs** | Live log tail |
+| 📰 **Digest** | Hourly/daily/weekly grounded briefings | 🎓 **Training** | Failure-audit → data-modify → retrain loop (see [Training loop](#-training-loop)) |
+| 📈 **Alpha Stack** | Trading research stack — its own webapp, embedded (see [Alpha Stack](#-alpha-stack)) | |
 | 🖥️ **Hologram Panels** | Today, digest, agents, chat, tasks, upload, system — all in the voice UI | |
 | 🏗️ **Ops Panel** | Inbox (scanned work tasks + calendar events — ✓ confirm / ✕ deny), Work tasks, Reminders, Schedules, Calendar (Google-synced appointments), + all scheduled crons with pause/resume — heartbeat, iris-digest hourly/daily/weekly | |
 
@@ -411,7 +511,7 @@ A single email can yield both — the meeting at a stated time is an event; "mak
 
 **Auto-accept** — when `scan:auto_accept` is on, `createActionableItems` writes every row with `confirmed = 1` already, so items skip the inbox entirely and land straight on the calendar/task list. Turn it on from the Actionable tab's toggle or `POST /api/scan/config { "autoAccept": true }`. Off (the default) means everything is `confirmed = 0` and waits in the inbox for your ✓.
 
-**Offline calendar fill** — extracted events are written to the **local** calendar DB (`calendar_source: 'local'`, a fresh `ical_uid`), with no round-trip to Google. That's the "auto-fills the calendar offline" part: your inbox-to-calendar pipeline doesn't depend on any provider being reachable. Online calendars sync the *other* direction — the 15-minute `startCalendarSyncPoller` pulls Google events into the same local DB so the models can read both local and remote in one `list_calendar_events` call. (Dexter manages entries on that local copy: create, list, update, and delete by the uid `list_calendar_events` returns.)
+**Offline calendar fill** — extracted events are written to the **local** calendar DB (`calendar_source: 'local'`, a fresh `ical_uid`), with no round-trip to Google. That's the "auto-fills the calendar offline" part: your inbox-to-calendar pipeline doesn't depend on any provider being reachable. Online calendars sync the *other* direction — the 15-minute `startCalendarSyncPoller` pulls Google events into the same local DB so the models can read both local and remote in one `list_calendar_events` call. (Iris manages entries on that local copy: create, list, update, and delete by the uid `list_calendar_events` returns.)
 
 **Manual run** — the Actionable tab's **Scan now** button (`POST /api/scan/run`) fires the same hourly Iris digest on demand through `triggerDigest('hourly', true)` → identical path → identical extraction. There is no separate scan cron or scan model; the hourly digest cron is the only thing that extracts, and the button is just "run it now."
 
@@ -422,6 +522,26 @@ A single email can yield both — the meeting at a stated time is an event; "mak
 Each digest span has a **talk** toggle (`digest:talk:hourly|daily|weekly` in router state, set from the dashboard). When talk is on for a span, that span's digest isn't just published to the panel — `digest_complete` also pushes it through the normal `chat_complete` notification path, and the voice client **speaks it aloud** via TTS.
 
 The daily digest's cron is configurable from the dashboard (default `17 21 * * *`, i.e. 21:17 local — deliberately off the :00 mark). Move it to your wake time, turn on `digest:talk:daily`, and the morning briefing — today's calendar, active tasks, notable emails, and the `alerts` block — is spoken to you at that time. Grounded in your real local data, not a generic forecast. A TTS alarm clock that knows you've got a standup in 20 minutes.
+
+### 🎓 Training loop
+
+Warden's seat model is a fine-tune (`orchatlas-ft`, built from `training/`), and the dashboard's Training view closes the circuit: failures the system actually made become new SFT rows and a fresh retrain — **audit → modify → train**, three buttons, no terminal.
+
+| Step | What it does |
+|---|---|
+| **Audit logs** (1 / 3 / 7-day window) | Clears VRAM (refuses while an agent turn is live), loads a 17 GB local analyst model, parses the warden logs (journald, `warden.log` fallback) for failure-shaped turns — tool errors that never recovered, dead ends with zero tool calls, refusals, hallucinated answers, infra outages — and has the analyst classify each slice as a failure class or `not_a_failure` (conversational turns grep-match too; the classifier filters them, not the regexes). **No cap** — every failure-shaped turn is cataloged, because dropped slices are dropped training data. The catalog is checkpointed after every slice, so a crash mid-run keeps the classification work. Catalogs land in `training/loop/catalogs/`. |
+| **Modify training data** | Takes the newest catalog, drops the non-failures, and has the analyst write new SFT rows against the live tool pool and existing exemplars. Every row is validated locally against the merge contract (exact time anchor, tools in the role pool, no per-row tools), then `merge_orchatlas_parts.mjs` runs as the gate — anything invalid gets renamed `.rejected` and the step fails loudly instead of corrupting the dataset. |
+| **Train** | Runs the standard 1-epoch `atlasorch.sh` as-is. When it finishes, flip the seat model to `orchatlas-ft` in the dashboard. |
+
+Each step is a detached background job with a live log tail in the view; only one step runs at a time, and audit/modify unload the analyst when they finish so the VRAM goes back to the resident models. The keep-alive re-pin cooperates: it only maintains models that are *loaded* — it snapshots Ollama's `/api/ps` and never re-spawns a model that was deliberately unloaded, so a pinned seat model can't fight the analyst for VRAM mid-audit.
+
+### 📈 Alpha Stack
+
+The trading research stack lives at `trading/` (red rail button under Chat in the dashboard) — a machine-local environment, **not part of a fresh install**: the venv, models, data, and paper-trading state are self-ignored via `trading/.gitignore` and are never committed.
+
+The Alpha Stack view is the stack's **own webapp** — `trading/webapp/` (a stdlib-only server, bound to `0.0.0.0:8765` so the dashboard's mobile/LAN clients can load the embedded iframe — same no-auth single-user posture as the dashboard itself). Warden does not run it as a daemon: opening the Alpha Stack view spawns it on demand (`trading/bin/python webapp/app.py`, detached, logging to `trading/logs/webapp.log`); the systemd drop-in `warden.service.d/alpha-webapp.conf` also starts it on every Warden (re)start. The iframe targets the dashboard's own hostname on `:8765`, so it renders from any device that can reach the dashboard. State (`trading/.alpha-stack/`) and reports (`trading/.tradingagents/logs/`) live on disk under the stack root, so a webapp restart loses nothing.
+
+Everything is fail-open: with no `trading/` present the view reports the failure and Warden runs identically. The stack's local LLM dependency (TradingAgents points at `http://localhost:11434/v1`) is the same Ollama the rest of Warden uses.
 
 ---
 
@@ -434,22 +554,23 @@ Everything talks to Warden through one HTTP server — the dashboard, the hologr
 | Group | Endpoints |
 | --- | --- |
 | **System & control** | `GET /api/status` · `GET /api/health` · `GET /api/heartbeat` · `GET /api/activity` · `GET/POST /api/process-logs` · `POST /api/server/restart` · `POST /api/open-terminal` · `POST /api/terminal` |
-| **Chat & agents** | `GET/POST /api/messages` · `POST /api/chat/stop` · `POST /api/chat/interrupt` · `POST /api/chat/clear-context` · `POST /api/agents/kill` · `POST /api/voice` |
+| **Chat & agents** | `GET/POST /api/messages` · `POST /api/chat/stop` · `POST /api/chat/interrupt` · `POST /api/chat/clear-context` · `POST /api/chat/clear-conversation` · `POST /api/agents/kill` · `POST /api/voice` |
 | **Files (shared workspace)** | `POST /api/files/upload` · `GET /api/files/download` · `GET /api/files/serve` · `GET /api/files/list` · `GET /api/files/read` · `GET /api/files/stat` · `POST /api/files/mkdir` · `POST /api/files/copy` · `POST /api/files/rename` · `POST /api/files/revert` · `GET /api/files/history` · `GET /api/files/version` |
 | **Digests** | `GET/POST /api/summaries?span=` · `POST /api/digest/generate?span=hourly\|daily\|weekly` |
 | **Actionable / Ops inbox** | `POST /api/scan/run` (run hourly extraction now) · `GET /api/scan/inbox` (unconfirmed tasks + events) · `POST /api/scan/confirm` · `GET/POST /api/scan/config` (`{ autoAccept }`) |
 | **Tasks & scheduling** | `GET/POST /api/tasks` · `POST /api/tasks/bulk` · `GET/POST /api/work-tasks` · `GET/POST /api/timers` · `GET/POST /api/automations` · `GET/POST /api/alarms` |
 | **Memory, bio, search** | `GET/POST /api/bio` · `GET/POST /api/projects` · `GET /api/search` · `GET /api/skills` · `GET /api/groups` |
-| **Channels** | `GET /api/channels` · `*/api/channels/slack` · `*/api/channels/telegram` · `*/api/channels/whatsapp` (+ `/qr`, `/sync`) · `*/api/email/{accounts,inbox,drafts,message,send,test}` · `*/api/sms/{accounts,messages,send,test}` · `GET/POST /api/calendar/events` · `POST /api/calendar/import` · `GET/POST /api/calendar-token` · `GET /api/oauth/start` · `GET /api/oauth/callback` · `GET /api/oauth/accounts` |
+| **Channels** | `GET /api/channels` · `*/api/channels/slack` · `*/api/channels/telegram` · `*/api/channels/whatsapp` (+ `/qr`, `/sync`) · `*/api/email/{accounts,inbox,drafts,message,send,test}` · `GET/POST /api/calendar/events` · `POST /api/calendar/import` · `GET/POST /api/calendar-token` · `GET /api/oauth/start` · `GET /api/oauth/callback` · `GET /api/oauth/accounts` |
 | **Models / Ollama** | `GET /api/ollama/servers` · `GET /api/ollama/model-names` · `POST /api/ollama/test` · `GET /api/ollama/thinking-support` · `POST /api/ollama/toggle` |
-| **Security & vault** | `POST /api/awareness` · `GET /api/security/awareness-log` · `GET/POST /api/security/oculus-md` · `GET/POST /api/vault` · `GET /api/vault/dictionary` · `POST /api/vault/scrub` · `POST /api/audit/run` · `GET /api/audit/status` |
+| **Training loop** | `POST /api/training/audit` `{days: 1\|3\|7}` · `POST /api/training/modify` · `POST /api/training/train` · `POST /api/training/stop` (SIGTERMs the running step's process group) · `GET /api/training/status` · `GET /api/training/catalogs` |
+| **Alpha Stack** | `GET /api/alphastack/status` (inventory + whether the webapp is up) · `POST /api/alphastack/webapp/start` (spawns the stack's webapp on `0.0.0.0:8765` on demand) |
+| **Audit** | `POST /api/audit/run` · `GET /api/audit/status` |
 | **Settings & UI plumbing** | `GET/POST /api/settings` · `GET/POST /api/dashboard-pages` (live/beta file editing) · `GET/POST /api/mcp-servers` · `GET /api/notifications` · `GET /api/notifications/poll` · `GET/POST /api/notification-list` · `POST /api/notification-list/read-all` · `GET/POST /api/api-keys` |
 
 ### Things worth knowing
 
 - **Files are workspace-scoped.** Every `/api/files/*` route resolves its `?path=` under `GROUPS_DIR` (`~/warden/groups`) and rejects anything that escapes it (`..`, absolute paths). The shared uploads/downloads folder the hologram panel uses is `groups/uploads/`. Uploads take the file body as `application/octet-stream` with the filename in an `x-filename` header (up to 1 GB); downloads stream a single file as octet-stream or a directory as `tar.gz`.
 - **Digests are a loopback.** Iris compiles a digest and publishes it by `POST /api/summaries?span=X` — a keyless internal call back to this same server. The panel then reads `GET /api/summaries?span=X`. That loopback is the *only* way a digest reaches the UI.
-- **AWARENESS bypasses chat.** The laptop camera stack `POST /api/awareness` with a structured `AWARENESS…` payload; the server routes it straight to the Oculus sub-agent — it never becomes a chat message.
 - **The hologram can't `fetch()` directly.** Its panels load from `file://`, so Qt WebEngine's same-origin policy blocks them from reaching `:3200`. `eyes_ears/ui/jarvis_window.py` bridges this with `warden_api(path, method, body)` (JSON proxy), `warden_upload(dir, name, b64)`, and `warden_download(path)` (base64 in/out) — Python makes the real HTTP request and hands the result back to the iframe.
 - **Quick checks.** `curl -fsS http://localhost:3200/api/status` for a live snapshot; `curl -fsS http://localhost:3200/api/health` for a liveness ping.
 
@@ -471,7 +592,13 @@ Model Context Protocol servers give agents real capabilities without touching co
 | **Time** | Timezone-aware scheduling |
 | **Plasma** | KDE Plasma D-Bus (notifications, clipboard, windows) |
 
-MCP servers are configured in `data/mcp-servers.json` and can be toggled from the dashboard.
+MCP servers are configured in `data/mcp-servers.json` and can be toggled from the dashboard. **Atlas and Vulkan get every installed server**; the chat seat keeps `marm` (memory recall is assistant state) and routes the rest through a delegate.
+
+### Default apps
+
+Warden ships a built-in provider for each capability — browser, web, files, shell, capture. An installed MCP server can take one over from **Settings → Default apps**: pick `chrome-mcp` for `browser` and from the next dispatch the agents browse with that server.
+
+Choosing a server **replaces** the built-in rather than sitting beside it. One provider per job is the point: two tools that can both plausibly do something is how a small model ends up hand-driving a page instead of calling the tool that owns the task. If the chosen server has no tools loaded, the built-in stays and the runner logs why — a server that failed to start can't leave a seat unable to work.
 
 ---
 
@@ -481,12 +608,20 @@ One conversation, many doors. All channels merge into a single chat:
 
 | Channel | How |
 |---------|-----|
-| 🌐 **Web Dashboard** | PWA at `http://localhost:3200` |
-| ✈️ **Telegram** | Bot via grammy *(module present, disabled by default)* |
+| 🌐 **Web Dashboard** | PWA at `http://localhost:3200` — always enabled |
+| ✈️ **Telegram** | Bot via grammy — enabled |
 | 💚 **WhatsApp** | Baileys (no third-party API) *(module present, disabled by default)* |
 | 💜 **Slack** | Bot integration *(module present, disabled by default)* |
 
-Only the **Web Dashboard** is enabled in the default build — `src/channels/index.ts` imports just `./web.js`. The Telegram, WhatsApp, and Slack modules still ship but are commented out; uncomment the relevant `import './<channel>.js';` line there to turn a messaging channel back on. When enabled, message from WhatsApp, continue on Telegram, check the dashboard — same context, same memory.
+The Web Dashboard and Telegram are enabled in the default build — `src/channels/index.ts` imports `./web.js` and `./telegram.js`. WhatsApp and Slack still ship but are commented out; uncomment the relevant `import './<channel>.js';` line there to turn one back on. Message from the dashboard, continue on Telegram, check back on the web — same context, same memory.
+
+### Telegram
+
+The Telegram bot is **single-owner by design** — it only talks to one chat. The bot can drive a whole computer, so it's not open to anyone: the first chat to `/start` it claims ownership, and every other chat is politely refused. The refusal message includes that chat's id, so you know exactly what to paste to re-point the bot there.
+
+- **Editable owner chat** — Settings → Channels → Edit Telegram exposes a **Chat ID** field that sets the *real* owner chat (`TELEGRAM_OWNER_ID` in `data/env/env` + the `telegram:owner_id` router state) and reconnects the bot. Paste a different chat id and save; the bot re-points there on reconnect. Leave the bot-token field blank to keep the current token.
+- **Group support** — add the bot to a group and `/start` it there; it replies with that group's chat id (a negative `-100…` number). Paste that id (including the leading `-`) into the Chat ID field and save, and the bot listens on the group instead of your DM. To actually see group messages, disable **Group Privacy** via @BotFather (`/mybots` → your bot → *Bot Settings* → *Group Privacy* → Turn off), then re-add the bot to the group.
+- **Full sender names** — every inbound message is tagged with the sender's full name (First Last, or username) so the seat can tell *who* is talking in a group, not just "a user." The name flows straight into the agent's message context (`<message sender="First Last">…</message>`).
 
 ---
 
@@ -496,11 +631,11 @@ Only the **Web Dashboard** is enabled in the default build — `src/channels/ind
 |-------|-----------|
 | Runtime | Node.js 20+ with TypeScript |
 | Database | SQLite via better-sqlite3 |
-| Browser | Playwright (playwright-core) over CDP, driving your real Chrome — DOM interaction (navigate, click, type, read, screenshot, evaluate JS) |
+| Browser | mcp-chrome-bridge native host (12306) + chrome-mcp-server extension on your real Chrome, re-served statelessly by the Warden gate — navigate, read, click, type, key-press, tab management |
 | Desktop | xdotool + spectacle — coordinate input, screenshots |
 | Terminal | Live PTY shell (tmux `warden-shell`) |
 | LLM | Ollama (local + cloud) |
-| LLM Routing | Credential proxy with format translation for cloud endpoints |
+| LLM Routing | Native Ollama HTTP by default; optional credential proxy (`src/credential-proxy.ts`) for Anthropic format translation |
 | Messaging | grammy (Telegram), Baileys (WhatsApp), Slack SDK |
 | Email | IMAP via imapflow, SMTP via nodemailer |
 | Calendar/Contacts | CalDAV/CardDAV via Radicale, synced with KDE Kontact |
@@ -523,15 +658,14 @@ Warden is an autonomous AI that runs on your own hardware. It can operate fully 
 | OS | Linux (kernel 5+) | Arch Linux or Ubuntu LTS |
 | Node.js | 20+ | 22 LTS |
 | RAM | 8 GB | 16 GB+ (local models + browser tools) |
-| GPU | Optional | NVIDIA GPU for local vision / TTS / security models |
-| Browser | Chromium/Chrome | System Chromium for Playwright CDP tools |
+| GPU | Optional | NVIDIA GPU for local vision / TTS models |
+| Browser | Optional — your real Google Chrome | Google Chrome + the `mcp-chrome-bridge` native host for the extension-driven browser tools |
 | Microphone/speaker | Optional | USB or Bluetooth headset for voice |
-| Webcam | Optional | For security / vision features |
 
 ### Step 1 — Get the repo
 
 ```bash
-git clone <your-repo-url> warden
+git clone https://github.com/domdoss/Warden.git warden
 cd warden
 ```
 
@@ -545,16 +679,17 @@ On Arch Linux (the primary target):
 bash install-deps.sh
 ```
 
-This installs Node.js, npm, git, build tools, Chromium, poppler, tmux, sqlite, Radicale, KDE PIM integration, and desktop-control utilities (`xdotool`, `ydotool`, `wtype`, `grim`, clipboard tools, etc.). It also enables `loginctl linger` so user systemd services keep running after logout.
+This installs Node.js, npm, git, build tools, poppler, tmux, sqlite, Radicale, KDE PIM integration, and desktop-control utilities (`xdotool`, `ydotool`, `wtype`, `grim`, clipboard tools, etc.). It also enables `loginctl linger` so user systemd services keep running after logout.
 
 On other distros, install the equivalents manually. The key binaries Warden expects are:
 
 - `node` and `npm`
-- `chromium` or `google-chrome-stable`
 - `poppler` (for `pdftotext`)
 - `tmux`, `sqlite3`
 - `xdotool`, `ydotool`, `wtype`, `grim`, `wl-clipboard`, `xclip`, `scrot`
 - `radicale`, `akonadi`, `kdepim-runtime`, `kontact` (for calendar/contacts; optional)
+
+For the browser capability (optional): your normal **Google Chrome**, plus `npm install -g mcp-chrome-bridge` and the unpacked `chrome-mcp-server-1.0.0/` extension from this repo loaded via `chrome://extensions` → *Load unpacked*. No system Chromium and no CDP flags needed — the extension bridge is the only path.
 
 macOS users can try `bash install-macos.sh` as a best-effort alternative. Some Linux-only tools will not be available.
 
@@ -569,13 +704,14 @@ bash install.sh
 1. Shows a safety warning and asks you to type `I UNDERSTAND` before continuing.
 2. Verifies Node.js >= 20.
 3. Offers to run `install-deps.sh` if it detects `pacman`.
-4. Installs npm dependencies for the server and the agent-runner.
-5. Compiles TypeScript with `npm run build`.
-6. Creates runtime directories: `data/`, `store/`, `groups/`, `logs/`.
-7. Initializes the SQLite database.
-8. Writes a starter `data/env/env` config file if one does not exist.
-9. Registers and starts a systemd user service: `~/.config/systemd/user/warden.service`.
-10. Enables user linger so the service survives logout.
+4. Checks for the optional browser chain (Google Chrome, `mcp-chrome-bridge`, the unpacked extension folder) and warns — never blocks — if any are missing.
+5. Installs npm dependencies for the server and the agent-runner.
+6. Compiles TypeScript with `npm run build`.
+7. Creates runtime directories: `data/`, `store/`, `groups/`, `logs/`.
+8. Initializes the SQLite database.
+9. Writes a starter `data/env/env` config file if one does not exist.
+10. Registers and starts a systemd user service: `~/.config/systemd/user/warden.service`, plus a drop-in that runs `scripts/restart-browser-bridge.sh` on every start so a Warden restart also repairs the browser bridge.
+11. Enables user linger so the service survives logout.
 
 After it finishes, the dashboard is available at `http://localhost:3200`.
 
@@ -625,9 +761,51 @@ journalctl --user -u warden -f
 tail -f logs/warden.log
 ```
 
+### Tuning the Ollama daemon
+
+Warden drives Ollama as its local model runtime — the Atlas seat, the shared Toolcall model (Iris/Sentry), and any resident cloud models all live there. The daemon's defaults are tuned for a generic single-user chat client, not an agent loop that fires many short requests across several models, so it's worth overriding them. Create a systemd drop-in for the `ollama` system service:
+
+```bash
+sudo systemctl edit ollama
+```
+
+Add these to the override (the `[Service]` section is where `Environment=` lines belong):
+
+```ini
+[Service]
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=3"
+Environment="OLLAMA_KEEP_ALIVE=30m"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+```
+
+Then reload and restart so they take effect:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+Verify they landed (`systemctl show ollama -p Environment` prints the merged environment, including your drop-in):
+
+```bash
+systemctl show ollama -p Environment
+```
+
+What each line does and why it's here:
+
+| Setting | What it controls | Why this value |
+|---|---|---|
+| `OLLAMA_NUM_PARALLEL=1` | How many inference requests Ollama will run **concurrently**. The default scales with your CPU count, inviting parallelism. | Warden's seat runs **one conversation at a time** and dispatches one sub-agent at a time. There is no benefit to concurrent inference here — only downside: two models racing for VRAM, evicting each other, or OOMing. Pinning this to `1` serializes requests so a model finishes and frees memory before the next one loads. |
+| `OLLAMA_MAX_LOADED_MODELS=3` | The max number of models Ollama will keep **resident in VRAM at once**. Beyond this, the least-recently-used resident model is evicted. | Room for the three things that matter to Warden: the **Atlas seat** (kept alive always), the shared **Toolcall model** (Iris/Sentry), and a third resident model whose keep-alive you've enabled. (The supervisor no longer holds a slot — its running-job tick was cut out; it only runs the occasional completion verdict on finished jobs.) A fourth request simply evicts the LRU rather than OOMing. (Raise or lower this to match your VRAM; the dashboard's keep-alive checkboxes decide *which* models are candidates for these slots.) |
+| `OLLAMA_KEEP_ALIVE=30m` | How long a model stays loaded in VRAM **after its last request** before Ollama unloads it. Default is `5m`. | The agent loop issues many short, bursty requests separated by seconds-to-minutes of thinking. At `5m` a model often unloads between turns and you pay the multi-second reload latency on the next call. `30m` keeps models hot across a typical work session so repeated calls hit resident weights. Lower it if you're tight on VRAM and want idle models to release memory sooner. |
+| `OLLAMA_KV_CACHE_TYPE=q8_0` | Quantizes the **KV cache** (the per-token attention state that grows with context length) to 8-bit instead of fp16. | Long agent contexts eat VRAM fast, and the KV cache is where it goes. `q8_0` roughly halves that cache footprint at a negligible quality cost, which is what lets you run longer contexts and keep more models resident (see `OLLAMA_MAX_LOADED_MODELS`) on the same GPU. Leave it fp16 only if you have VRAM to spare and want the last bit of fidelity. |
+
+These are the levers that actually matter for an agent workload: serialize the work, keep the right models hot, and spend VRAM on cache cheaply. Everything else in the Ollama config is either automatic or not worth touching for Warden.
+
 ### Modular audio pipeline (`run.sh`)
 
-Warden's audio system is a **composable pipeline** where every piece — mic, speaker, STT, TTS, the Warden brain — can run on a different machine, and you pick which pieces go where with a handful of flags. There is no hardwired topology. The same `run.sh` entrypoint covers everything from "all-local on a laptop" to "brain on a GPU box, mic on a Pi in the kitchen, speaker on a Pi in the living room."
+Warden's audio system runs on a **single desktop** by default — mic, speaker, STT, TTS, and the Warden brain all on one machine. The pipeline is composable, though: if you want, you can offload just the raw mic/speaker I/O to a small satellite box on the LAN (a Pi or any headless box). The same `run.sh` entrypoint covers everything from "all-local on the desktop" (the default) to "mic on a Pi in the kitchen, speaker on a Pi in the living room."
 
 The pipeline looks like this:
 
@@ -635,7 +813,7 @@ The pipeline looks like this:
 ┌──────────┐    raw PCM     ┌──────────────┐   transcribed text   ┌───────────────┐
 │  MIC     │ ──────────────> │  STT (local) │ ───────────────────> │  WARDEN       │
 │  local   │   HTTP stream   │  Whisper     │                      │  (any host)   │
-│  or Pi   │                 └──────────────┘                      │  orchestrator │
+│  or Pi   │                 └──────────────┘                      │  atlas seat  │
 └──────────┘                                                      │  + delegates  │
                                                                    └───────┬───────┘
 ┌──────────┐    WAV audio     ┌──────────────┐   spoken reply      │
@@ -645,13 +823,13 @@ The pipeline looks like this:
 └──────────┘                 └──────────────┘
 ```
 
-Here's how a spoken question travels through the pipeline. You press the push-to-talk button on the Pi. The Pi's `satellite_server.py` opens a PipeWire capture stream and starts serving raw 16 kHz PCM over HTTP. Back on the laptop, the voice client pulls that stream, feeds it through Whisper, and gets back text. The text goes to the Warden server — which might be on the same laptop, or a GPU box downstairs, or a cloud VM. Warden's orchestrator reads it, delegates to whatever specialists are needed, and sends back a reply. That reply hits the laptop's TTS engine (Kokoro or Orpheus, running on the local GPU), which synthesizes a WAV file. If the speaker is local, PipeWire plays it on the desk speakers. If the speaker is the Pi, the WAV gets POSTed to the Pi's `:8766/play` endpoint and comes out of whatever speaker is plugged into the Pi's headphone jack.
+Here's how a spoken question travels through the pipeline. By default everything is local: you press the push-to-talk button (or clap twice), the desktop's mic captures audio, Whisper transcribes it, and the text goes to the Warden seat on the same machine. Warden reads it, delegates to whatever specialists are needed, and sends back a reply. The reply hits the local TTS engine (Kokoro or Orpheus, running on the GPU), which synthesizes a WAV file and PipeWire plays it on the desk speakers. If you've offloaded audio I/O to a satellite, the mic stream comes from the satellite's `satellite_server.py` over HTTP instead, and the finished WAV is POSTed to the satellite's `:8766/play` endpoint to come out of whatever speaker is plugged into it.
 
-Every joint in that chain is a flag. `--mic local` means "read the laptop's built-in mic." `--mic 192.168.0.171` means "stream it from the Pi." `--speaker local` means "play through the laptop speakers." `--speaker 192.168.0.180` means "send the WAV to a different Pi in another room." The laptop always runs STT, TTS, and the hologram UI — those need the GPU. The satellite only ever runs `pw-record` and `pw-play`. It has no Python dependencies. It doesn't even need a virtual environment. You could run it on a Pi Zero and it wouldn't break a sweat.
+Every joint in that chain is a flag. `--mic local` means "read the desktop's built-in mic." `--mic 192.168.1.80` means "stream it from a satellite." `--speaker local` means "play through the desktop speakers." `--speaker 192.168.1.81` means "send the WAV to a satellite in another room." The desktop always runs STT, TTS, and the hologram UI — those need the GPU. The satellite only ever runs `pw-record` and `pw-play`. It has no Python dependencies. It doesn't even need a virtual environment. You could run it on a Pi Zero and it wouldn't break a sweat.
 
-This means you can put mics and speakers wherever you actually spend time — kitchen, workshop, bedside table — without moving the GPU. Each satellite is just a Pi with a USB mic and a powered speaker, running one script. The laptop stays on your desk. The brain stays wherever it has the most RAM. And `run.sh` ties it all together: one command, a few flags, and the whole distributed system comes up.
+This means you can put mics and speakers wherever you actually spend time — kitchen, workshop, bedside table — without moving the GPU. Each satellite is just a small box with a USB mic and a powered speaker, running one script. The desktop stays on your desk. And `run.sh` ties it all together: one command, a few flags, and the whole system comes up.
 
-**STT, TTS, and the hologram UI always run on the laptop.** Only raw audio I/O — the microphone stream and speaker playback — can be offloaded to a satellite. The satellite is a dumb pipe: it runs `satellite_server.py`, a ~200-line Python script with zero dependencies beyond PipeWire's `pw-record` and `pw-play`. No venv, no GPU, no models. A Pi Zero is overkill.
+**STT, TTS, and the hologram UI always run on the desktop.** Only raw audio I/O — the microphone stream and speaker playback — can be offloaded to a satellite. The satellite is a dumb pipe: it runs `satellite_server.py`, a ~200-line Python script with zero dependencies beyond PipeWire's `pw-record` and `pw-play`. No venv, no GPU, no models. A Pi Zero is overkill.
 
 #### Independent per-side routing
 
@@ -661,62 +839,54 @@ Mic and speaker are chosen **independently**. You can have the Pi mic in one roo
 # Everything local (the default)
 ./run.sh
 
-# Both mic and speaker on the default Pi satellite (192.168.0.171)
+# Both mic and speaker on the default satellite (from eyes_ears/config/settings.yaml)
 ./run.sh --remote
 
-# Both on a specific Pi
-./run.sh --remote 192.168.0.180
+# Both on a specific satellite
+./run.sh --remote 192.168.1.80
 
-# Pi mic, local desk speaker
-./run.sh --mic 192.168.0.171 --speaker local
+# Satellite mic, local desk speaker
+./run.sh --mic 192.168.1.80 --speaker local
 
-# Local laptop mic, Pi speaker in another room
-./run.sh --mic local --speaker 192.168.0.171
+# Local desktop mic, satellite speaker in another room
+./run.sh --mic local --speaker 192.168.1.80
 
-# Different Pis for mic and speaker
-./run.sh --mic 192.168.0.171 --speaker 192.168.0.180
+# Different satellites for mic and speaker
+./run.sh --mic 192.168.1.80 --speaker 192.168.1.81
 ```
 
 The `--mic` and `--speaker` flags accept `local`, `remote` (resolves to the default satellite IP), `remote:<ip>`, or a bare IP. The root `run.sh` normalizes all of these into `main.py`'s `--mic`/`--speaker` format before launching.
 
-#### Audio and video, together or apart
+#### `eyes_ears/run.sh` — the single entrypoint
 
-Audio (voice assistant) and video (security camera) are independent subprocesses launched by the same parent. They can run together, separately, or on different machines:
+`eyes_ears/run.sh` is the one launcher for the ears app (the Eyes / Oculus webcam detector was removed 2026-09-15 — ears only now). It handles the app-specific setup before handing off to `ears.main`:
 
 ```bash
-./run.sh --ears                    # just the voice assistant, no camera
-./run.sh --eyes                    # just the security camera, no voice
-./run.sh --both                    # both — eyes in background, ears in foreground
-./run.sh --ears --remote ...       # voice on a satellite, camera off
+./run.sh --ears                    # voice assistant, local mic + speaker
+./run.sh --ears --remote ...       # voice on a satellite relay
 ./run.sh --ui-only                 # hologram + panels + text chat, NO audio routing
 ```
 
-This means you can run the camera on a box with a webcam and the voice client on a different box with a good mic — each pointed at the same Warden brain via `--warden <ip>`. The new `--ui-only` mode lets a machine run just the hologram + panels against the Warden server with no mic, speaker, STT, TTS, clap-detector, control-server, or global-hotkey — handy for a desktop that shouldn't route audio.
+The `--ui-only` mode lets a machine run just the hologram + panels against the Warden server with no mic, speaker, STT, TTS, clap-detector, control-server, or global-hotkey — handy for a desktop that shouldn't route audio.
 
 #### Interactive launcher
 
-With no flags and a TTY, `eyes_ears/run.sh` drops into an interactive menu (prefaced with an ANSI `EYES & EARS` block banner):
+With no flags and a TTY, `eyes_ears/run.sh` drops into an interactive menu (prefaced by an ANSI `EARS` block banner):
 
 ```
-1) Eyes       — Oculus detector + frame server, background awareness
-2) Ears       — voice + UI, local mic + speaker
-3) Both       — eyes in background, ears in foreground
-4) Satellite  — this machine is the audio relay on :8766
-5) UI only    — hologram + panels + text chat, NO audio routing
-6) Configure  — set warden.base_url / satellite.host / oculus toggle
-7) Quit
+1) Ears       — voice + UI, local mic + speaker
+2) Satellite  — this machine is the audio relay on :8766
+3) UI only    — hologram + panels + text chat, NO audio routing
+4) Configure  — set warden.base_url / satellite.host
+5) Quit
 ```
 
-The same choices exist as flags for scripting: `--eyes`, `--ears`, `--both`, `--ui-only`, `--satellite`, `--configure`. Bare `--mic`/`--speaker`/`--remote` audio flags forward to ears (`--remote <host>` is shorthand for `--mic remote:HOST --speaker remote:HOST`). No Warden or satellite IPs are hardcoded in the script — both come from `eyes_ears/config/settings.yaml`, set via the Configure menu or `--configure`.
+The same choices exist as flags for scripting: `--ears`, `--ui-only`, `--satellite`, `--configure`. Bare `--mic`/`--speaker`/`--remote` audio flags forward to ears (`--remote <host>` is shorthand for `--mic remote:HOST --speaker remote:HOST`). No Warden or satellite IPs are hardcoded in the script — both come from `eyes_ears/config/settings.yaml`, set via the Configure menu or `--configure`.
 
-#### `eyes_ears/run.sh` — the single entrypoint
-
-`eyes_ears/run.sh` is now the one launcher for both halves (the old `security/run.sh` and `voice/run.sh` are merged). It handles the eyes/ears-specific setup before handing off to `eyes.main` / `ears.main`:
-
-- **Dual-mode**: `./run.sh --satellite` runs the dumb audio relay (`../satellite/satellite_server.py`) on the current machine instead of either eyes or ears — same script, opposite role. The relay is stdlib-only, so this works on a bare Pi with no venv.
-- **GPU setup**: Sets ROCm library paths for AMD GPUs, persists compiled GPU kernels so cold starts are fast, and configures Qt WebEngine flags for the hologram UI (skips slow D-Bus probes, collapses 5 renderer processes into 2).
-- **TTS persistence**: Reads `TTS_ENGINE` and `KOKORO_VOICE` from the environment and writes them to `eyes_ears/config/settings.yaml` before launch, so the in-process TTS picks them up at startup. Defaults to Kokoro with `af_bella`; swap to Orpheus with `TTS_ENGINE=orpheus_cpp ./run.sh`.
-- **Sensible defaults**: No flags (with a TTY) drops into the menu; otherwise no flags = fully local (desk mic + desk speaker, Kokoro on GPU). Any `--mic`/`--speaker`/`--remote` flag and it forwards them through.
+- **Satellite mode**: `./run.sh --satellite` runs the dumb audio relay (`../satellite/satellite_server.py`) on the current machine instead of ears — same script, opposite role. The relay is stdlib-only, so this works on a bare Pi with no venv.
+- **GPU setup**: Sets CUDA library paths for the orpheus_cpp TTS engine and configures Qt WebEngine flags for the hologram UI (skips slow kwallet probes).
+- **TTS persistence**: `--tts kokoro|orpheus_cpp|orpheus` and `--tts-device` persist to `eyes_ears/config/settings.yaml` before launch, so the in-process TTS picks them up at startup. Defaults to Kokoro; swap with `./run.sh --tts orpheus_cpp`.
+- **Sensible defaults**: No flags (with a TTY) drops into the menu; otherwise no flags = fully local (desk mic + desk speaker). Any `--mic`/`--speaker`/`--remote` flag and it forwards them through.
 
 ```bash
 cd eyes_ears
@@ -726,32 +896,29 @@ cd eyes_ears
 
 # Or pick a role directly
 ./run.sh --ears
-./run.sh --eyes
-./run.sh --both
 ./run.sh --ui-only
 
 # Run the satellite relay on this machine instead
 ./run.sh --satellite
 
-# Orpheus TTS with a different voice
-TTS_ENGINE=orpheus_cpp KOKORO_VOICE=zoe ./run.sh
+# Orpheus TTS with a device pin
+./run.sh --tts orpheus_cpp --tts-device cuda:0
 
-# Remote mic, local speaker, custom control port
-./run.sh --mic remote:192.168.0.171 --speaker local --control-port 8768
-```
-
-For a permanent install, prefer the systemd service. `run.sh` is for development, one-off tests, and split-machine topologies.
+# Remote mic, local speaker
+./run.sh --mic remote:192.168.1.80 --speaker local
+```For a permanent install, prefer the systemd service. `run.sh` is for development, one-off tests, and split-machine topologies.
 
 ---
 
 ## 🌐 Multi-Machine / Bare-Metal Role Configuration
 
+> **Note (2026-08):** Warden now runs on a **single desktop** — the old two-box desktop + Pi setup was retired. The role-split below still works if you genuinely want to distribute roles across machines on a LAN, but it is no longer the default or the supported path. Most users want everything on one box.
+
 Warden is split into roles that can run on different machines on the same LAN. By default everything assumes `localhost`, but you can point each role at another host by editing the right config.
 
 | Role | What to set | Where |
 |------|-------------|-------|
-| **Warden** (brain/dashboard) | `WARDEN_URL` or `warden.base_url` | `data/env/env` for server; `eyes_ears/config/settings.yaml` for eyes + ears |
-| **Video** (security detector) | Warden URL it POSTs awareness to | `eyes_ears/config/settings.yaml` under `warden.base_url` |
+| **Warden** (brain/dashboard) | `WARDEN_URL` or `warden.base_url` | `data/env/env` for server; `eyes_ears/config/settings.yaml` for ears |
 | **Audio** (hologram) | Warden URL + Satellite URL | `eyes_ears/config/settings.yaml` under `warden.base_url`; `--remote <satellite-ip>` on launch |
 | **Ollama** | `OLLAMA_URL` | `data/env/env` |
 | **Satellite** (Pi audio relay) | Audio server IP | Pi TUI (`tui/graice-tui.sh`) |
@@ -760,8 +927,7 @@ Warden is split into roles that can run on different machines on the same LAN. B
 
 - **Warden** on a small box at `http://<warden-host>:3200`
 - **Ollama** on a GPU box at `http://<ollama-host>:11434`
-- **Video** on a laptop with a webcam
-- **Audio** on the same laptop, using a Pi Satellite at `<satellite-host>`
+- **Audio** on the same desktop, using a Pi Satellite at `<satellite-host>`
 
 Set on the **Warden host** (`data/env/env`):
 
@@ -769,7 +935,7 @@ Set on the **Warden host** (`data/env/env`):
 OLLAMA_URL=http://<ollama-host>:11434
 ```
 
-Set on the **Video and/or Audio host** (`eyes_ears/config/settings.yaml`) — one merged file, one `warden.base_url`:
+Set on the **Audio host** (`eyes_ears/config/settings.yaml`) — one merged file, one `warden.base_url`:
 
 ```yaml
 warden:
@@ -782,13 +948,13 @@ Then start Audio pointed at the Satellite:
 ./eyes_ears/run.sh --remote <satellite-host>
 ```
 
-See [Modular audio pipeline](#modular-audio-pipeline-runsh) for the full routing matrix — independent mic/speaker, eyes/ears/ui-only, and the interactive launcher.
+See [Modular audio pipeline](#modular-audio-pipeline-runsh) for the full routing matrix — independent mic/speaker, local/satellite/ui-only, and the interactive launcher.
 
 ---
 
 ## 🗣️ Voice Assistant
 
-`eyes_ears/` (the ears half) is a voice-first desktop companion that turns Warden into a talk-to-it assistant. Press a button (or a global hotkey), speak, and the reply is spoken back. Speech-to-text (Whisper) and text-to-speech (Kokoro or Orpheus) run locally on your machine — your voice never leaves it. All reasoning, tools, and memory stay on the Warden server; the app is just ears, eyes, and a mouth.
+`eyes_ears/` (the ears half) is a voice-first desktop companion that turns Warden into a talk-to-it assistant. Press a button (or a global hotkey), speak, and the reply is spoken back. Speech-to-text (Whisper) and text-to-speech (Kokoro or Orpheus) run locally on your machine — your voice never leaves it. All reasoning, tools, and memory stay on the Warden server; the app is just ears and a mouth.
 
 ![The Warden TUI / hologram window](docs/screenshots/warden-tui.png)
 
@@ -813,7 +979,7 @@ The window wrapper (`eyes_ears/ui/jarvis_window.py`) exposes the same interface 
 
 ### Install the voice client
 
-1. Create a Python virtual environment (one combined venv for eyes + ears):
+1. Create a Python virtual environment:
 
 ```bash
 cd eyes_ears
@@ -865,7 +1031,9 @@ python -m ears.main --remote <satellite-host>   # use a Pi/headless box for mic 
 
 ## 🛰️ Satellite (Pi audio relay)
 
-`satellite/` is the Raspberry Pi side of the voice system — the ears and mouth that live on a dedicated Pi (or any small headless box). The Pi is a **dumb pipe**: it streams raw microphone audio to the laptop and plays back the TTS the laptop returns. No STT, no TTS, no model inference happens on the Pi — transcription and synthesis run on the laptop, so a Pi Zero is plenty.
+> **Note (2026-08):** The dedicated-Pi satellite is **optional / legacy** — Warden's voice system runs fully on the desktop now. This section describes the optional remote mic/speaker relay for when you want audio I/O in another room.
+
+`satellite/` is the Raspberry Pi side of the voice system — the ears and mouth that live on a dedicated Pi (or any small headless box). The Pi is a **dumb pipe**: it streams raw microphone audio to the desktop and plays back the TTS the desktop returns. No STT, no TTS, no model inference happens on the Pi — transcription and synthesis run on the desktop, so a Pi Zero is plenty.
 
 The satellite relay is a single ~200-line Python file (`satellite_server.py`) with **zero dependencies** beyond PipeWire's `pw-record` and `pw-play`. It exposes three HTTP endpoints on `:8766`:
 
@@ -938,72 +1106,6 @@ The relay binds `:8766` by default.
 
 ---
 
-## 🛡️ Security Mode
-
-`eyes_ears/` (the eyes half) is a webcam awareness system. The camera machine runs the cheap RF-DETR detector and sends only structured JSON events to the Warden service. One background agent handles the rest.
-
-![Oculus rules: the editable `eyes_ears/oculus.md` decision rules](docs/screenshots/oculus-rules.png)
-
-### Features
-
-- 📷 **RF-DETR Keypoint** watches the webcam (CPU or NVIDIA GPU) and builds a compact JSON situation each frame.
-- 🔔 **AWARENESS events** are POSTed to `/api/awareness` only when something changes.
-- 🛡️ **Oculus** receives the JSON, applies editable `eyes_ears/oculus.md` rules, and decides: alert, greet, or stay silent.
-- 👤 **Face recognition** runs on every AWARENESS event — known people are identified by name, unknown faces escalate.
-- 🎛️ Oculus model and camera host are set from the dashboard.
-- 🗄️ `store/security.db` logs every event and assessment.
-
-### Install
-
-1. Create a Python virtual environment (one combined venv for eyes + ears):
-
-```bash
-cd eyes_ears
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-2. Copy and edit the config:
-
-```bash
-cp config/settings.example.yaml config/settings.yaml
-```
-
-Set at least:
-
-```yaml
-warden:
-  base_url: http://localhost:3200
-
-camera:
-  index: 0
-```
-
-Use `camera.stream_url` instead of `index` if you want an ESP32-CAM or other HTTP/MJPEG stream.
-
-3. Run it:
-
-```bash
-python -m eyes.main
-# or
-./run.sh --eyes
-```
-
-Or start it via `run.sh` from the project root:
-
-```bash
-./eyes_ears/run.sh --eyes
-```
-
-### Dashboard setup
-
-Open the dashboard, go to **Settings**, and set the **Video server** / **Satellite IP** to the host running `eyes.main`. Warden will pull frames from `http://<host>:8765/frame`.
-
-See `eyes_ears/README.security.md` for tuning, arming/disarming, and the Oculus rules.
-
----
-
 ## ⚙️ Configuration
 
 ### Environment file
@@ -1013,7 +1115,7 @@ The main config file is `data/env/env`. It is created by `install.sh` if it does
 ```bash
 # Identity
 ASSISTANT_NAME=Warden
-LOCAL_ASSISTANT_NAME=Kimi
+LOCAL_ASSISTANT_NAME=Kimi   # display name for local/offline mode (a persona), NOT a model — model picks live in the dashboard
 
 # Server
 STATUS_PORT=3200               # dashboard / API port
@@ -1045,8 +1147,8 @@ systemctl --user restart warden
 
 Most runtime behavior is controlled from the dashboard at `http://localhost:3200`:
 
-- **Models** — per-role model selection: orchestrator, Atlas, Vulkan, Artemis, council seats, and one shared Toolcall model for Byte/Dexter/Iris/Mercury/Oculus. Each role has a num_ctx override and a keep-alive checkbox for Orchestrator/Atlas/Toolcall.
-- **Servers** — Ollama URL, Whisper URL, video server / Satellite IP, and (after the distributed-roles refactor) Audio/Warden/Video role URLs.
+- **Models** — per-role model selection: Atlas (the seat), Vulkan, Artemis, council seats, and one shared Toolcall model for Iris/Sentry. Each role has a num_ctx override and a keep-alive checkbox for Atlas/Toolcall.
+- **Servers** — Ollama URL, Whisper URL, Satellite IP, and the Audio/Warden role URLs.
 - **Heartbeat** — scheduled standing instructions.
 - **Skills & MCP** — toggle capabilities and external tools.
 
@@ -1055,10 +1157,6 @@ Dashboard settings are stored in the router state and take effect immediately �
 ### Voice config
 
 `eyes_ears/config/settings.yaml` holds STT/TTS parameters, audio devices, the Warden server URL (`warden.base_url`), and the Satellite port. Copy from `eyes_ears/config/settings.example.yaml` or run `./eyes_ears/run.sh --configure` to generate it. This file is gitignored.
-
-### Security config
-
-`eyes_ears/config/settings.yaml` also controls the camera, detector model, awareness cooldown, face-ID settings, and the Warden URL the detector POSTs events to (same single merged file).
 
 ---
 
@@ -1070,7 +1168,7 @@ Warden runs on **your** machine. It uses **your** browser, **your** desktop, **y
 
 It is not a demo. It is a real assistant with browser automation, desktop control, voice, email, calendar, multi-channel messaging, a plugin ecosystem, an agent architecture that can reason about your work and audit its own decisions, and a prompt engineering surface that has been battle-tested across hundreds of hours of real use.
 
-Warden stole fire from the gods. This one runs on your laptop.
+Warden stole fire from the gods. This one runs on your desktop.
 
 ---
 

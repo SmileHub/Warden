@@ -22,7 +22,11 @@ export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
+// 15s, not 60s: this poll is the hard latency floor for "in N minutes"
+// reminders (a "1 minute" reminder landed at ~2.5-3min under 60s). Cheap —
+// getDueTasks is a single indexed SELECT. The toolcall agent's ~1min tool-call
+// time is model inference speed and unaffected by this.
+export const SCHEDULER_POLL_INTERVAL = 15000;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
@@ -43,6 +47,17 @@ export const SENDER_ALLOWLIST_PATH = path.join(
 );
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+
+// Canonical messages DB path. Propagated into process.env here so every spawned
+// child (agent-runner, MCP servers) inherits it via spawn's `...process.env`.
+// Without this the agent-runner's get_chat_history tool fell back to a stale
+// ~/dockbox/store/messages.db path that doesn't exist → the seat's only
+// history-recovery tool returned "directory does not exist" and it lost the
+// thread across turns (e.g. confirming an offer it had no memory of making).
+export const MESSAGES_DB_PATH = path.join(STORE_DIR, 'messages.db');
+if (process.env.MESSAGES_DB_PATH === undefined) {
+  process.env.MESSAGES_DB_PATH = MESSAGES_DB_PATH;
+}
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'dockbox-agent:latest';
@@ -89,19 +104,22 @@ export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 // Cloud models exposed in the dashboard dropdown. The first entry is the
-// default used when no model is explicitly selected.
+// default selected when the dropdown has no blank option (defaults live in
+// Settings, never hardcoded as a runtime fallback).
 export const CLOUD_MODELS = [
   { id: 'glm-5.2:cloud', label: 'GLM 5.2 (cloud)', provider: 'glm' },
   { id: 'kimi-k2.6:cloud', label: 'Kimi K2.6 (cloud)', provider: 'kimi' },
   { id: 'kimi-k2.5:cloud', label: 'Kimi K2.5 (cloud)', provider: 'kimi' },
 ];
-export const DEFAULT_CLOUD_MODEL = 'glm-5.2:cloud';
 
 // Ollama configuration
 export const OLLAMA_URL =
   process.env.OLLAMA_URL || envConfig.OLLAMA_URL || 'http://127.0.0.1:11434';
+// No hardcoded model fallback here — the dashboard Settings rows (router_state,
+// seeded on first boot) are the only source of model selection. Empty string
+// means "not set"; callers must read the live router_state value, not this.
 export const OLLAMA_CHAT_MODEL =
-  process.env.OLLAMA_CHAT_MODEL || envConfig.OLLAMA_CHAT_MODEL || DEFAULT_CLOUD_MODEL;
+  process.env.OLLAMA_CHAT_MODEL || envConfig.OLLAMA_CHAT_MODEL || '';
 export const LOCAL_ASSISTANT_NAME =
   process.env.LOCAL_ASSISTANT_NAME || envConfig.LOCAL_ASSISTANT_NAME || 'Kimi';
 // Model routing mode: "" (Claude only), "local", "hybrid"

@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Steve Panel</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #050508;
+    font-family: system-ui, sans-serif; user-select: none; }
+  .wrap { height: 100%; display: flex; flex-direction: column;
+    padding: 14px; box-sizing: border-box; gap: 12px; }
+  button { border: none; cursor: pointer; font-weight: 800; letter-spacing: 2px;
+    transition: filter .12s, transform .1s; }
+  button:active { transform: scale(.97); }
+
+  /* Horizontal strip: red TALK on the left — one click (or 3 taps on the
+     mic) starts the conversation, back and forth until the stop sign, he
+     says "that's all for now", or he goes quiet (a sustained run of silent
+     listens ends the mode) — and the yellow stop sign stops everything. */
+  #row { flex: 1; display: flex; gap: 12px; }
+  #push { flex: .75; background: #d81b1b; color: #fff; font-size: 24px;
+    line-height: 1.15; border-radius: 14px;
+    box-shadow: inset 0 -6px 0 rgba(0,0,0,.28), 0 0 18px rgba(255,40,40,.25); }
+  #push:hover { filter: brightness(1.12); }
+  #push.on { animation: breathe 1.6s infinite; }
+  @keyframes breathe { 50% { filter: brightness(.72); } }
+
+  /* Big YELLOW OCTAGON stop sign — 25% bigger than the talk pad, far right.
+     Dormant when idle; flashes hard the whole time a conversation runs. */
+  #stop { flex: 1; background: #f5c400; color: #221800; font-size: 32px;
+    border-radius: 16px;
+    clip-path: polygon(30% 0, 70% 0, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0 70%, 0 30%);
+    box-shadow: inset 0 -6px 0 rgba(0,0,0,.22); }
+  #stop:hover { filter: brightness(1.1); }
+  #stop.busy { animation: strobe .7s infinite; }
+  @keyframes strobe {
+    50% { filter: brightness(.35); transform: scale(.94); }
+  }
+
+  /* Thin status line under the button row */
+  #space { height: 34px; border-radius: 10px; background: #0d1018;
+    border: 1px solid #232a3a; color: #93a3c4; font-size: 15px;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 2px 12px; box-sizing: border-box; overflow: hidden; }
+  #space.err { color: #ff9090; border-color: #4a2020; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="row">
+    <button id="push">TALK</button>
+    <button id="stop">STOP</button>
+  </div>
+  <div id="space"></div>
+</div>
+<script>
+  var push = document.getElementById('push'), stop = document.getElementById('stop'),
+      space = document.getElementById('space');
+
+  function paint(s) {
+    if (!s || !s.ok) {
+      push.classList.remove('on'); stop.classList.remove('busy');
+      space.textContent = 'Jarvis is not answering — check he is running.';
+      space.className = 'err';
+      return;
+    }
+    if (s.busy) {
+      push.classList.add('on'); stop.classList.add('busy');
+      space.textContent = 'Working…'; space.className = '';
+    } else {
+      push.classList.remove('on'); stop.classList.remove('busy');
+      space.textContent = s.note || ''; space.className = '';
+    }
+  }
+
+  async function poll() {
+    try { paint(JSON.parse(await window.pywebview.api.status())); }
+    catch (e) { paint(null); }
+  }
+
+  push.addEventListener('click', async function () {
+    try { await window.pywebview.api.voice_start(); } catch (e) {}
+    setTimeout(poll, 300);
+  });
+  stop.addEventListener('click', async function () {
+    try { await window.pywebview.api.stop(); } catch (e) {}
+    setTimeout(poll, 300);
+  });
+
+  poll(); setInterval(poll, 1200);
+</script>
+</body>
+</html>

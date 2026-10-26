@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
-# eyes_ears/run.sh — ONE interactive, role-flexible entrypoint for both apps.
+# eyes_ears/run.sh — ONE interactive, role-flexible entrypoint for the voice app.
 #
 # Roles are NOT bound to machines. This script can run any of them on THIS
 # machine, and asks for the IPs/URLs of the OTHER roles (the Warden server,
 # the satellite) so nothing is hardcoded:
 #
-#   - Eyes  (Oculus detector): owns the webcam, runs RF-DETR + motion, serves
-#           frames on :8765, POSTs AWARENESS to the Warden server. Background
-#           awareness (describe + comment) runs here when eyes start.
 #   - Ears  (voice + UI): STT/TTS + the hologram UI + Warden chat bridge. Audio
 #           I/O is local by default; --remote uses the satellite relay.
 #   - Satellite: a dumb mic/speaker relay (../satellite/satellite_server.py,
 #           :8766). Stdlib-only — no venv, no GPU.
 #
+#   (The Eyes / Oculus webcam detector was removed 2026-09-15 — Dom. This is
+#   ears only now.)
+#
 #   ./run.sh                       # interactive menu
-#   ./run.sh --eyes                # eyes only (Oculus detector)
 #   ./run.sh --ears                # ears only (voice + UI), local audio
 #   ./run.sh --ears --remote       # ears, mic+speaker on the satellite
-#   ./run.sh --both                # eyes (background) + ears (foreground)
 #   ./run.sh --satellite           # this machine is the audio relay
 #   ./run.sh --configure           # set warden.base_url / satellite.host / ...
+#   ./run.sh --tts kokoro --tts-device cpu --ears   # quick engine/device switch
+#                                    (persisted to config; --tts takes
+#                                     kokoro|orpheus_cpp|orpheus, --tts-device
+#                                     takes cpu|cuda for kokoro, or
+#                                     both|cuda:0|cuda:1|cpu for orpheus_cpp)
 #
-# Any other args forward to the app (e.g. --camera 1, --no-window, --mic local).
+# Any other args forward to the app (e.g. --mic local).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -44,7 +47,7 @@ if [ "${SATELLITE_MODE:-0}" = 1 ]; then
   exec python3 "$SAT_BIN" "${fwd[@]}"
 fi
 
-# ── venv (shared by eyes + ears) ─────────────────────────────────────────────
+# ── venv ─────────────────────────────────────────────────────────────────────
 VENV=".venv"
 if [ ! -x "$VENV/bin/python" ]; then
   echo "[run.sh] venv not found at $VENV/bin/python" >&2
@@ -54,10 +57,29 @@ fi
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
 
+# CUDA 12 runtime for the orpheus_cpp TTS engine. Its llama-cpp-python cu124
+# wheel does not bundle libcudart/libcublas — they come from the nvidia-*-cu12
+# pip packages inside the venv. Prepend (not append) so the system's CUDA 13
+# in /opt/cuda can never satisfy the .so.12 sonames. Silent no-op when those
+# packages aren't installed (e.g. kokoro-only install).
+EE_SITE_PKGS="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
+if [ -n "$EE_SITE_PKGS" ]; then
+  for d in "$EE_SITE_PKGS/nvidia/cuda_runtime/lib" "$EE_SITE_PKGS/nvidia/cublas/lib"; do
+    if [ -d "$d" ]; then
+      LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+  done
+  export LD_LIBRARY_PATH
+fi
+unset EE_SITE_PKGS d
+
 # Qt WebEngine (Chromium) flags for the ears UI (pywebview). --no-sandbox +
 # --password-store=basic skip slow kwallet/keyring probes; --allow-file-access-
 # from-files lets the combined panels host share its JS bridge with file:// iframes.
 export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:---no-sandbox --password-store=basic --allow-file-access-from-files}"
+# Line-buffered stdout so the redirected log (/tmp/warden_ears.log) shows
+# [bridge]/[Jarvis] lines as they happen, not in 4KB blocks after the fact.
+export PYTHONUNBUFFERED=1
 
 # ── TUI presentation (ANSI — strictly cosmetic, no behavior change) ──────────
 if [ -t 1 ]; then
@@ -90,10 +112,6 @@ hdr("Warden server (the Node brain; whichever machine runs it):")
 c.set("warden.base_url", ask("warden.base_url", c.get("warden.base_url")))
 c.set("warden.owner_jid", ask("warden.owner_jid", c.get("warden.owner_jid"), "owner@local"))
 print()
-hdr("Frame server (Eyes binds here so the Warden server can pull frames):")
-c.set("frame_server.host", ask("frame_server.host", c.get("frame_server.host"), "0.0.0.0"))
-c.set("frame_server.port", int(ask("frame_server.port", c.get("frame_server.port"), 8765) or 8765))
-print()
 hdr("Satellite (remote audio relay; whichever machine runs it):")
 c.set("satellite.host", ask("satellite.host", c.get("satellite.host")))
 c.set("satellite.port", int(ask("satellite.port", c.get("satellite.port"), 8766) or 8766))
@@ -101,12 +119,18 @@ ptt = ask("satellite.push_to_talk (true/false)", c.get("satellite.push_to_talk")
 c.set("satellite.push_to_talk", ptt in ("true", "1", "yes", "y"))
 print()
 hdr("Ears voice:")
-c.set("voice.tts_engine", ask("voice.tts_engine (kokoro|orpheus|orpheus_cpp)", c.get("voice.tts_engine"), "kokoro"))
-c.set("voice.tts_voice", ask("voice.tts_voice", c.get("voice.tts_voice"), "af_heart"))
-print()
-hdr("Oculus background awareness (describe + comment on motion when eyes run):")
-ba = ask("oculus.background_awareness (true/false)", c.get("oculus.background_awareness"), "true").lower()
-c.set("oculus.background_awareness", ba in ("true", "1", "yes", "y"))
+eng = ask("voice.tts_engine (kokoro|orpheus_cpp|orpheus)", c.get("voice.tts_engine"), "kokoro")
+c.set("voice.tts_engine", eng)
+voice_default = "af_heart" if eng == "kokoro" else "zoe"
+c.set("voice.tts_voice", ask("voice.tts_voice", c.get("voice.tts_voice"), voice_default))
+if eng == "kokoro":
+    # Kokoro is tiny (82M); either is fine. cuda frees the CPU, cpu leaves the
+    # GPU alone for other models. cpu also sidesteps STT/TTS GPU contention.
+    c.set("voice.tts_device", ask("voice.tts_device (cpu|cuda)", c.get("voice.tts_device"), "cpu"))
+else:
+    # orpheus_cpp: cuda:N pins one card; "both" layer-splits across all NVIDIA
+    # cards; cpu is a last resort (very slow). vLLM "orpheus" is CUDA-only.
+    c.set("voice.tts_device", ask("voice.tts_device (both|cuda:0|cuda:1|cpu)", c.get("voice.tts_device"), "both"))
 
 c.save()
 print()
@@ -117,30 +141,62 @@ PY
 }
 
 # ── arg parsing ──────────────────────────────────────────────────────────────
+# Pre-scan the run.sh-owned flags that take a value (the main loop below only
+# sees valueless flags and forwards everything else to the app). --tts and
+# --tts-device persist to config/settings.yaml, then are consumed (not
+# forwarded — ears.main doesn't know them).
+TTS_ENGINE=""
+TTS_DEVICE=""
+TTS_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tts)        TTS_ENGINE="${2:-}"; shift 2 ;;
+    --tts=*)      TTS_ENGINE="${1#--tts=}"; shift ;;
+    --tts-device) TTS_DEVICE="${2:-}"; shift 2 ;;
+    --tts-device=*) TTS_DEVICE="${1#--tts-device=}"; shift ;;
+    *)            TTS_ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${TTS_ARGS[@]+"${TTS_ARGS[@]}"}
+
 MODE=""
 HAS_AUDIO=0
-BG_AWARENESS=""  # "" = use config; "1" = force on; "0" = force off
 FWD=()
 for a in "$@"; do
   case "$a" in
-    --eyes)    MODE="eyes" ;;
     --ears)    MODE="ears" ;;
-    --both)    MODE="both" ;;
     --ui-only) MODE="ui" ;;
     --satellite) ;;  # handled above
     --configure) MODE="configure" ;;
-    --background-awareness)    BG_AWARENESS="1" ;;
-    --no-background-awareness) BG_AWARENESS="0" ;;
     --mic|--speaker|--remote) HAS_AUDIO=1; FWD+=("$a") ;;
     *) FWD+=("$a") ;;
   esac
 done
 
-# Apply the background-awareness override (config + env for the eyes app).
-if [ -n "$BG_AWARENESS" ]; then
-  python -c "from core.config import Config; c=Config(); c.set('oculus.background_awareness', $BG_AWARENESS=='1'); c.save()" 2>/dev/null || true
+# Persist --tts/--tts-device overrides to config/settings.yaml before launch so
+# the app sees them. Also keeps the voice sensible when switching engine
+# families (kokoro voices like af_heart don't exist in Orpheus and vice versa).
+if [ -n "$TTS_ENGINE" ] || [ -n "$TTS_DEVICE" ]; then
+  python - "$TTS_ENGINE" "$TTS_DEVICE" <<'PY'
+import sys
+from core.config import Config
+c = Config()
+eng, dev = sys.argv[1], sys.argv[2]
+KOKORO = {"af_heart", "am_michael", "bm_george", "af_bella"}
+ORPHEUS = {"tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"}
+if eng:
+    c.set("voice.tts_engine", eng)
+    cur = c.get("voice.tts_voice")
+    if eng == "kokoro" and (not cur or cur in ORPHEUS):
+        c.set("voice.tts_voice", "af_heart")
+    elif eng != "kokoro" and (not cur or cur in KOKORO):
+        c.set("voice.tts_voice", "zoe")
+if dev:
+    c.set("voice.tts_device", dev)
+c.save()
+print(f"[run.sh] tts: engine={c.get('voice.tts_engine')} voice={c.get('voice.tts_voice')} device={c.get('voice.tts_device')}")
+PY
 fi
-export OCULUS_BACKGROUND_AWARENESS="$BG_AWARENESS"
 
 # ── interactive menu (no mode arg) ───────────────────────────────────────────
 if [ -z "$MODE" ] && [ $# -eq 0 ]; then
@@ -156,23 +212,19 @@ BAN
   printf '%s\n\n' "$R"
   printf '  %swhat does THIS machine run?%s\n\n' "$BMG" "$R"
   rule
-  printf '  %s1%s) %sEyes%s      %sOculus detector + frame server, background awareness%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s2%s) %sEars%s      %svoice + UI, local mic + speaker%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s3%s) %sBoth%s      %seyes in background, ears in foreground%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s4%s) %sSatellite%s  %sthis machine is the audio relay on :8766%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s5%s) %sUI only%s   %shologram + panels + text chat, no audio routing%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s6%s) %sConfigure%s  %sset warden.base_url / satellite.host / oculus toggle%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
-  printf '  %s7%s) %sQuit%s\n' "$BYL" "$R" "$BWH" "$R"
+  printf '  %s1%s) %sEars%s      %svoice + UI, local mic + speaker%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
+  printf '  %s2%s) %sSatellite%s  %sthis machine is the audio relay on :8766%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
+  printf '  %s3%s) %sUI only%s   %shologram + panels + text chat, no audio routing%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
+  printf '  %s4%s) %sConfigure%s  %sset warden.base_url / satellite.host%s\n' "$BYL" "$R" "$BWH" "$R" "$D" "$R"
+  printf '  %s5%s) %sQuit%s\n' "$BYL" "$R" "$BWH" "$R"
   rule
   read -r -p "$(printf '%s▶ %s' "$BGR" "$R")" choice
   case "$choice" in
-    1) MODE="eyes" ;;
-    2) MODE="ears" ;;
-    3) MODE="both" ;;
-    4) MODE="satellite" ;;
-    5) MODE="ui" ;;
-    6) MODE="configure" ;;
-    7) exit 0 ;;
+    1) MODE="ears" ;;
+    2) MODE="satellite" ;;
+    3) MODE="ui" ;;
+    4) MODE="configure" ;;
+    5) exit 0 ;;
     *) printf '%s[run.sh] invalid choice%s\n' "$BRD" "$R"; exit 1 ;;
   esac
 fi
@@ -213,11 +265,6 @@ prompt_audio_source() {
 }
 
 # ── launch ───────────────────────────────────────────────────────────────────
-launch_eyes() {
-  printf '%s▶ launching Eyes%s %sOculus detector%s — %s%s%s\n' "$BCY" "$R" "$BWH" "$R" "$D" "${FWD[*]:-no extra args}" "$R"
-  exec python -m eyes.main "${FWD[@]}"
-}
-
 launch_ears() {
   if [ "$HAS_AUDIO" -eq 0 ]; then prompt_audio_source; else AUDIO_ARGS=(); fi
   printf '%s▶ launching Ears%s %svoice + UI%s — %s%s%s\n' "$BCY" "$R" "$BWH" "$R" "$D" "${AUDIO_ARGS[*]:-explicit flags}" "$R"
@@ -230,16 +277,7 @@ launch_ui() {
 }
 
 case "$MODE" in
-  eyes) launch_eyes ;;
   ears) launch_ears ;;
   ui) launch_ui ;;
-  both)
-    printf '%s▶ launching Both%s — %sEyes%s (background) + %sEars%s (foreground).%s\n' "$BCY" "$R" "$D" "$BWH" "$R" "$BWH" "$R"
-    python -m eyes.main "${FWD[@]}" &
-    EYES_PID=$!
-    trap 'kill $EYES_PID 2>/dev/null || true' EXIT INT TERM
-    if [ "$HAS_AUDIO" -eq 0 ]; then prompt_audio_source; else AUDIO_ARGS=(); fi
-    python -m ears.main "${AUDIO_ARGS[@]}" "${FWD[@]}"
-    ;;
   *) printf '%s[run.sh] unknown mode: %s%s\n' "$BRD" "$MODE" "$R" >&2; exit 1 ;;
 esac

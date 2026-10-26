@@ -2,7 +2,9 @@
  * Warden Agent Runner
  * Runs as a child Node process on the user's real system, receives config via stdin,
  * outputs result to stdout. Files live on disk under WORKSPACE_ROOT (default ~/Projects).
- * The workspace boundary is enforced in the tool layer by resolveInsideWorkspace().
+ * Paths are resolved in the tool layer by resolveInsideWorkspace() (~ expansion +
+ * workspace-relative joining); no boundary is enforced — the runner works across
+ * the workspace, /opt/Warden and the wider home dir by design.
  *
  * Input protocol:
  *   Stdin: Full ContainerInput JSON (read until EOF)
@@ -17,17 +19,20 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import * as inbox from './inbox.js';
 import './tools/index.js';
 import { registry } from './tool-registry.js';
-import { setOculusTaskPrompt } from './tools/awareness-tools.js';
+import { CAPABILITY_BUILTINS } from './toolsets.js';
+import { askVisionModel, setVisionModelResolver } from './tools/vision-qa.js';
 import { TOOLSETS, resolveToolset, resolveMultipleToolsets } from './toolsets.js';
 import { writeIpcFile, waitForResult, cleanFilePath, log, IPC_DIR, TASKS_DIR, RESULTS_DIR } from './ipc-helpers.js';
+import { noteMarmActivity } from './marm-recall.js';
 import { hooks } from './hooks.js';
 import { extractKeywords, rankTools, buildRelevantPatternsSection } from './dynamic-selection.js';
 import { createProvider } from './providers/index.js';
 import type { ChatProvider } from './providers/types.js';
-import { resolveInsideWorkspace, WorkspaceBoundaryError } from './workspace-boundary.js';
+import { resolveInsideWorkspace } from './workspace-boundary.js';
 import {
   loadSkills,
   renderSkillIndex,
@@ -128,11 +133,127 @@ function skillToolDefs(): Tool[] {
     return mergeActiveSkillTools(skillState.skills, skillState.active);
 }
 
+// Default apps: capability -> 'builtin' | 'mcp:<server>'. Re-synced each turn
+// from settings, so a change takes effect on the next dispatch.
+let DEFAULT_APPS: Record<string, string> = {};
+
+// The agent's own name, as set for the dash (ASSISTANT_NAME host-side).
+// Spoken in the seat's own prompt — a whitelabel name changes the speech.
+let AGENT_NAME = 'Warden';
+
+// Tools exempt from relevance ranking, on top of the discovery escape hatch.
+// The ranker scores name + description, so a tool whose description does not
+// carry the words people actually use loses to tools that do — `youtube` lost
+// "change the song" to read_file/list_file/bash. Pinning is the override for
+// that, and it is a SETTING so a new one needs no code change: the list is
+// owned entirely by router_state `local:pinned_tools` (dashboard Pinned tools;
+// host default lives in db.ts readPinnedTools) and rides the spawn payload +
+// per-turn settings sync. Nothing is pinned in code — and an MCP tool may be
+// pinned by its full wire name (mcp__<server>__<tool>).
+let PINNED_TOOLS: string[] = [];
+
+/** Is a tool covered by a pin? Exact name, or — for an MCP SERVER pin
+ *  (`mcp__<server>`, what the dashboard's pin select offers) — any tool that
+ *  server exposes. */
+function isPinnedTool(n: string): boolean {
+    return PINNED_TOOLS.some((p) => n === p || (p.startsWith('mcp__') && n.startsWith(p + '__')));
+}
+
+/** The MCP server chosen to provide `capability`, or '' when the built-in has it. */
+function providerFor(capability: string): string {
+    const v = String(DEFAULT_APPS[capability] || '').trim();
+    return v.startsWith('mcp:') ? v.slice(4).trim() : '';
+}
+
+/** Playback/control asks (play/skip/pause). Its ONLY use is the iteration-1
+ *  think-skip in the orchestrator loop — a one-call mechanical ask wastes a
+ *  planning pass. The tool stand-down it used to gate is GONE (2026-09-21):
+ *  any playback word in an ask ("check my notifications while the music
+ *  plays") withheld the browser provider's tools from that turn, and a
+ *  facebook-notifications ask that mentioned music lost the browser entirely
+ *  — the seat fell back to youtube and the user's ask went unanswered. */
+const PLAYBACK_ASK_RE = /\b(play|playing|played|pause|paused|resume|skip|skipped|song|songs|music|video|videos|track|tracks|playlist|playlists|youtube|lofi|chillstep|chill|mix|fullscreen|now playing|put on|listen|queue)\b/i;
+
+// Cooldown for the per-turn lazy-dial of the default browser provider (see
+// the dial block in the turn loop): a successful dial attaches for the
+// runner's lifetime; this only spaces out retries while it is unreachable.
+let lazyDialLastAttemptAt = 0;
+
+// The seat's current ask — set by mergeSkillTools each seat iteration (the
+// only path that computes it; subagent tool builds never touch this). Exposed
+// lazily below as __wardenTurnAsk: a GENERIC turn fact for tools/ modules
+// (which cannot import this file — circular). What the ask MEANS is each
+// skill's own business; nothing ask-specific lives in this file.
+let CURRENT_ASK = '';
+
+/** Apply the default-app choices to one seat's tool list.
+ *  For a capability handed to an MCP server: drop that capability's BUILT-IN
+ *  tools and let the server's tools stand in. Substitution, not addition —
+ *  two tools that both plausibly do the job is how a small model ends up
+ *  hand-driving instead of calling the tool that owns the task.
+ *  Exception: a LAZY provider (optional component, e.g. the browser-driving
+ *  bridge) only substitutes while its tools are actually loaded. When it is
+ *  absent, the capability FAILS TO DEFAULT — the built-ins stay and the model
+ *  keeps working. An optional component must never remove the default. */
+function applyDefaultApps(builtins: any[], mcpDefs: any[]): any[] {
+    const drop = new Set<string>();
+    for (const [cap, names] of Object.entries(CAPABILITY_BUILTINS)) {
+        const server = providerFor(cap);
+        if (!server) continue;
+        const prefix = `mcp__${server}__`;
+        const loaded = mcpDefs.some(t => String(t?.function?.name || '').startsWith(prefix));
+        if (!loaded && isLazyMcpServer(server)) {
+            // Optional provider not connected: keep the built-in default. When
+            // the provider comes up and its tools enter the pool, it takes over.
+            log(`[default-apps] ${cap} -> mcp:${server} not loaded (optional) — built-in ${cap} tools stay as default`);
+            continue;
+        }
+        // Unconditional for non-lazy servers: naming a default app for a
+        // capability withholds that capability's built-in tools, whether or
+        // not the chosen server is currently connected. The whole point of
+        // choosing a default is that the model should never see the built-in
+        // as an option at all; a broken default should surface as "no tool
+        // for this," not a silent swap back to the thing the user turned off.
+        for (const n of names) drop.add(n);
+        log(`[default-apps] ${cap} -> mcp:${server} (built-in ${cap} tools withheld${loaded ? '' : ' — WARNING: server has no tools loaded right now, capability is unavailable until it connects'})`);
+    }
+    if (drop.size === 0) return builtins;
+    return builtins.filter(t => !drop.has(String(t?.function?.name || '')));
+}
+
+/** Is this MCP server configured as lazy (optional, on-demand only)?
+ *  Unreadable config answers YES: the caller withholds a capability's built-in
+ *  tools for a non-lazy server whether or not it is connected, so answering NO
+ *  on a failed read strands that capability with ZERO tools — the exact state
+ *  the lazy contract exists to prevent. Keeping the built-ins is the recoverable
+ *  side of this branch, and the read failure is logged rather than swallowed. */
+function isLazyMcpServer(server: string): boolean {
+    const cfgPath = process.env.MCP_SERVERS_CONFIG || path.join(process.cwd(), 'data', 'mcp-servers.json');
+    try {
+        // Small config, read per seat-build — no caching needed.
+        const raw = fs.readFileSync(cfgPath, 'utf-8');
+        const list = JSON.parse(raw);
+        return Array.isArray(list) && list.some((s: any) => s && s.name === server && s.enabled !== false && s.lazy === true);
+    } catch (err: any) {
+        log(`[default-apps] mcp-servers config unreadable at ${cfgPath} (${err?.message || err}) — treating ${server} as lazy so built-in tools stay available`);
+        return true;
+    }
+}
+
 /** MCP tool defs for a sub-agent's allow-listed servers (mcp__<server>__*).
  *  Servers that aren't connected contribute nothing, so defs can name servers
  *  that don't exist yet (e.g. iris pre-wired for kmail). */
 function mcpToolDefsForServers(servers?: string[]): any[] {
     if (!servers || servers.length === 0 || !skillState) return [];
+    // '*' = every server currently connected. The SUBAGENTS literal is built
+    // before any MCP server has been contacted, so a seat that should get
+    // "whatever the user has installed" cannot name them statically — and a
+    // static list silently omits every server added afterwards.
+    if (servers.includes('*')) {
+        return skillState.skills
+            .filter(sk => sk.source === 'mcp')
+            .flatMap(sk => sk.tools);
+    }
     const prefixes = servers.map(s => `mcp__${s}__`);
     const out: any[] = [];
     for (const skill of skillState.skills) {
@@ -143,6 +264,27 @@ function mcpToolDefsForServers(servers?: string[]): any[] {
         }
     }
     return out;
+}
+
+/** A BARE MCP tool name → its real `mcp__<server>__<tool>` name, when exactly
+ *  one connected server owns it. Prompts name MCP tools in prose and drift from
+ *  the wire names (the old routing prompt said `marm_smart_recall`; the tool is
+ *  `mcp__marm__marm_smart_recall`), and when the prefixed def is not in the
+ *  turn's visible list the model copies the prompt's spelling — 2026-09-18
+ *  11:23, five straight "Unknown tool marm_smart_recall" and no memory recall
+ *  at all. The intent is unambiguous when one server owns the name, so resolve
+ *  it instead of failing; ambiguous (two servers, same tool name) still fails. */
+function resolveBareMcpName(name: string): string | null {
+    if (!skillState || name.startsWith('mcp__')) return null;
+    const matches: string[] = [];
+    for (const skill of skillState.skills) {
+        if (skill.source !== 'mcp') continue;
+        for (const t of skill.tools) {
+            const n = t.function?.name || '';
+            if (n.endsWith(`__${name}`)) matches.push(n);
+        }
+    }
+    return matches.length === 1 ? matches[0] : null;
 }
 
 /** Find the owning MCP client + remote tool name for an mcp__server__tool call. */
@@ -157,23 +299,78 @@ function resolveMcpTool(name: string): { client: ExternalMcpClient; tool: string
     return { client, tool };
 }
 
-/** Disconnect all MCP clients (called at turn end / on exit). */
-async function disconnectMcpClients(): Promise<void> {
+/** Disconnect all MCP clients (called at turn end / on exit). HTTP clients
+ *  persist across turns (single-session servers) unless force=true. */
+async function disconnectMcpClients(force = false): Promise<void> {
     if (!skillState) return;
     for (const c of skillState.clients.values()) {
+        if (!force && c.config.transport === 'http') continue;
         try { await c.disconnect(); } catch { /* best-effort */ }
     }
-    skillState.clients.clear();
+    for (const [name, c] of skillState.clients) {
+        if (!force && c.config.transport === 'http') continue;
+        skillState.clients.delete(name);
+    }
 }
 
-/** Resolve a workspace-relative path, returning a boundary error message on failure. */
-function safeResolve(inputPath: string): { ok: true; path: string } | { ok: false; error: string } {
-    try {
-        return { ok: true, path: resolveInsideWorkspace(inputPath) };
-    } catch (e) {
-        if (e instanceof WorkspaceBoundaryError) return { ok: false, error: e.message };
-        throw e;
-    }
+// Capability tools that must FOLLOW THE DEFAULT APP (youtube drives whatever
+// browser the user chose in Settings → Default apps) live in tools/ and
+// cannot import this file (circular), so the two facts they need are exposed
+// here. Lazy readers — skillState and DEFAULT_APPS are reassigned as turns
+// reload — so these are functions and live lookups, never snapshots.
+(globalThis as any).__wardenDefaultApps = () => DEFAULT_APPS;
+/** The user's ask for the current seat turn ('' when unknown). */
+(globalThis as any).__wardenTurnAsk = () => CURRENT_ASK;
+(globalThis as any).__mcpBridge = {
+    /** Connected tool defs for one server: [{ name ('mcp__srv__tool'), description, params }] */
+    listTools: (server: string) => {
+        if (!skillState) return [];
+        const prefix = `mcp__${server}__`;
+        const out: any[] = [];
+        for (const sk of skillState.skills) {
+            if (sk.source !== 'mcp') continue;
+            for (const t of sk.tools) {
+                const n = String(t?.function?.name || '');
+                if (n.startsWith(prefix)) {
+                    out.push({ name: n, description: t.function.description || '', params: (t.function.parameters || {}) as any });
+                }
+            }
+        }
+        return out;
+    },
+    /** Call one tool on one server. Lazy servers (optional components, e.g.
+     *  browser-driving) are dialed on demand here — this call IS the ask.
+     *  Throws when the server cannot be reached; the caller fails gracefully. */
+    call: async (server: string, tool: string, args: any) => {
+        const short = tool.startsWith(`mcp__${server}__`) ? tool.slice(`mcp__${server}__`.length) : tool;
+        let client = skillState?.clients.get(server);
+        if (!client) {
+            const { getOrCreateMcpClient } = await import('./mcp-client.js');
+            client = await getOrCreateMcpClient(server);
+            await attachLazyServer(server, client);
+        }
+        return await client.callTool(short, args ?? {});
+    },
+};
+
+// Close MCP clients on SIGTERM/SIGINT before exiting. A single-session http
+// server (the Chrome extension's MCP endpoint) keeps its session server-side
+// when this process is killed without a DELETE on the transport — the next
+// process then fails every connect with "Already connected to a transport"
+// until the server drops the orphan (2026-09-19: each warden restart left one
+// behind and browser-driving went dark). Best-effort, 2s cap, then exit.
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(sig, () => {
+        void Promise.race([
+            disconnectMcpClients(true),
+            new Promise<void>((r) => setTimeout(r, 2000)),
+        ]).finally(() => process.exit(0));
+    });
+}
+
+/** Resolve a path (~ expansion + workspace-relative joining). Never fails. */
+function safeResolve(inputPath: string): { ok: true; path: string } {
+    return { ok: true, path: resolveInsideWorkspace(inputPath) };
 }
 
 // Lazy provider — created on first use based on env vars
@@ -227,8 +424,82 @@ const STATUS_MARKER = '---WARDEN_STATUS---';
 // check", "I'll verify") but emitting no tool_call. Capped at INTENT_MAX_NUDGES
 // per turn. Triggered only when response is short, has no fenced code, and the
 // regex matches an announcement phrase.
-const INTENT_RE = /\b(?:let me|i'll|i will|i need to|i'm going to|going to|gonna|now i|i can|let's)\b[\s\S]{0,80}?\b(?:tail|check|verify|run|execute|read|inspect|look|search|find|grep|cat|ls|cd|write|edit|test|debug|install|start|stop|send|fetch|open|close|create|delete|move|copy|list|show|get|set|update|build|deploy|fix|patch|investigate|explore|examine|parse|extract|scan|monitor|kill|spawn|launch|queue|schedule)\b/i;
+const INTENT_RE = /\b(?:let me|i'll|i will|i need to|i'm going to|going to|gonna|now i|i can(?!['’]?t\b)|let's)\b[\s\S]{0,80}?\b(?:tail|check|verify|run|execute|read|inspect|look|search|find|grep|cat|ls|cd|write|edit|test|debug|install|start|stop|send|fetch|open|close|create|delete|move|copy|list|show|get|set|update|build|deploy|fix|patch|investigate|explore|examine|parse|extract|scan|monitor|kill|spawn|launch|queue|schedule|play|trigger|pause|resume|skip|seek|mute|unmute|rewind|delegate)\b/i;
 const INTENT_MAX_NUDGES = 2;
+
+// Sub-agent version of the same announced-intent defect, on the runSubAgent
+// side: a LOOPING sub-agent (vulkan/atlas) ends a text-only turn narrating the
+// NEXT tool action ("Now write index.html. I'll use the exact content…")
+// instead of making the call — runSubAgent treats a no-tool-call turn as the
+// final answer, so the job "completes" with the deliverable unwritten
+// (vulkan-9ryv, 2026-09-05: wrote style.css, then ended with "Now write
+// index.html…"; index.html never existed). The orchestrator loop already has
+// an intent nudge; sub-agents had none. First-person/now tense only, so a
+// final report that RECOMMENDS work ("Next, fix the login form" — an artemis
+// audit) is not a self-announcement and is not nudged.
+const SUB_INTENT_RE = /\b(?:now|i'?ll|i will|next,?\s+i'?ll|let me|let'?s|i'?m going to|then i'?ll)\b[\s\S]{0,40}?\b(?:write|create|make|build|add|update|edit|fix|run|install|move|copy|delete|save|generate|implement|apply|set up|put|check|verify|read|inspect|look(?: up| at)?|search|find|scan|examine|review)\b/i;
+// A promise that names the file it will produce ("Now write index.html", "I'll
+// create the page at v2/index.html") is an unfulfilled promise at ANY length:
+// the vulkan-9ryv failures (2026-09-05, three in a row) were long, fenced-code
+// plan dumps that named the file and then ended — sailing past the
+// short-reply exemptions below. Present-tense verbs only, so a completed
+// report ("wrote index.html", "created the page") does not match.
+const SUB_INTENT_FILE_WRITE_RE = /\b(?:write|create|make|build|save|generate)\b[\s\S]{0,40}?[\w~./@-]+\.[a-z0-9]{1,6}\b/i;
+const SUB_INTENT_MAX_NUDGES = 2;
+
+// ── Deterministic churn + narration watchdogs (count/volume-based, NOT time) ──
+// Speed-invariant by design: local models stream slower than cloud ones, so
+// elapsed seconds can't distinguish "slow but working" from "circling". Both
+// detectors key on WHAT the job emits, not how long it takes.
+// Research streak (restored from 2727c1e, removed 2026-08-25 in 7123b6b when
+// the LLM supervisor took over sensing — then the supervisor was hard-disabled
+// 2026-08-29, leaving NOTHING sensing stuck jobs. Nudges only, never abort:
+// only the orchestrator decides stops; the 3h wall-clock is the sole code-side kill.)
+const CHURN_NUDGE_AFTER = 12;    // consecutive research-class calls → commit nudge
+const CHURN_RENUDGE_EVERY = 10;  // re-nudge interval after the first
+const CHURN_MIN_AGE_S = 60;      // don't churn-nudge a job younger than this
+const RESEARCH_TOOLS = new Set([
+    'Read', 'Grep', 'Glob', 'Bash', 'WebSearch', 'WebFetch',
+    'read_file', 'list_file', 'get_chat_history', 'list_running_agents',
+    'read_job_result', 'agent_logs',
+    // Browser probes count as research: atlas-10gs circled 40+ iterations on
+    // page-read probes of Reddit's shadow-DOM composer without acting. The CDP
+    // browser_* names are retired; browsing now rides the MCP bridge, so the
+    // read/inspection class of its tools carries the streak (full mcp-prefixed
+    // names — see TOOL_RESULT_MAX_CHARS for the same convention).
+    'mcp__browser-driving__chrome_read_page', 'mcp__browser-driving__chrome_get_web_content',
+    'mcp__browser-driving__chrome_screenshot', 'mcp__browser-driving__chrome_navigate',
+    'desktop_screenshot',
+    'mcp__marm__marm_smart_recall',
+]);
+// Narration cap: a stream that has produced this many chars of CONTENT with
+// zero tool_call chunks is writing an essay, not working. A legitimate long
+// generation (big Write/browser_type payload) emits tool_call chunks from the
+// first fragments, and thinking is exempt (sanctioned planning), so neither
+// trips it regardless of model speed.
+const NARRATION_MAX_CHARS = 6000;
+const NARRATION_MAX_NUDGES = 3;
+
+// Narrated-but-never-dispatched guard (Atlas regression): the model narrates a
+// delegation in present-progressive ("Atlas is opening the page now") or future
+// ("I'll have Atlas do X — I'll let you know") then ends the turn with no tool
+// call. INTENT_RE and claimedDelegation (past-tense only) both miss this. The
+// structural check below keys on the invariant — a delegate NAME appears in the
+// reply with no matching tool_call this turn and it is NOT a past-tense
+// citation of a prior result ("Atlas reported…", "Atlas's report") — instead of
+// chasing phrasings (arms race per feedback-fix-general-cause-not-symptom).
+// Atlas is not here: this seat IS atlas, so 'atlas' is not a delegate tool
+// and naming it in a nudge would send the model after a tool that does not exist.
+const DELEGATE_NAMES = ['iris', 'vulkan', 'artemis'];
+// Words that, when they appear within ~40 chars before OR after a delegate
+// name, mark the mention as a citation of an already-completed result rather
+// than a promise to dispatch now. Before: "according to Atlas", "from Atlas".
+// After (subject-verb order): "Atlas noted…", "Vulkan reported…", "Atlas
+// finished/completed/delivered…". These are the structural completed-work
+// signal; present-progressive ("Atlas is opening") and future ("I'll have
+// Atlas") deliberately do NOT match, so the nudge still fires on real
+// narrated-but-undispatched hand-offs. Matched case-insensitively.
+const PAST_TENSE_MARKER_RE = /\b(?:reported|reports|said|says|noted|found|replied|concluded|observed|discovered|answered|confirmed|told|finished|completed|delivered|produced|wrote|built|returned|according\s+to|per|from|as)\b/i;
 
 // Prompt-injection guard markers: wrap external content (tool output, web
 // fetches, email bodies) so the model can recognize untrusted text and so
@@ -258,34 +529,7 @@ function untrustedContextMessage(content: string): string {
 // external content (web, email, files) to this set.
 const TRUSTED_RESULT_TOOLS = new Set(['activate_skill', 'deactivate_skill', 'list_skills', 'fabric_pattern']);
 
-// Mid-loop breaker: distinct from the post-loop force-answer fallback.
-//   CIRCLING_USELESS_LIMIT consecutive "useless" rounds (repeated recent tool
-//   signature + no answer text) → force one tool-free round.
-//   RUNAWAY_CALL_LIMIT of the exact same call signature → force one tool-free
-//   round (this catches a model stuck repeating one tool call verbatim).
-const CIRCLING_USELESS_LIMIT = 4;
-const RUNAWAY_CALL_LIMIT = 15;
-const RECENT_CALL_SIG_DEPTH = 6;
-
-// Verifier sub-agent: fresh-context second model judges SUCCESS/FAIL after
-// effectful tools. Opt-in via env var (default OFF — costs an extra model call
-// per turn, worth it for weak local models that rationalize self-checks).
-const AGENT_VERIFIER_SUBAGENT = process.env.AGENT_VERIFIER_SUBAGENT === '1' || process.env.AGENT_VERIFIER_SUBAGENT === 'true';
-const VERIFIER_MAX_ROUNDS = 2;
-const VERIFIER_EFFECTFUL_TOOLS = new Set<string>([
-    'Write', 'Edit', 'NotebookEdit', 'Bash', 'Write_Special', // file/effect mutations
-    'send_email', 'reply_email', 'bulk_email',                  // email sends
-    'schedule_task', 'cancel_task', 'pause_task', 'resume_task', 'update_task', // scheduler mutations
-    'install_mcp_server', 'uninstall_mcp_server',
-    'open_app', 'desktop_click', 'desktop_type',               // desktop actions
-    'atlas', 'byte', 'dexter', 'iris',                         // sub-agent delegates (they perform actions)
-]);
-
-// Build a one-line signature of a tool call for the runaway / circling detectors.
-function callSignature(toolName: string, args: any): string {
-    const argString = JSON.stringify(args || {}).slice(0, 120);
-    return `${toolName}:${argString}`;
-}
+const DUP_TOOL_ABORT = 3;       // consecutive IDENTICAL tool calls before the stream is aborted (repetition-loop guard)
 function writeOutput(output) {
     console.log(OUTPUT_START_MARKER);
     console.log(JSON.stringify(output));
@@ -311,10 +555,6 @@ function toolLabel(name) {
         Skill: 'Running skill',
         api_request: 'Calling API',
         list_api_keys: 'Checking API keys',
-        send_sms: 'Sending SMS',
-        read_sms: 'Reading SMS',
-        byte: 'Running Byte',
-        dexter: 'Running Dexter',
         atlas: 'Running Atlas',
         artemis: 'Running Artemis',
         iris: 'Running Iris',
@@ -367,14 +607,10 @@ function toolDetailLabel(name, args) {
         case 'add_priority': return `Add priority`;
         case 'schedule_task': return `Schedule ${args.schedule_type || 'task'}`;
         case 'create_calendar_event': return `Calendar: ${short(args.title || '', 40)}`;
-        case 'send_sms': return `SMS to ${short(args.to || '', 20)}`;
         case 'generate_pdf': return `Generate PDF: ${clean(args.filename || '')}`;
+        case 'generate_image': return `Generate image: ${short(args.prompt || '', 50)}`;
         case 'convert_file': return `Convert ${clean(args.input || '')} → ${args.format || '?'}`;
-        case 'read_sms': return `Read SMS${args.from ? ' from ' + short(args.from, 20) : ''}`;
         case 'api_request': return `${args.method || 'GET'} ${args.key_type}${args.path || ''}`;
-        case 'set_user_email': return `Set email: ${short(args.email || '', 30)}`;
-        case 'byte': return `📋 Byte: ${args.task || ''}`;
-        case 'dexter': return `⏰ Dexter: ${args.task || ''}`;
         case 'atlas': return `🌍 Atlas: ${args.task || ''}`;
         case 'artemis': return `🏹 Artemis: ${args.task || 'reviewing the conversation'}`;
         case 'iris': return `✉️ Iris: ${args.task || ''}`;
@@ -386,6 +622,38 @@ function toolDetailLabel(name, args) {
     }
 }
 /**
+ * Consume ONLY interrupt files from the IPC input dir (sets interruptRequested),
+ * leaving any queued message files on disk for the turn-end/idle drain. Called
+ * once per tool-loop iteration so a host-initiated soft stop (user pressed Stop)
+ * lands mid-turn instead of only while idle — it replaces the old behavior where
+ * stopping hard-killed the whole runner child and the next message paid a full
+ * cold boot.
+ */
+function drainInterruptOnly() {
+    try {
+        const dirExists = fs.existsSync(IPC_INPUT_DIR);
+        if (!dirExists) return;
+        const files = fs.readdirSync(IPC_INPUT_DIR)
+            .filter(f => f.endsWith('.json'))
+            .sort();
+        for (const file of files) {
+            const filePath = path.join(IPC_INPUT_DIR, file);
+            let data;
+            try {
+                data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            }
+            catch { continue; }
+            if (data && data.type === 'interrupt') {
+                try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+                interruptRequested = true;
+                log('Interrupt signal received via IPC (mid-turn)');
+            }
+        }
+    }
+    catch { /* never break the loop on IPC errors */ }
+}
+
+/**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  */
@@ -395,14 +663,14 @@ function drainIpcInput() {
         const files = fs.readdirSync(IPC_INPUT_DIR)
             .filter(f => f.endsWith('.json'))
             .sort();
-        const messages = [];
+        const messages: { text: string; sideTurn: boolean }[] = [];
         for (const file of files) {
             const filePath = path.join(IPC_INPUT_DIR, file);
             try {
                 const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
                 fs.unlinkSync(filePath);
                 if (data.type === 'message' && data.text) {
-                    messages.push(data.text);
+                    messages.push({ text: data.text, sideTurn: data.sideTurn === true });
                     // Re-sync dashboard model/ctx settings from the host for this turn.
                     // The persistent child captured env at spawn and only got models on
                     // its first stdin payload; without this, dashboard changes never
@@ -438,10 +706,6 @@ function drainIpcInput() {
  */
 function applySettingsSync(data: any) {
     if (!data || typeof data !== 'object') return;
-    if (data.orchestratorModel !== undefined) {
-        const m = (data.orchestratorModel || '').replace(/^local:/, '');
-        if (m) ORCHESTRATOR_MODEL = m;
-    }
     if (data.model !== undefined) {
         ATLAS_MODEL = (data.model || '').replace(/^local:/, '');
     }
@@ -449,10 +713,9 @@ function applySettingsSync(data: any) {
         VULKAN_MODEL = (data.vulkanModel || '').replace(/^local:/, '');
     }
     // Per-agent tool-caller + artemis models — concrete values, no fallback.
-    if (data.byteModel !== undefined) BYTE_MODEL = (data.byteModel || '').replace(/^local:/, '');
-    if (data.dexterModel !== undefined) DEXTER_MODEL = (data.dexterModel || '').replace(/^local:/, '');
     if (data.irisModel !== undefined) IRIS_MODEL = (data.irisModel || '').replace(/^local:/, '');
     if (data.artemisModel !== undefined) ARTEMIS_MODEL = (data.artemisModel || '').replace(/^local:/, '');
+    if (data.sentryModel !== undefined) SENTRY_MODEL = (data.sentryModel || '').replace(/^local:/, '');
     if (data.drivingForce !== undefined) {
         DRIVING_FORCE_ID = data.drivingForce || '';
     }
@@ -465,26 +728,41 @@ function applySettingsSync(data: any) {
         lastContextClearAt = v;
         CONTEXT_CLEAR_AT = v;
     }
+    if (data.supervisorModel !== undefined) SUPERVISOR_MODEL = (data.supervisorModel || '').replace(/^local:/, '');
+    if (data.supervisorEnabled !== undefined) SUPERVISOR_ENABLED = data.supervisorEnabled !== false;
+    if (data.pinnedTools !== undefined) {
+        PINNED_TOOLS = Array.isArray(data.pinnedTools)
+            ? data.pinnedTools.filter((t: any) => typeof t === 'string' && t.trim()).map((t: string) => t.trim())
+            : [];
+    }
+    if (typeof data.assistantName === 'string' && data.assistantName.trim()) {
+        AGENT_NAME = data.assistantName.trim();
+    }
+    if (data.defaultApps !== undefined) {
+        DEFAULT_APPS = {};
+        const src = (data.defaultApps && typeof data.defaultApps === 'object') ? data.defaultApps : {};
+        for (const [k, v] of Object.entries(src)) if (typeof v === 'string' && v) DEFAULT_APPS[k] = v;
+    }
     if (data.councilSkepticModel !== undefined) COUNCIL_MODEL_SKEPTIC = (data.councilSkepticModel || '').replace(/^local:/, '');
     if (data.councilPragmatistModel !== undefined) COUNCIL_MODEL_PRAGMATIST = (data.councilPragmatistModel || '').replace(/^local:/, '');
     if (data.councilSynthesistModel !== undefined) COUNCIL_MODEL_SYNTHESIST = (data.councilSynthesistModel || '').replace(/^local:/, '');
     if (data.subagentModel !== undefined) process.env.SUBAGENT_MODEL = data.subagentModel || '';
-    if (data.orchestratorCtx !== undefined) process.env.ORCHESTRATOR_NUM_CTX = data.orchestratorCtx ? String(data.orchestratorCtx) : '';
+    if (data.maxOutputTokens !== undefined) {
+        const n = parseInt(String(data.maxOutputTokens || ''), 10);
+        MAX_OUTPUT_SETTING = Number.isFinite(n) && n > 0 ? n : 0;
+    }
     if (data.subagentCtx !== undefined) process.env.SUBAGENT_NUM_CTX = data.subagentCtx ? String(data.subagentCtx) : '';
     if (data.atlasCtx !== undefined) process.env.ATLAS_NUM_CTX = data.atlasCtx ? String(data.atlasCtx) : '';
+    if (data.visionModel !== undefined) process.env.VISION_MODEL = data.visionModel ? String(data.visionModel) : '';
     if (data.toolsCtx !== undefined) process.env.TOOLS_NUM_CTX = data.toolsCtx ? String(data.toolsCtx) : '';
     if (data.mercuryCtx !== undefined) process.env.MERCURY_NUM_CTX = data.mercuryCtx ? String(data.mercuryCtx) : '';
     // Per-agent num_ctx overrides — blank means the model's native window.
-    if (data.byteCtx !== undefined) process.env.BYTE_NUM_CTX = data.byteCtx ? String(data.byteCtx) : '';
-    if (data.dexterCtx !== undefined) process.env.DEXTER_NUM_CTX = data.dexterCtx ? String(data.dexterCtx) : '';
     if (data.irisCtx !== undefined) process.env.IRIS_NUM_CTX = data.irisCtx ? String(data.irisCtx) : '';
     if (data.artemisCtx !== undefined) process.env.ARTEMIS_NUM_CTX = data.artemisCtx ? String(data.artemisCtx) : '';
     if (data.vulkanCtx !== undefined) process.env.VULKAN_NUM_CTX = data.vulkanCtx ? String(data.vulkanCtx) : '';
-    if (data.oculusCtx !== undefined) process.env.OCULUS_NUM_CTX = data.oculusCtx ? String(data.oculusCtx) : '';
     // Per-agent keep_alive overrides (-1 = resident, 300 = 5 min). The host
-    // seeds ORCHESTRATOR_KEEP_ALIVE='-1' to preserve the historic resident
-    // orchestrator; toolcall/atlas stay unset → runner defaults to 300.
-    if (data.orchestratorKeepAlive !== undefined) process.env.ORCHESTRATOR_KEEP_ALIVE = data.orchestratorKeepAlive ? String(data.orchestratorKeepAlive) : '';
+    // seeds ATLAS_KEEP_ALIVE='-1' (the seat stays resident); toolcall stays
+    // unset → runner defaults to 300.
     if (data.atlasKeepAlive !== undefined) process.env.ATLAS_KEEP_ALIVE = data.atlasKeepAlive ? String(data.atlasKeepAlive) : '';
     if (data.toolcallKeepAlive !== undefined) process.env.TOOLCALL_KEEP_ALIVE = data.toolcallKeepAlive ? String(data.toolcallKeepAlive) : '';
 }
@@ -521,17 +799,6 @@ function drainIpcResults() {
                     const status = data.success ? 'sent successfully' : `failed: ${data.error}`;
                     messages.push(`[System: Email to ${data.to || 'recipient'} ${status}]`);
                 }
-                else if (data.type === 'sms_send_result') {
-                    const status = data.success ? 'sent successfully' : `failed: ${data.error}`;
-                    messages.push(`[System: SMS to ${data.to || 'recipient'} ${status}]`);
-                }
-                else if (data.type === 'sms_read_result') {
-                    if (data.error) {
-                        messages.push(`[System: SMS read failed - ${data.error}]`);
-                    } else {
-                        messages.push(`[System: SMS messages retrieved - ${data.messages?.length || 0} messages]`);
-                    }
-                }
                 else if (data.type === 'work_tasks_list') {
                     messages.push(`[System: Work tasks retrieved - ${data.tasks?.length || 0} tasks]`);
                 }
@@ -554,7 +821,7 @@ function drainIpcResults() {
                         messages.push(`[System: Failed to get cached emails - ${data.error}]`);
                     }
                     else if (data.emails?.length === 0) {
-                        messages.push('[System: No cached emails found. Use refresh_email_cache first.]');
+                        messages.push('[System: No cached emails found. Use email(action="refresh") first.]');
                     }
                     else {
                         const summary = data.emails.map((e) => `From: ${e.from}
@@ -586,9 +853,34 @@ Date: ${e.date}`).join('\n---\n');
 // All tools self-register via imports in ./tools/index.js.
 // Tool schemas for Ollama are generated via registry.getDefinitions().
 
+// Tool names already reported as over-long, so the warning below fires once per
+// tool instead of every prompt.
+const CLAMP_WARNED = new Set<string>();
+
 // Strip tier field before sending to Ollama — it only expects { type, function }
 function stripTier(tools: any[]) {
-    return tools.map(({ tier, ...rest }) => rest);
+    // The tool schema block is re-ingested EVERY prompt. The 200-char clamp
+    // exists for third-party MCP servers, which ship paragraph prose where the
+    // name and parameter schema already carry the contract. It must NOT touch
+    // first-party tools: ours are authored as a compact JSON blob
+    // ({"what":…,"use_when":…,"answer":…}) where the description IS the
+    // contract, and slicing one at 197 chars cuts the JSON mid-string, leaving
+    // the model an invalid blob ending in an ellipsis — the BBS/friends tools
+    // shipped that way (2026-10-18) and the seat confabulated their behavior.
+    return tools.map(({ tier, ...rest }) => {
+        const d = rest?.function?.description;
+        if (typeof d === 'string' && d.length > 200) {
+            const name = String(rest?.function?.name || '');
+            if (name.startsWith('mcp__')) {
+                const first = d.split('\n').map((l: string) => l.trim()).find(Boolean) || d;
+                rest.function.description = first.length > 200 ? first.slice(0, 197).trimEnd() + '…' : first;
+            } else if (!CLAMP_WARNED.has(name)) {
+                CLAMP_WARNED.add(name);
+                log(`[tools] description for "${name}" is ${d.length} chars — passed through unclamped (first-party JSON contract)`);
+            }
+        }
+        return rest;
+    });
 }
 
 // Derive full tool list from registry
@@ -602,6 +894,15 @@ interface SubAgentDef {
     label: string;
     maxIterations: number;
     summary: string;
+    /** The one line the ORCHESTRATOR reads when deciding who owns an ask. The
+     *  `# THE CREW` roster (crewBlock) is generated from these, so a new
+     *  seat (or a changed remit) needs no prompt edit and the prompt can never
+     *  describe a roster the code doesn't have. */
+    routing?: string;
+    /** True when the delegate returns a job id and the result lands in the
+     *  inbox later; false when it answers in line. Also generated into the
+     *  crew block. */
+    background?: boolean;
     systemPrompt: string;
     toolsets: string[];
     /** MCP servers whose tools this sub-agent receives (e.g. iris → kmail).
@@ -616,239 +917,299 @@ interface SubAgentDef {
     temperature?: number;
 }
 
+/** The rules atlas and vulkan share. Written once so the two seats cannot
+ *  drift apart: when "read once" or "three approaches before impossible" is
+ *  worth changing, it changes for both. `doneLine` is the only per-seat part —
+ *  what "the deliverable exists" means differs between a file on disk and a
+ *  page in front of the user. */
+function agentKernel(doneLine: string): string {
+    // Nested JSON carries only the FIXED facts — procedures that never change
+    // (reading, retries, sudo, memory). The seats consuming this run granite
+    // and sometimes qwen, and both read structure — but a wall of never-rules
+    // made them literal-minded (2026-09-26), so keep entries short, positive
+    // and factual. The voice lives in the seat prompts, not here.
+    return JSON.stringify({
+        reading: {
+            files: 'each file the task names, once, in full; keep what you read and work from it',
+            grep: 'once, for a single string you need again',
+        },
+        acting: {
+            deliver: 'produce the deliverable in the turn you know what it is',
+            report: 'past tense: what exists now, what you ran',
+            pace: 'one useful step per turn',
+        },
+        on_failure: {
+            retry: 'read the error; take a genuinely different approach',
+            stop: 'after 3 different approaches each failed with a real error — say plainly what blocks you',
+            empty_result: 'an empty result is an answer; when the target is nowhere, say where you looked and ask where it is',
+            earlier_fix_failed: 'confirm the change is present, trace the data flow end to end, fix the real cause',
+        },
+        sudo: {
+            who: 'the user types the password',
+            run: 'sudo pacman -S <pkg> once, say a password prompt is waiting, and wait',
+            fail: 'one attempt — report what is missing, continue with the rest',
+        },
+        memory: {
+            recall: 'mcp__marm__marm_smart_recall before hunting for a fact, a prior decision, or how something was done',
+            log: 'when the user asked you to remember it — then mcp__marm__marm_log_entry, once per fact',
+        },
+        finishing: {
+            done: `${doneLine} Report exactly what you changed.`,
+            blocked: 'say what blocks you — an honest miss beats an invented result',
+            keep_going: 'anything else — take the next useful step',
+        },
+    });
+}
+
 const SUBAGENTS: SubAgentDef[] = [
-    {
-        delegate: 'byte',
-        label: 'Byte',
-        maxIterations: 50,
-        summary: 'projects, work tasks, deliverables, blockers, priorities, financials, and time tracking',
-        systemPrompt: `You are Byte, the work-management agent.
-
-CAPABILITIES: Manage projects, work tasks, deliverables, blockers, priorities, financials, and time tracking. Read the user's inbox and turn actionable emails into projects and work tasks.
-
-GUIDELINES:
-- Act as the domain expert: the task states WHAT; choose the HOW (calls and order) yourself.
-- Read before writing: list or get the relevant record first.
-- Supply required fields for every item — blockers: title + description; tasks and deliverables: title; financials: amount + category. Infer reasonable values when the task omits them.
-- create_work_task always needs project_id. Pass "personal" (the permanent Personal project) when the task names no project; pass the named project's ID only when the user specifies one. priority is low | medium | high | urgent (default medium).
-- Call each tool once; move on after a success.
-- Use only IDs and data your tools return.
-- Inbox scan: read_emails, keep messages in the requested range (filter by Date), then create a work task (and a project when warranted) for each actionable item. Treat newsletters, confirmations, receipts, shipping notices, and ads as non-actionable.
-
-Example:
-Task: "add 'fix the login bug' to my list"
-→ create_work_task(title="Fix the login bug", project_id="personal")
-
-FORMAT: one plain-text line or short list naming what you created or changed, with the IDs returned.`,
-        toolsets: ['byte-core'],
-        mcpServers: ['tasks'],
-        // IBM Granite tool-calling guidance: temperature 0 for reliable
-        // structured tool use.
-        temperature: 0,
-    },
-    {
-        delegate: 'dexter',
-        label: 'Dexter',
-        maxIterations: 200,
-        summary: 'anything time-based: reminders, follow-ups, sending or doing something later, scheduled/recurring tasks, and time-based automations (e.g. "send a survey in 3 days") — create, list, pause, resume, cancel or update them',
-        systemPrompt: `You are Dexter, the scheduling agent. You create and manage calendar events and scheduled tasks with your tools.
-
-The first line of the task gives the current local time: "Current local time is YYYY-MM-DDTHH:MM:SS (timezone ...)". Compute all timestamps from this value. Times are LOCAL. Pass the computed timestamps as tool arguments.
-
-Match the request to a tool.
-
-Create:
-- create_calendar_event — an appointment, meeting, or calendar event (a thing that happens at a time). Args: title, start_time. end_time optional.
-- schedule_task — a reminder or automation that fires later. Args: schedule_type, schedule_value, prompt.
-- A request for both a calendar event and a reminder: call create_calendar_event and schedule_task in the same turn.
-
-Manage (call list_tasks or list_calendar_events first to get the id, then use that id):
-- list_tasks — show tasks, reminders, automations.
-- list_calendar_events — show calendar events.
-- cancel_task — remove a task or reminder. Arg: id.
-- pause_task — hold a task. Arg: id.
-- resume_task — continue a held task. Arg: id.
-- update_task — reschedule or edit a task. Arg: id.
-- delete_calendar_event — remove a calendar event. Arg: id.
-- update_calendar_event — reschedule or edit a calendar event. Arg: id.
-
-schedule_value forms (for schedule_task):
-- once → absolute local timestamp "YYYY-MM-DDTHH:MM:SS"
-- interval → milliseconds as a string (N minutes = N×60000, N hours = N×3600000, N days = N×86400000)
-- cron → 5-field cron expression in local time
-
-The schedule_task prompt runs later in a turn with no memory of this conversation; write it as a complete instruction with all needed context.
-
-A plain to-do with no time trigger belongs to Byte; name it in one line.
-
-For a "once" time, check the computed time with the time tool before calling schedule_task.
-
-Call each tool once with all required args filled.
-
-After the last tool call, reply with one sentence stating what you created, changed, or cancelled, and when.`,
-        toolsets: ['dexter-core'],
-        mcpServers: ['tasks', 'mcp-server-time'],
-        // IBM Granite tool-calling guidance: temperature 0 for reliable,
-        // deterministic structured output — schedule_value timestamps and
-        // cron expressions must come out the same way every time.
-        temperature: 0,
-    },
+    // Byte was merged into iris (2026-09-05): one toolcall agent / one
+    // fine-tuned model. Iris's entry below carries the work-management role.
     {
         delegate: 'atlas',
         label: 'Atlas',
+        background: true,
+        routing: "shell, browser, desktop, files, anything online — hands-on work, however small",
         maxIterations: 200,
-        summary: 'web search, page fetching/scraping, live browser automation, running shell commands, and generating or converting documents (PDF, DOCX, XLSX, etc.)',
-        systemPrompt: `You are Atlas, the execution agent. You receive a task and execute it with your tools. Act immediately — don't explain, plan, or ask questions. You are the execution expert: the task tells you WHAT the user needs, the HOW is yours — if the task prescribes steps that don't fit your tools or a better approach exists, deliver the outcome your own way.
-
-WARDEN ITSELF — Warden's own source lives at \`/opt/warden\` (repo root): \`src/\` (host), \`container/agent-runner/\` (agent), \`dist/\` (built), \`store/\`, \`data/\`, \`public/\` (dashboard), \`security/\` (detector). Tasks about Warden itself look there, not in \`~/Downloads\`. Edit \`src/\` or \`container/agent-runner/src/\`, run \`npm run build\`, then \`systemctl --user restart warden\` to deploy — \`dist/\` is built output, never edit it by hand.
-
-FILES — User-uploaded files live in the workspace root; copy before editing. Read only the files your task names — don't explore unrelated files. Edit with targeted old_string/new_string, never rewrite whole files; if an Edit misses, re-read the section and retry (never fall back to python/sed rewrites). You have full filesystem access — use absolute paths outside the workspace (\`~/Documents\`, \`/etc\`, \`/var/log\`). Bash is a persistent shared shell: \`cd\` persists across calls in this task, so work in the right place instead of repeating full paths.
-
-BROWSER — For web tasks (open URLs, forms, scraping, clicks, YouTube) use the native browser_* tools. Chrome launches automatically on CDP 9222 with the user's real signed-in profile — call \`browser_navigate\` directly as the first browser action, no setup, no Bash checks (never use Bash to find/launch Chrome or install Chromium — that spawns a blank-profile Chrome and breaks sign-ins). It returns a snapshot with refs like [ref=e12]; pass them to click/type, and take a fresh \`browser_snapshot\` after the page changes (refs go stale). If a fetch is blocked by robots/captcha/empty shell, fall back to browser_navigate + snapshot/evaluate to read the rendered page and continue.
-
-NATIVE APPS — For desktop apps that aren't a web page (Stremio, a media player, a settings window), drive them by hand: launch the app with Bash (\`flatpak run …\` or the app command) and wait for it to open, then \`desktop_screenshot\` to see the screen, \`desktop_click\` at the pixel coordinates of the control you want, and \`desktop_type\` to type or send keys. Take a fresh \`desktop_screenshot\` after each action so you can see what changed. Don't use xdg-open — it opens things you then can't control.
-
-YOUTUBE — To play a song or video, navigate to YouTube's search results for it (\`https://www.youtube.com/results?search_query=...\`) and click a real result from the snapshot — never guess or type a watch URL; always click an actual result so the video exists. To change to a different song, run a fresh search and click a result that isn't the one currently playing. Drive playback through the \`<video>\` element with \`browser_evaluate\` (\`document.querySelector('video').play()\` / \`.pause()\`), not the page's UI buttons.
-
-AUDIO & MEDIA — Use the dedicated tools, not Bash amixer/playerctl commands. \`audio_volume\` (action get/set/toggle_mute, level 0-100) for the SPEAKER loudness; \`mic_volume\` for the MIC sensitivity; \`media_control\` (play/pause/play_pause/next/previous/stop) for a running media player (browser YouTube, Spotify, mpv). "Turn it up/down", "mute", "make it louder", "volume to 50" → audio_volume; "mute the mic", "mic too quiet/loud" → mic_volume; "pause/skip/next song" → media_control.
-
-VERIFYING — Match the check to the task. A successful Edit/Write/Bash/browser call IS done — don't re-Read the file to double-check it. For an ACTION that changes page state (submit a form, click a flow), confirm the end state with ONE screenshot — "navigated to X" is not completion. For media playback, do NOT screenshot: set state with \`video.play()\`/\`video.pause()\` via browser_evaluate and a successful return IS completion (a loading video gives a misleading frame). For a READ-ONLY lookup, the extracted content is the verification — no screenshot. When code you write references something defined elsewhere (a fetch→route, a field), Grep that file once to confirm the contract exists; don't spin up browsers or servers just to check.
-
-SUDO — interactive: the USER types the password, never you. For a system package, run \`sudo pacman -S <pkg>\` ONCE, tell the user a password prompt is waiting, and wait — never pipe/echo a password, never retry a failed or timed-out sudo (faillock locks them out). One attempt; if it fails, report what's missing and continue the rest without it.
-
-SCHEDULING — never build your own (at, cron, systemd timers, sleep loops). If the task says "remind" or "schedule", do only the data-gathering and return the values; scheduling goes through the parent scheduler.
-
-MCP — install via \`install_mcp_server\`, one per call; check \`data/mcp-servers.json\` first and skip servers already present. Never rewrite that file with a heredoc/Write — it clobbers existing entries.
-
-DON'T REPEAT A FIX THAT FAILED — if the task says an earlier fix for this issue didn't work, don't re-apply it. Verify the earlier change is actually present (Read/Grep), trace the real data flow end-to-end (written→read→rendered), and fix the actual cause. State what was wrong with the previous attempt.
-
-FINISHING — you declare done, not a timer or tool cap (you have up to 100 rounds; don't quit early). End in one of three ways:
-- **DONE**: every deliverable the user asked for actually exists (file written, edit applied, command clean, expected state shown). Stop calling tools and write the final report — list exactly the files you changed, nothing more, and never claim a change unless its tool call succeeded this task. Generated files: write then \`attach_file\` so the user gets them.
-- **BLOCKED**: you genuinely can't proceed — missing capability, permission denied, or three distinct approaches all failed with concrete errors. State plainly what's blocking you; don't invent a result or write a vague "limitations" line.
-- **KEEP GOING**: take the single most useful next step. A failed tool call is feedback, not a verdict — read the error, adjust, retry; never repeat a successful call.
-
-PERSISTENCE — never call a task "impossible", "not supported", or "limited by the browser/tool" until you've tried at least three distinct approaches that all failed with concrete errors. "I can't control media playback" / "complex JavaScript" / "dynamic rendering" are excuses, not conclusions — pages are just DOM trees: snapshot them, find the element, interact. If one approach fails, try another (search-results URL, type+Enter, browser_eval click, keyboard shortcut). If you truly can't finish after three attempts, report what each returned and what the next would be.`,
+        summary: 'web, browser automation, shell, documents (PDF, DOCX, XLSX)',
+        // Dense nested JSON — atlas background jobs run on granite4.1:8b on
+        // this box, and granite reads structure, not prose. Same facts as the
+        // old # ROLE/# THE MACHINE/… sections, keyed (kernel rides inside).
+        systemPrompt: JSON.stringify({
+            role: 'Atlas. You execute. The task states what the user needs; the method is yours. Act on the first turn. When the task suggests an approach that fits your tools poorly, deliver the outcome your own way.',
+            tools: 'each tool description is its instructions — read it and pick by intent; a capability you do not see listed is one call away: `list_skills`, then `activate_skill`',
+            machine: {
+                live: 'a real person\'s live computer with their real accounts — look before you claim',
+                src: '/opt/Warden (capital W): src/ (host), container/agent-runner/ (agent), store/, data/, public/, eyes_ear/; dist/ is build output. Edit source, run `npm run build`, then `systemctl --user restart warden` to deploy',
+                user_files: '~/Warden — the user\'s own files, uploads and deliverables',
+                bash: 'persistent shared shell — `cd` holds across calls, so work from the right directory; absolute paths anywhere on the filesystem are available',
+                scheduling: 'the parent scheduler owns reminders and schedules — a task that says remind or schedule: gather the values and return them',
+            },
+            email: {
+                route: 'mail content belongs to the email specialist — say so and end the turn',
+                download: 'a file offered by a mail page is a download: save it and report the path',
+            },
+            verifying: {
+                tool_success: 'a successful Edit, Write, Bash or browser call is the proof',
+                page_state: 'a page state you changed: confirm the end state once',
+                user_watches: 'something the user watches or hears: the tool confirmation is the proof — no screenshot, no report',
+                lookup: 'the content you extracted is the verification',
+                code_contract: 'code referencing a route, field or export defined elsewhere: Grep that contract once',
+            },
+            kernel: JSON.parse(agentKernel('every deliverable the task asked for actually exists — the file written, the edit applied, the command clean, the expected state visible on screen. Generated files: write them, then `attach_file` so the user gets them.')),
+        }),
+        mcpServers: ['*'], // every MCP server the user has installed
         toolsets: ['atlas-core'],
     },
     {
         delegate: 'vulkan',
         label: 'Vulkan',
+        background: true,
+        routing: "code, scripts, builds, heavy bash; big-context work (many files, long docs, big logs) even when not code",
         maxIterations: 200,
-        summary: 'coding, scripting, building, and heavy bash work — editing source, running builds and tests, refactoring, and executing complex shell pipelines',
-        systemPrompt: `You are Vulkan, the coding agent. You receive a task and execute it with your tools. Act immediately — don't explain, plan, or ask questions. You are the engineering expert: the task tells you WHAT the user needs, the HOW is yours — if the task prescribes steps that don't fit the code or a better approach exists, deliver the outcome your own way.
+        summary: 'code, builds, tests, heavy bash, big-context work',
+        // Markdown prose, deliberately: vulkan is the CLOUD seat (see the
+        // VULKAN_MODEL notes and the vision-resolver comment below), not one of
+        // the local granite seats. The dense-nested-JSON style the other
+        // prompts use exists because granite reads structure rather than prose;
+        // that reason does not apply here, so this stays prose. The shared
+        // kernel still arrives as JSON — it is authored once for both seats.
+        systemPrompt: `# ROLE
+You are Vulkan. You write and change code. The task states what the user needs; the engineering is yours. Act on the first turn.
 
-WARDEN ITSELF — Warden's own source lives at \`/opt/warden\` (repo root): \`src/\` (host), \`container/agent-runner/\` (agent), \`dist/\` (built), \`store/\`, \`data/\`, \`public/\` (dashboard), \`security/\` (detector). Tasks about Warden itself look there, not in \`~/Downloads\`. Edit only \`src/\` or \`container/agent-runner/src/\` — \`dist/\` is built output, never edit it by hand. After a source change, run \`npm run build\` then \`systemctl --user restart warden\` to deploy.
+Your tools are source edits, builds and tests. Showing a result on screen is Warden's — report what you changed and let it be shown.
 
-CODE — Read or Grep before you change anything: understand the real data flow (written → read → rendered) end to end before editing. Edit with targeted old_string/new_string, never rewrite whole files; if an Edit misses, re-read the section and retry (never fall back to python/sed rewrites). Match the surrounding style — naming, indentation, comment density. Run the build and the tests to confirm a change; a successful Edit is not a working change. When your code references something defined elsewhere (a fetch→route, a field, an export), Grep that file once to confirm the contract exists before relying on it.
+# THE CODEBASE
+- Warden's source: \`/opt/Warden\` (capital W) — \`src/\` (host), \`container/agent-runner/src/\` (agent). \`dist/\` is built output.
+- After a source change: \`npm run build\`, then \`systemctl --user restart warden\`. A change ships when the build is clean.
+- The user's own projects and deliverables: \`~/Warden\`.
+- Bash is a persistent shared shell; \`cd\` holds across calls.
+- Your context window is large. Use it.
+- The conversation that led to this task is yours to read: call \`get_chat_history\` to see the recent chat, when the task references something said earlier or you need the original ask in full rather than the delegation summary.
 
-VERIFYING — Match the check to the task. A successful Edit/Write/Bash call IS applied — don't re-Read the file to double-check it. For a behavioral change, run the build and the relevant test (or a focused reproduction) and read its actual output; "it should work" is not verification. When you change a contract (a route, a function signature, a config shape), Grep for the old form and update every caller — don't leave the build broken.
+# CODE
+- Read or Grep first: follow the real data flow, written → read → rendered, end to end. The cause usually sits away from the symptom.
+- Edit with targeted old_string/new_string. On a miss, re-read that section and retry.
+- Match the surrounding style: naming, indentation, comment density.
+- Fix the defect class, not the single input that triggered it.
+- After changing a route, a signature or a config shape: Grep the old form and update every caller.
 
-SUDO — interactive: the USER types the password, never you. For a system package, run \`sudo pacman -S <pkg>\` ONCE, tell the user a password prompt is waiting, and wait — never pipe/echo a password, never retry a failed or timed-out sudo (faillock locks them out). One attempt; if it fails, report what's missing and continue the rest without it.
+# VERIFYING
+- A successful Edit or Write is applied.
+- A behavioral change is verified by running the build and the relevant test, or a focused reproduction, and reading the output.
 
-DON'T REPEAT A FIX THAT FAILED — if the task says an earlier fix for this issue didn't work, don't re-apply it. Verify the earlier change is actually present (Read/Grep), trace the real data flow, and fix the actual cause. State what was wrong with the previous attempt.
+# DELIVERABLES
+- Media deliverables (animation, video, image, designed asset) are produced with the installed media/design tools and skills — \`list_skills\` shows what is available.
+- Anything that becomes a file is built with the Write tool; Bash runs single-line commands.
 
-FINISHING — you declare done, not a timer or tool cap (you have up to 100 rounds; don't quit early). End in one of three ways:
-- **DONE**: the change is implemented, the build is clean, and the tests pass (or you ran a focused repro showing it works). Stop calling tools and write the final report — list exactly the files you changed and the commands you ran, nothing more, and never claim a change unless its tool call succeeded this task.
-- **BLOCKED**: you genuinely can't proceed — missing capability, permission denied, or three distinct approaches all failed with concrete errors. State plainly what's blocking you; don't invent a result.
-- **KEEP GOING**: take the single most useful next step. A failed tool call is feedback, not a verdict — read the error, adjust, retry; never repeat a successful call.
+# KERNEL
+The rules below are shared with Atlas and authored once (agentKernel), so they arrive as JSON inside this Markdown brief rather than being restated here — restating them is what lets the two seats drift apart. Read them as the same standing rules, in JSON form.
 
-PERSISTENCE — never call a task "impossible" or "not supported" until you've tried at least three distinct approaches that all failed with concrete errors. If one approach fails, try another (different file, different API, a workaround). If you truly can't finish after three attempts, report what each returned and what the next would be.`,
+${agentKernel('every deliverable exists on disk — the file written, the edit applied, the build clean, and the tests or a focused reproduction actually run and passing. Report the files you changed and the commands you ran.')}`,
+        mcpServers: ['*'], // every MCP server the user has installed
         toolsets: ['vulkan-core'],
     },
     {
         delegate: 'iris',
         label: 'Iris',
-        maxIterations: 100,
-        summary: 'email + digest compiler — read/send/compile email, and compile grounded hourly/daily/weekly digests from context handed to you in the task. Use for inbox tasks and the scheduled digest prompts.',
-        systemPrompt: `You are Iris, the personal information + digest agent: email and digests.
+        background: false,
+        routing: "email, calendar, reminders, alarms, scheduled tasks, digests — anything in the user's mail/calendar, attachments included; a website page (facebook, social media, forums, news) = the browser-driving tools; brief = one JSON object {intent, ...}, result comes back JSON {result, items}",
+        // Up to 3 tool calls per dispatch (was 1, 2026-09-15): iris is a
+        // fine-tuned 3b that held list→id→act flows only across separate
+        // orchestrator dispatches — the orchestrator had to re-delegate each
+        // step, and multi-step email work (get → download attachment) fell
+        // through to atlas scraping Gmail's DOM. The loop machinery below
+        // handles multi-iteration; the fine-tune needs 2-turn SFT rows to be
+        // fully on-distribution, so keep dispatches to 1-3 calls.
+        // (byte merged in 2026-09-05; core-only redesign 2026-09-09;
+        // 2026-09-09 collapse: 41 flat schemas → 4 merged action tools —
+        // alarm, task, calendar, email — one tool per noun, `action` selects
+        // the operation. Iris's fine-tune is trained on exactly these four
+        // schemas; projects/work-tasks stay OUT (2026-09-11: the merged
+        // `project` tool is orchestrator-direct instead — see toolsets.ts).
+        // No BOTH-tier/skill/MCP merges, terse structured prompt, no examples.)
+        // 2026-09-17 — prompt slimmed to identity + contract + tool/action map +
+        // time anchor + schedule_value formats. The behavioural RULES block
+        // (id-vs-list, reminder+calendar in one turn, ask back on a half
+        // request, actionable/non-actionable inbox marking, only-real-ids/
+        // addresses, the OUTPUT paragraph) is TRAINED IN via the toolcall-ft
+        // SFT dataset, not prompted: a 3b fine-tune follows its weights, and
+        // every prompted rule is context the fine-tune already carries. Telling
+        // iris HOW to behave is now the ORCHESTRATOR's job — the counterpart
+        // brief-writing rules live in the iris delegate description,
+        // so a bad iris run is a briefing defect, fixed there (or in the
+        // dataset), never by regrowing this prompt. The INPUT block is the one
+        // exception that must stay prompted: the dispatch is a LABELLED brief
+        // (local-time line, then `TASK:` + one imperative sentence with every
+        // id/address/value inline) because
+        // Granite reads structure better than prose, and a wire format can't be
+        // inferred from weights alone. Emitting it is the orchestrator's job
+        // (BRIEFING IRIS + the iris delegate tool's `task` description); the
+        // time line is prepended by the iris branch of executeXmlTool.
+        maxIterations: 3,
+        summary: 'email, calendar, contacts, todos, alarms, tasks, projects',
+        systemPrompt: `You are Iris: alarms, reminders, calendar, email.
 
-CAPABILITIES: Read, organize, and send email. Compile the scheduled digests (hourly / daily / weekly) from context provided in the task.
+CONTRACT: one request → up to 3 tool calls → one result line. Each call uses a fact an earlier call returned. Never repeat a call that succeeded.
 
-GUIDELINES:
-- Act as the domain expert: the task states WHAT; choose the HOW (calls and order) yourself.
-- Finding emails: search with read_emails; on an empty result, retry with shorter sender substrings, subject keywords, or common typos before stopping.
-- Saving or organizing email: call get_email for each match to fetch the full body, then Write each body to a file under the target folder — one file per email, named \`<date>_<from>_<subject>.md\` (sanitized); create the folder if absent.
-- Report tool results verbatim, including no-results and errors, and stop there rather than continuing without data.
-- Keep real email addresses, names, dates, and quoted content — everything runs on-device, so no redaction.
-- Accounts: default to the first enabled account; name the sending account in any send confirmation. State plainly when no account is configured.
+TOOLS — one tool per noun; 'action' selects the operation.
+- alarm: create (label + alarm_time HH:MM; alarm_date, repeat_type none/daily/weekdays/custom, repeat_days), list, update (alarm_id + fields), delete (alarm_id)
+- task: schedule (prompt + schedule_type + schedule_value), list, update (task_id + fields), pause, resume, cancel (task_id)
+- calendar: create (title + start_time), list (start/end range), update (event_id + fields), delete (event_id)
+- email: read (since/before for a date range), get (email_id), download (email_id + filename), send (to, subject, body), refresh, cached
 
-DIGESTS: a digest task arrives with INPUT (above) — current time, user bio/habits, calendar events, active work tasks, and weather, from the local DB. CRITICAL: compile the digest ONLY from INPUT and read_emails output. NEVER invent meetings, tasks, emails, projects, proposals, or events not explicitly in those sources. If a section is empty, say so plainly — a blank section is better than a fabricated one. You may call read_emails for recent inbox activity. Publish by calling post_summary with span ("hourly"/"daily"/"weekly") and text (your markdown) as your final action — post_summary is keyless and is the only way the digest reaches the dashboard.
+INPUT
+- Line 1 is the current local time — use it when a schedule time is relative.
+- BRIEF: one JSON object — {"intent": "read|send|download|schedule|list|create|update|delete", ...} — carrying every id, address, and value it needs inline.
 
-FORMAT: one plain-text confirmation — what you did, what you found, and any failures verbatim.`,
+schedule_value — compute the value from what THIS request asked for and the current local time on line 1; each type writes it in one fixed wire format:
+- once, relative: an ISO-8601 duration in the pattern PnYnMnDTnHnMnS — keep only the units the ask implies
+- once, absolute: the local date and time in the pattern YYYY-MM-DDTHH:MM:SS
+- interval: the gap between runs in milliseconds, digits only
+- recurring: a 5-field cron expression — minute hour day-of-month month day-of-week, space-separated, * meaning every
+
+OUTPUT
+- Exactly one JSON object, nothing outside it: {"result": "<the outcome in one line>", "items": ["<one string per list item>"]}.
+- Every line of a list is its own string in "items". The two characters backslash-n never appear in your output — real structure goes in "items", never an escaped newline.
+- Answer from the values the tools returned.`,
         toolsets: ['iris-core'],
         // IBM Granite tool-calling guidance: temperature 0 for reliable
-        // structured tool use (so Iris reliably calls post_summary rather than
-        // emitting the digest as free text and skipping the publish call).
+        // structured tool use (so Iris reliably calls the email/task/calendar/alarm
+        // tools rather than emitting free text and skipping the tool call).
         temperature: 0,
     },
     {
         delegate: 'artemis',
         label: 'Artemis',
+        background: true,
+        routing: "audit, second opinion, why-a-job-failed diagnosis — reads logs and DBs instead of guessing",
         maxIterations: 200,
-        summary: "a second-opinion audit of the current conversation — reads what the user asked and what the assistant actually said/did, then flags mistakes, wrong assumptions, and oversights. It can read and search files, query Warden's SQLite databases, and inspect the service logs to verify claims, but never changes anything. Runs in the background: calling it returns a job id immediately and the audit arrives in your inbox when it finishes. Call when the user wants a review or sanity-check, or before finalizing something important",
-        systemPrompt: `You are Artemis, a critical reviewer inside Warden. You are handed a transcript of a conversation between the user and the AI assistant (Warden). Your job is to audit it: read what the user actually asked and what the assistant said and did, and find mistakes, errors, and oversights. Your tools are for INSPECTION ONLY — Read (open a file), Grep (search file contents), Glob (find files), get_chat_history, and Bash for read-only inspection of system state. Use them to verify claims by inspecting the files, messages, databases, and logs referenced in the conversation. You audit — you never modify, send, or browse the web.
-
-BASH — READ-ONLY INSPECTION ONLY:
-- SQLite: the live Warden database is /opt/warden/store/messages.db (WAL mode — open it read-only: \`sqlite3 "file:/opt/warden/store/messages.db?mode=ro" "SELECT ..."\`). It holds chats, messages, registered_groups, sessions, scheduled_tasks, task_run_logs, user_work_tasks, dashboard_users, email_accounts, and more — use .tables and .schema <table> to explore. The .db files under data/ are empty stubs; store/messages.db is the real one.
-- Logs: the Warden service appends stdout to /opt/warden/logs/warden.log and stderr to /opt/warden/logs/warden.error.log — tail/grep these to see what the system actually did and when.
-- Allowed: SELECT queries, .tables/.schema, tail, grep, cat, ls, date. NEVER: INSERT/UPDATE/DELETE/DROP or any write pragma, file writes or shell redirection, sending anything, installing anything, or long-running/interactive commands.
-
-Look for:
-- Factual or logical errors in the assistant's replies.
-- Places the assistant misread the user, or answered a different question than the one asked.
-- Oversights: things the user needs that were missed, unstated assumptions, edge cases, risks, or clearly better approaches that weren't considered.
-- Claims the assistant made that aren't actually supported by what happened in the conversation.
-
-Output, in this order:
-- Start with one line: \`What was asked: <the user's actual request, in your own words>\`.
-- Then a concise audit. If you find issues, list them most-important-first. For each: name the specific message or claim, give one line on why it's wrong or risky, and a concrete correction.
-- If the exchange is sound, say so in one or two sentences and note anything worth double-checking.
-Be direct and specific — reference the exact point you're critiquing. Do not flatter, do not restate the whole conversation, do not pad. Your notes are saved automatically, so write them as a standalone record.`,
-        toolsets: [],
+        summary: "read-only audit: logs, DBs, the conversation — flags mistakes",
+        // Dense nested JSON — artemis runs on a local granite seat; granite
+        // reads structure, not prose. Same facts as the old # sections, keyed.
+        // artemis-flag: its tools come from ARTEMIS_TOOL_DEFS below; listing the
+        // toolset here puts flag_training_error in SUBAGENT_OWNED, keeping it
+        // out of the orchestrator's own pool.
+        systemPrompt: JSON.stringify({
+            role: 'Artemis, the critical reviewer inside Warden. You receive a transcript of the user and the assistant. Audit it: what the user asked, what the assistant said and did, and where it went wrong.',
+            tools: {
+                set: 'Read, Grep, Glob, get_chat_history, Bash — read-only inspection; flag_training_error — your one write',
+                use: 'check claims against the real files, messages, databases and logs the conversation refers to',
+                invariant: 'auditing is the whole job; the system stays as you found it, apart from the training flags you add',
+            },
+            training_errors: {
+                what: 'a fine-tunable failure: the model chose badly while the tool worked — wrong tool, wrong arguments, narrated instead of calling, call written as text, wrong answer shape, dead end, refusal, invented facts',
+                action: 'each one you confirm in the logs: one flag_training_error call with the verbatim log lines; the training loop writes the corrective examples from your flags',
+                code_defects: 'a missing tool, a tool returning the wrong thing, a wrong path or setting: list these in your findings with the proving log line',
+            },
+            log_mining: {
+                when: 'asked to mine the logs for failures, or turn them into training data',
+                first: 'Read `data/skills/log-mining/SKILL.md` and follow it',
+                writes: 'your findings, plus one flag_training_error per fine-tunable failure',
+            },
+            evidence: {
+                db: '/opt/Warden/store/messages.db, read-only — sqlite3 "file:/opt/Warden/store/messages.db?mode=ro" "SELECT ..."; holds chats, messages, projects, user_work_tasks, scheduled_tasks, task_run_logs, email_accounts and more; run .tables first, then .schema <table>; this file is the live one — the .db files under data/ are empty stubs',
+                logs: '/opt/Warden/logs/warden.log (stdout), /opt/Warden/logs/warden.error.log (stderr) — tail and grep for what the system did and when',
+                bash_vocab: 'SELECT queries, .tables, .schema, tail, grep, cat, ls, date',
+            },
+            find: [
+                'factual or logical errors in the assistant replies',
+                'places it misread the user, or answered a different question',
+                'oversights: what the user needed and did not get, unstated assumptions, edge cases, risks, better approaches available at the time',
+                'claims the conversation does not support',
+            ],
+            format: {
+                line1: 'What was asked: <the user request, in your own words>',
+                then: 'the audit, most important first — each item names the specific message or claim, one line on why it is wrong or risky, and the concrete correction',
+                sound: 'a sound exchange gets one or two sentences saying so, plus anything worth double-checking',
+                note: 'reference the exact point you are critiquing; your notes are saved automatically — write them as a standalone record',
+            },
+        }),
+        toolsets: ['artemis-flag'],
     },
     {
-        delegate: 'oculus',
-        label: 'Oculus',
-        maxIterations: 4,
-        summary: "single background situational-awareness agent: SILENTLY logs each AWARENESS event to awareness_log, captures+logs watch-out-for matches to uploads, and answers orchestrator queries about the room/logs at a given time. Never proactively messages or alerts.",
-        systemPrompt: `You are Oculus, Warden's background situational-AWARENESS agent. You are SILENT. You never message the user, never raise an alert, never arm/disarm anything. You only record and, on demand, report.
-
-You receive one structured JSON AWARENESS event from the camera detector. Your ONLY job is to LOG it. Apply the user rules in eyes_ears/oculus.md.
-
-Event fields in the task:
-- event: arrival | departure | movement | motion_burst | camera_covered | camera_uncovered | camera_moved | note
-- situation.person_count, situation.labels, situation.room_occupied
-- situation.seconds_empty, situation.seconds_occupied, situation.motion_area
-- situation.camera_covered, situation.camera_moved
-- is_known (bool) and label (string) from InsightFace face recognition, when a face is visible
-- ts (timestamp)
-
-A latest frame reference is provided in your task when the user's eyes are OPEN (e.g. "Latest security frame: [Image: attachments/img-....jpg]"). When eyes are CLOSED, no frame is provided and you log the text event only.
-
-ON EVERY AWARENESS EVENT — your one action is:
-1. awareness_log({"action":"record", "ts":..., "event":..., "label":..., "is_known":..., "assessment":"logged"}) — record the event. If a latest security frame IS provided in your task (eyes open), look at it and add a one-line "description" of what you see to the record. If no frame is provided (eyes closed), record the text event with no description. That is the whole job. Then stop. Do NOT call send_message (you do not have it). Do NOT output plain text. Use tools only.
-
-WATCH-OUT-FOR MATCH — the task may include a "Watch out for" list (situations the user defined). If the current event clearly matches one of those situations:
-1. awareness_log({"action":"record", "assessment":"flagged", "watch_out_for":"<the matched situation>", ...}) — record that it matched.
-2. oculus_capture({}) — save the latest frame to the uploads area so the user can review it later. (The frame was already fetched for you.)
-Then stop. Still SILENT — do not message the user about the match; the photo in uploads + the log entry is the record.
-
-If the model you are running on is vision-capable, you may call security_frame once to load the live frame and verify what you see before logging. Otherwise rely on the structured payload.
-
-If the user asks to register a person as known (e.g. "this is dominic, remember him"), call save_known_person({"label":"dominic"}).
-
-Do NOT output plain-text summaries. Only call tools, then stop.
-
-STATUS QUERY MODE — the orchestrator asks you a direct question such as "who's in the room", "what's happening", or "what did the logs show around <time>" by passing a task that starts with [ORCHESTRATOR_QUERY]. This is DIFFERENT from an AWARENESS event. In this mode:
-- Do NOT message the user. You do not have send_message.
-- Use awareness_status for the CURRENT room state, and security_frame (once) to look at the live screen if the question is about what is on screen now.
-- Use awareness_log({"action":"query", ...}) and security_log to read TEXT LOGS — query by the time window the user asked about.
-- Decide the CURRENT room state and return a concise report as your final plain-text output.
-- Start with NOTHING_NOTEWORTHY if the room is currently empty and there is no person present, no recent motion/arrival/departure, and the camera is normal.
-- Start with NOTEWORTHY if a person is currently present, an unknown person is detected, there is recent motion, or the camera is covered/moved.
-- If the user asked about a specific time, report what the logs show for that window.
-- Then add one sentence of detail. Do not greet or alert the user.`,
-        toolsets: ['awareness-core', 'security-core'],
+        // Sentry was reborn 2026-09-08 — this is the software-security scanner.
+        // Spawned by the host (hourly peek / daily deep scheduled tasks, fired
+        // like iris-digest rows) and delegatable on demand ("scan the pc").
+        delegate: 'sentry',
+        label: 'Sentry',
+        background: true,
+        routing: "security scans: ports, connections, services, autostart, crontabs",
+        maxIterations: 30,
+        summary: "security scan: ports, services, autostart, persistence",
+        // Dense nested JSON — sentry runs on a local granite seat at
+        // temperature 0; granite reads structure, not prose.
+        systemPrompt: JSON.stringify({
+            role: "Sentry, Warden's desktop security agent. You run inside the user's account with user-level permissions — that is always enough; sudo, installs, and file writes are outside your job.",
+            // Ports come from the same env the rest of the runner reads, so a
+            // changed port cannot leave Sentry flagging Warden's own dashboard
+            // as a finding. Parsed without `new URL`, which throws on a
+            // malformed value — this string is built at module load, where a
+            // throw would take the whole runner down over a cosmetic detail.
+            known_good: `you scan the machine Warden itself lives on; Warden and its parts are normal here: the Warden host (node) with its dashboard on port ${process.env.STATUS_PORT || '3200'}, the agent-runner (node), the voice app (port ${process.env.VOICE_CONTROL_PORT || '8767'}), the MARM memory server (port ${process.env.MARM_PORT || '8001'}), and Ollama (port ${(process.env.OLLAMA_URL || '').match(/:(\d+)/)?.[1] || '11434'})`,
+            tools: {
+                bash: 'running commands',
+                sentry_report: 'once, at the end — its schema describes everything it accepts',
+            },
+            scope: {
+                peek: 'network and running services',
+                deep: 'adds persistence and startup paths: autostart entries, user crontab, enabled user units, shell rc files, and a process audit',
+            },
+            method: {
+                you: 'the analyst — judge what you see against a normal Linux desktop',
+                investigate: 'a non-standard port, an unknown process, an outbound connection you cannot place: investigate it, Bash and your iterations exist for this',
+                owner: 'ps -p PID, systemctl status UNIT, ls -l /proc/PID/exe',
+                package: 'pacman -Qo PATH',
+                ports: 'a port matching a vendor registration (TeamViewer 5938/5939, Steam 27036, KDE Connect 1716) names the process you expect to find — confirm it by owner and package before you treat the port as explained; the registration is the hypothesis, the owner check is the evidence',
+                root_sockets: 'root-owned sockets read as "unknown" at user level — resolve them through the service list',
+            },
+            report: {
+                content: 'what stays unexplained after you checked, saying what you checked and what it turned out to be; something you resolved is understood, whatever it looked like at first; each genuine finding as "what — why"; an empty suspicious list means the machine is clean',
+                submit: 'one sentry_report; it returns the host verdict, and that returned verdict is your final answer, stated as it came back',
+                format: 'one or two sentences; for a scheduled scan the host posts findings itself; for a seat delegation your verdict text is the report it relays — give each finding its own line there',
+            },
+        }),
+        toolsets: ['sentry-core'],
+        temperature: 0,
     },
 ];
 
@@ -858,22 +1219,127 @@ function getSubAgentToolNames(subagent: SubAgentDef): string[] {
     return resolveMultipleToolsets(subagent.toolsets);
 }
 
+/** The orchestrator's `# THE CREW` block, generated from SUBAGENTS. Prose
+ *  rosters go stale the moment a seat is added, renamed or re-scoped; this
+ *  cannot. Council is appended by hand because it is not a SubAgentDef. */
+// ─── The seat's system prompt ───────────────────────────────────────────────
+// THE single source of truth for who this seat is. Rewritten 2026-09-26 back
+// to the first-officer voice (the framing the orchatlas rows were trained
+// against originally): prose carries WHO the seat is and HOW it talks —
+// granite and qwen both went literal-minded under all-JSON rule walls — and
+// the nested JSON block below carries only the FIXED facts (paths, formats,
+// procedures that never change turn to turn). If this text changes, the SFT
+// copy (training/orchatlas-parts/_sys.txt) must be regenerated before the
+// next train: a fine-tune conditions on the prompt it saw.
+//
+// `# THE CREW` is deliberately absent: crewBlock() generates the roster from
+// SUBAGENTS, so a hand-written one would both duplicate it and go stale the
+// moment a seat is added or re-scoped.
+const ORCH_SYSTEM = `You are Warden, the assistant that runs on this machine. The user talks to you in chat; you answer plainly, act on their machine yourself when the ask needs it, and hand what you don't own to the specialists below. Talk like a normal person: short, plain sentences, the answer carried in the words themselves. Most messages are ordinary conversation and deserve an ordinary answer. When the user names a shape — one word, a single line, a list — that shape is the whole reply. The user would rather hear a straight "couldn't do it, here's why" than a hopeful guess — and a repeated question gets answered again, identically kindly.
+
+Decide on the first turn: when the ask needs an action, pick the tool and call it; when it is a greeting, small talk, or a question the conversation already answers, reply in plain text with no tool call. A multi-step ask is yours end to end: state the chain once, take the steps one after another, report when it lands. The tool result is the truth: report outcomes from results, not intentions. When something fails, try a genuinely different way; after three real failures, say what blocked you.
+
+{"fixed": {
+ "machine": {
+  "host": "Arch + KDE + Wayland; the browser is the user's signed-in Chrome",
+  "src": "/opt/Warden — src/ (host), container/agent-runner/ (agent); dist/ is build output",
+  "user_files": "~/Warden — the user's files, uploads, deliverables"
+ },
+ "sudo": "the user types the password: run the install once, say a prompt is waiting, end the turn",
+ "jobs": {
+  "before": "list_running_agents — a running job that owns the outcome keeps it",
+  "steer": "nudge_agent steers a job; stop_agent stops a stuck one",
+  "after": "read_job_result; report_task_failure records a proven failure, then re-delegate once with the gap named"
+ },
+ "skills": {
+  "find": "list_skills",
+  "load": "activate_skill — this turn",
+  "mcp": "install_mcp_server → tools arrive NEXT turn, say so; uninstall_mcp_server removes",
+  "package": "create_skill"
+ },
+ "report": "outcome first, 1-2 plain sentences unless the user named a shape; work the user can already see or hear: say so only when it fails"
+}}`;
+// The prompt going IN is dense nested JSON (granite's preferred shape; every
+// token is re-ingested every prompt, so keys carry the structure). The reply
+// going OUT stays markdown. Descends from the _sys.txt variant that tested
+// best on the 8b — positive rules, no rumination tails.
+
+function crewBlock(): string {
+    // JSON members ("seat": "routing") — the orchestrator prompt is dense
+    // nested JSON (granite's preferred shape), so the roster must be too.
+    const lines = SUBAGENTS
+        // Atlas is this seat, not a crew member it can hand work to.
+        .filter(s => s.routing && s.delegate !== 'atlas')
+        .map(s => `  ${JSON.stringify(s.delegate)}: ${JSON.stringify(s.routing + (s.background ? ' (background — job id, result lands in inbox)' : ''))}`);
+    lines.push(`  ${JSON.stringify('council')}: ${JSON.stringify('3 seats deliberate in parallel — costly, hard-to-reverse calls only')}`);
+    return lines.join(',\n');
+}
+
+/** `# DEFAULT APPS` — GENERATED from DEFAULT_APPS + the live skill layer, the
+ *  same source applyDefaultApps uses, so the prose can never claim a provider
+ *  the tool list contradicts (the prompt-vs-tools drift rule). Omitted when no
+ *  default is set, or when the chosen server has no tools connected — there
+ *  applyDefaultApps keeps the built-in and the section must not say otherwise. */
+function defaultsSection(): string {
+    if (!skillState) return '';
+    // JSON members, same shape as the orchestrator prompt around it.
+    const entries: string[] = [];
+    for (const cap of Object.keys(CAPABILITY_BUILTINS)) {
+        const server = providerFor(cap);
+        if (!server) continue;
+        const prefix = `mcp__${server}__`;
+        const connected = skillState.skills.some(s => s.source === 'mcp'
+            && s.tools.some(t => String(t?.function?.name || '').startsWith(prefix)));
+        if (!connected) continue;
+        entries.push(`${JSON.stringify(cap)}: ${JSON.stringify(cap === 'browser'
+            ? { provider: server, does: 'reading and acting on any website page (facebook, social media, forums, news): navigate there, read it, act on it' }
+            : `${server} MCP tools`)}`);
+        if (cap === 'browser') {
+            entries.push(`${JSON.stringify('media')}: ${JSON.stringify({ tool: 'youtube', does: 'music/video: play, pause, resume, skip, seek, now playing; a stop ask = pause', rule: 'one call, its result is the answer' })}`);
+        }
+    }
+    if (entries.length === 0) return '';
+    return `\n\n{"default_apps":{"note":"these providers were chosen in Settings — always use them for their capability",${entries.join(',')}}}\n`;
+}
+
 const SUBAGENT_OWNED = new Set<string>(SUBAGENTS.flatMap(s => getSubAgentToolNames(s)));
+// Atlas's full tool set (browser, web, files, shell, youtube, …). Atlas IS the
+// orchestrator seat, so these are the orchestrator's own hands — not a
+// specialist's to delegate to. Static: atlas's toolsets never change.
+const ATLAS_OWNED = new Set<string>(getSubAgentToolNames(SUBAGENTS.find(s => s.delegate === 'atlas')!));
 const SUBAGENT_BY_DELEGATE = new Map<string, SubAgentDef>(SUBAGENTS.map(s => [s.delegate, s]));
 
 const ORCHESTRATOR_SHARED_TOOLS = new Set<string>([
     'convert_file', 'api_request', 'list_api_keys',
-    // The orchestrator's EYES — also listed in Oculus's security toolset, so
-    // without this the SUBAGENT_OWNED filter would strip them from the
-    // orchestrator's tool defs and the # EYES instructions couldn't fire.
-    'desktop_screenshot', 'webcam_capture', 'read_image',
+    // Atlas's lesser ONE-SHOT tools, shared with the orchestrator (2026-09-12):
+    // the orchestrator's model is as capable as atlas's, so a single-call
+    // action (run a status command, read a file, open a local file,
+    // pause/skip media, volume) should not spawn a whole sub-agent job.
+    // 2026-09-18: the WEB half of that sharing is GONE — WebSearch/WebFetch
+    // and the whole browser toolset are atlas's alone again. The orchestrator
+    // is a routing seat on a mid-size local model now, and web work is where
+    // it loses the plot: it drove a tab atlas already owned (two actors, one
+    // page, 2026-09-18 10:41), and every browser/web schema it carries is
+    // prompt weight on turns that never touch the web. One-shot local action
+    // stays; anything that touches the internet delegates.
+    'Bash', 'Read', 'open_app',
+    'audio_volume', 'mic_volume', 'media_control',
+    // Vision capture is NOT here any more (2026-09-18). This seat runs a
+    // visionless local model, so a capture it cannot read was never an answer:
+    // it captured, then guessed. Capture belongs to vulkan (the cloud seat that
+    // can actually see) via the `capture` toolset, and an image question from
+    // here goes through the vision explainer, which now resolves to vulkan's
+    // model instead of falling back to this seat's blind one.
 ]);
 
 // Artemis: read-only auditor tools (Bash included for read-only inspection:
-// sqlite3 queries against the store DB, reading service logs — never writes)
+// sqlite3 queries against the store DB, reading service logs) plus its one
+// write, flag_training_error. The Council seats get the read-only set only.
+const AUDIT_READ_TOOL_NAMES = ['Read', 'Grep', 'Glob', 'Bash', 'get_chat_history'];
 const ARTEMIS_TOOL_DEFS = stripTier(
-    registry.getDefinitions(['Read', 'Grep', 'Glob', 'Bash', 'get_chat_history']),
+    registry.getDefinitions([...AUDIT_READ_TOOL_NAMES, 'flag_training_error']),
 );
+const COUNCIL_TOOL_DEFS = stripTier(registry.getDefinitions(AUDIT_READ_TOOL_NAMES));
 
 // The Council: three Artemis instances reason in parallel on the same question
 // from three different angles, then iterate until they agree. Uses Artemis's
@@ -1027,12 +1493,16 @@ const COUNCIL_TOOL_DEF = {
     type: 'function',
     function: {
         name: 'council',
-        description: 'Convene The Council — three Artemis instances (Skeptic, Pragmatist, Synthesist) deliberate in parallel on the same question from three different angles. Each round, all three answers are shared and each seat re-evaluates independently. The loop repeats until all three agree on a single answer (or max_rounds is hit). Use for high-stakes questions where you want a council consensus rather than a single answer. Slower than a single delegate call — expect 1-3 minutes.',
+        // Descriptions ride through stripTier, which clamps anything over 200
+        // chars to its first line — the tail (when to use it, the timing cost)
+        // was being cut mid-sentence. Dense JSON under the cap; the detail that
+        // does not fit lives in the param descriptions, which are NOT clamped.
+        description: JSON.stringify({ what: 'three Artemis seats deliberate in parallel, re-reading each other each round, until they converge', use_when: 'high-stakes question wanting consensus over one opinion', cost: '1-3 min' }),
         parameters: {
             type: 'object',
             properties: {
-                task: { type: 'string', description: 'The question for The Council to deliberate on. Self-contained — no chat history available to the seats.' },
-                max_rounds: { type: 'number', description: 'Maximum deliberation rounds. Default 4, capped at 15. Each round spawns 3 parallel Artemis calls; seats argue, disagree, present new points, and work toward one answer all three can endorse.' },
+                task: { type: 'string', description: 'The question for The Council to deliberate on. Self-contained — the seats get no chat history. Three seats answer it from different angles: Skeptic, Pragmatist, Synthesist.' },
+                max_rounds: { type: 'number', description: 'Maximum deliberation rounds. Default 4, capped at 15. Each round spawns 3 parallel Artemis calls; seats argue, disagree, present new points, and work toward one answer all three can endorse. The loop ends early once all three agree.' },
             },
             required: ['task'],
         },
@@ -1043,7 +1513,7 @@ const COUNCIL_STATUS_TOOL_DEF = {
     type: 'function',
     function: {
         name: 'council_status',
-        description: 'Peek at what The Council is doing right now. Returns the deliberation status (round in progress, elapsed time) and each seat\'s answer from the completed rounds, or the outcome if it already finished. Use when the user asks how the council is doing, what it is thinking, or whether it is done. Read-only — does not interrupt the deliberation.',
+        description: JSON.stringify({ what: 'progress of the running Council: round, elapsed, each seat answer so far, or the outcome', use_when: 'asked how it is doing or whether it is done', effect: 'read-only, never interrupts' }),
         parameters: { type: 'object', properties: {}, required: [] },
     },
 };
@@ -1053,14 +1523,16 @@ const BOTH_TOOL_DEFS = stripTier(registry.getDefinitions(
     registry.getByTier('both').map(t => t.name)
 ));
 
-// Each sub-agent's actual tool defs: its toolsets' tools + shared 'both' tools,
-// EXCEPT for Oculus, which gets only its explicit toolsets to prevent
-// fabric/MCP/web noise from derailing its narrow background job.
+// Each sub-agent's actual tool defs: its toolsets' tools + shared 'both' tools.
+// Iris is exempt (2026-09-09): the toolcall-ft fine-tune was trained on
+// EXACTLY the iris-core 41 tools (tool_schemas.json) — extra tools in the
+// schema (Read etc.) are off-distribution and it grabs them instead of the
+// trained pick ("check emails" → Read(".mail") bug).
 const SUBAGENT_TOOL_DEFS = new Map<string, any[]>(
     SUBAGENTS.map(s => [
         s.delegate,
         stripTier(
-            s.delegate === 'oculus'
+            (s.delegate === 'sentry' || s.delegate === 'iris')
                 ? registry.getDefinitions(getSubAgentToolNames(s))
                 : [
                     ...registry.getDefinitions(getSubAgentToolNames(s)),
@@ -1069,24 +1541,47 @@ const SUBAGENT_TOOL_DEFS = new Map<string, any[]>(
         ),
     ])
 );
-
 // Delegate tool def handed to the main model in place of a sub-agent's raw tools.
 function delegateToolDef(s: SubAgentDef) {
-    // Atlas, artemis, and oculus run async by default: the call returns a job
-    // id immediately and the result lands in the orchestrator's inbox. Blocking
+    // Atlas, artemis, vulkan, and sentry run async by default: the call returns a
+    // job id immediately and the result lands in the orchestrator's inbox. Blocking
     // mode remains for quick lookups the orchestrator cannot proceed without
     // mid-turn.
-    if (s.delegate === 'atlas' || s.delegate === 'vulkan' || s.delegate === 'artemis' || s.delegate === 'oculus') {
+    if (s.delegate === 'atlas' || s.delegate === 'vulkan' || s.delegate === 'artemis' || s.delegate === 'sentry') {
         return {
             type: 'function',
             function: {
                 name: s.delegate,
-                description: `Delegate to ${s.label} for ${s.summary}. ${s.label} ALWAYS runs in the background. You get a job id back immediately and the full result arrives in your inbox when it finishes — keep working or end your turn in the meantime. Set urgent:true when the result should interrupt whatever you are doing at the time. NEVER use mode:"blocking".`,
+                description: JSON.stringify({ delegate: s.label, does: s.summary, mode: 'background', returns: 'job id; result → inbox', urgent: 'true = interrupt on arrival' }),
                 parameters: {
                     type: 'object',
                     properties: {
-                        task: { type: 'string', description: 'What the USER wants done: the goal plus only the facts the agent cannot guess (file paths, URLs, names, dates, IDs, the exact outcome). Intent only — never steps, never where to look, never how to code, never tool names or order.' },
-                        urgent: { type: 'boolean', description: 'Inject the result into your context immediately when it finishes, even mid-task (default false).' },
+                        task: { type: 'string', description: '{"what":"the user goal","include":"only facts the agent cannot guess: paths, urls, names, dates, ids, the exact outcome","omit":"steps, where to look, tool names, order"}' },
+                        urgent: { type: 'boolean', description: '{"what":"true = the result interrupts you on arrival","default":false}' },
+                    },
+                    required: ['task'],
+                },
+            },
+        };
+    }
+    // Iris takes a LABELLED brief, not prose: the toolcall-ft fine-tune is
+    // trained on a `TASK:` + imperative-sentence input shape (Granite reads
+    // structure better than a prose sentence), so its `task` description
+    // overrides the plain-language one every other delegate gets — atlas,
+    // vulkan, artemis and sentry keep prose briefs.
+    if (s.delegate === 'iris') {
+        return {
+            type: 'function',
+            function: {
+                name: s.delegate,
+                description: JSON.stringify({ delegate: s.label, does: s.summary, web: 'a website page = browser-driving tools', brief: 'one JSON object in, one JSON result back' }),
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        task: {
+                            type: 'string',
+                            description: '{"what":"one JSON object, nothing else","keys":"intent (read|send|download|schedule|list|create|update|delete) + every id, address, filename, date, value inline","pick_by_user_ask":{"user_names_an_email":{"intent":"read","email_id":"<the id the user named>"},"user_gives_no_id_check_or_recent":{"intent":"read"},"user_wants_a_download":{"intent":"download","email_id":"<id>","filename":"<name>"}},"id_source":"every id key — email_id, alarm_id, task_id, event_id — carries a value one of iris earlier list/read results returned for that same noun, quoted exactly as it came back; hold no id for the noun and the brief omits the key, so the intent is the matching list/read and the id arrives from its result","rule":"no id = read/list every connected source, recent first","note":"no preamble, no time — the runner prepends local time"}',
+                        },
                     },
                     required: ['task'],
                 },
@@ -1097,22 +1592,20 @@ function delegateToolDef(s: SubAgentDef) {
         type: 'function',
         function: {
             name: s.delegate,
-            description: `Delegate to ${s.label} for ${s.summary}. You do NOT have these tools directly — call this with a clear plain-language goal and you will receive a short text summary of the result.`,
+            description: JSON.stringify({ delegate: s.label, does: s.summary, brief: 'plain-language goal', returns: 'a short text summary of the result' }),
             parameters: {
                 type: 'object',
-                properties: { task: { type: 'string', description: 'What the USER wants done: the goal plus only the facts the agent cannot guess (names, dates, amounts, IDs). Intent only — never steps, where to look, how to do it, or tool names.' } },
+                properties: { task: { type: 'string', description: '{"what":"the user goal","include":"only facts the agent cannot guess: names, dates, amounts, ids, the exact outcome","omit":"steps, tool names, order"}' } },
                 required: ['task'],
             },
         },
     };
 }
 
-// The model the orchestrator is running on — set by runNativeOllama. A sub-agent may
-// share it (e.g. orchestrator=gemma4:latest, byte=granite); unloading a
-// shared model mid-turn crashes the orchestrator's next call (Ollama 500).
-let ORCHESTRATOR_MODEL = '';
-// Atlas model — from its own dashboard dropdown (input.model). No hardcoded
-// fallback: when unset the agent errors (the host seeds it on first boot).
+// Atlas model — the SEAT's model, from its dashboard dropdown (input.model).
+// No hardcoded fallback: when unset the agent errors (the host seeds it on
+// first boot). A sub-agent may share it; unloading a shared model mid-turn
+// crashes the seat's next call (Ollama 500).
 let ATLAS_MODEL = '';
 // Vulkan (coding specialist) model — from its own dashboard dropdown
 // (input.vulkanModel). No hardcoded fallback: when unset the agent errors
@@ -1121,10 +1614,28 @@ let VULKAN_MODEL = '';
 // Per-agent models for the tool callers + artemis. Each is a concrete value
 // selected from the Agents-panel dropdown (no blank, no `||` fallback). Empty →
 // the agent errors out rather than silently running on the wrong model.
-let BYTE_MODEL = '';
-let DEXTER_MODEL = '';
 let IRIS_MODEL = '';
 let ARTEMIS_MODEL = '';
+// Sentry (software-security scanner) model — same per-agent pattern: a concrete
+// dashboard-selected value, no fallback, empty errors inside runSubAgent.
+let SENTRY_MODEL = '';
+// Sentry is DISABLED (2026-09-28): the toolcall fine-tune has zero sentry
+// examples in its SFT data, so it fabricates the scan inventory instead of
+// running Bash — invented sockets or nothing, and ~12% of runs an unbounded
+// fabrication loop that hits the num_predict cap and dies as "produced no
+// output". The host gates its scheduled scans (SENTRY_SCANS_ENABLED in
+// src/index.ts); this gates the orchestrator's delegate paths. Re-enable both
+// after sentry examples are trained into the SFT set.
+const SENTRY_ENABLED = false;
+// The vision explainer — the model that answers image questions for visionless
+// seats (askVisionModel / the query_image tool). It used to fall back to the
+// atlas/orchestrator seat, which on this box is granite4.1:8b: a visionless
+// model being asked to read an image. That fallback is why capture "worked"
+// and the answer was always guesswork. Vulkan is the cloud seat, so it is the
+// one that can actually see; the orchestrator seat is the last resort only
+// because something is better than refusing outright. Resolved lazily per
+// call, so dashboard model changes apply immediately.
+setVisionModelResolver(() => (process.env.VISION_MODEL || VULKAN_MODEL || ATLAS_MODEL || '').trim());
 // Driving force — the orchestrator's selected preamble preset id
 // (data/driving-forces/<id>.md). Empty = built-in default preamble.
 // CONTEXT_CLEAR_AT is a timestamp from the host; when it changes, the
@@ -1138,6 +1649,18 @@ let lastContextClearAt = '';
 let COUNCIL_MODEL_SKEPTIC = '';
 let COUNCIL_MODEL_PRAGMATIST = '';
 let COUNCIL_MODEL_SYNTHESIST = '';
+// Supervisor model override — from the dashboard Supervisor dropdown. Empty =
+// the completion verdict (runCompletionVerdict) inherits the orchestrator
+// model. Set to a small cloud or local model (e.g. granite4.1:3b) so the
+// verdict call runs cheaply and never churns VRAM or ties up the main model.
+// The verdict call is tool-less and context-free, so a small model is enough.
+// No ctx row: cloud/small models use their native context window.
+let SUPERVISOR_MODEL = '';
+// Supervisor on/off — the dashboard "Supervisor" row toggle. Off means the
+// completion verdict (the only supervision left after the periodic watchdog
+// tick was removed 2026-09-17) does not run. There is no cadence setting any
+// more: nothing ticks, so an interval had nothing to pace.
+let SUPERVISOR_ENABLED = true;
 // Live state of the most recent Council deliberation. The background council
 // loop is the only writer; the council_status tool handler only reads, so the
 // orchestrator can peek at an in-flight deliberation without touching it.
@@ -1162,12 +1685,39 @@ interface BackgroundJob {
     agent: string;
     task: string;
     shortId: string;
+    urgent: boolean;
     toolCallCount: number;
     lastAction: string;
     lastActionAt: number;
-    abortFlag: { aborted: boolean };
+    abortFlag: { aborted: boolean; nudges: string[] };
     status: 'running' | 'done' | 'errored' | 'aborted';
     activityLog: { t: number; tool: string; args: string; result?: string }[];
+    // When the orchestrator last steered this job with nudge_agent. A nudge
+    // never kills; it steers. (Kept after the LLM supervisor was removed
+    // 2026-09-17 — the orchestrator is the only nudger now.)
+    watchdogNudgedAt: number;
+    // Orchestrator steering count. supervisorNudges counts how many steering
+    // messages the orchestrator has delivered to this job — informational
+    // only, so the orchestrator can see
+    // how many times it has nudged when deciding whether to stop_agent. There is
+    // no code ceiling: the orchestrator decides when to stop, and may nudge
+    // indefinitely until it does. The 3h wall-clock is the only code-enforced stop.
+    supervisorNudges: number;
+    // Follow-up dispatches that named the same file(s) while this job was
+    // running. Queued, not spawned — two writer jobs on one file clobber each
+    // other. Drained on completion: a follow-up runs only after this job
+    // finishes (any terminal status — the file is freed either way).
+    pendingFollowups: { delegate: string; task: string; urgent: boolean }[];
+    // Capped live streaming transcript for the Oversight window: recent
+    // thinking/content text and the last few tool calls. Optional — only
+    // assigned on streaming background jobs; readers default to ''.
+    streamThinking?: string;
+    streamContent?: string;
+    streamTools?: { name: string; args: string; t: number }[];
+    // ms timestamp of the last streamed chunk — lets Oversight say "streaming"
+    // (writing/thinking right now) instead of a growing "idle Ns" that read as
+    // a stall during a long zero-tool-call generation.
+    streamAt?: number;
 }
 const backgroundJobs = new Map<string, BackgroundJob>();
 // Emit a live verbose-status line summarizing the background jobs currently
@@ -1176,85 +1726,1007 @@ const backgroundJobs = new Map<string, BackgroundJob>();
 // progress) and on job start. Without this, the orchestrator's turn ends right
 // after it delegates, the host clears liveStatus, and the dashboard reads
 // "idle" — even though the job is still working in the background.
+// Structured per-job snapshot for the dashboard's oversight window — one row
+// per running job with the fields it needs directly (no label parsing).
+function currentJobsList() {
+    const now = Date.now();
+    return [...backgroundJobs.values()].filter(j => j.status === 'running').map(j => ({
+        id: `${j.agent}-${j.shortId}`,
+        agent: j.agent,
+        task: (j.task || '').slice(0, 140),
+        calls: j.toolCallCount,
+        lastAction: (j.lastAction || '').slice(0, 120),
+        elapsed: Math.round((now - j.startedAt) / 1000),
+        idle: Math.round((now - j.lastActionAt) / 1000),
+        // Live output scrollby for the Oversight window — tail of the most
+        // recent streamed thinking/content (capped on the job record; sliced
+        // again here to keep the status line lean). streamAt lets the UI tell
+        // "actively generating" from a genuine stall.
+        streamThinking: (j.streamThinking || '').slice(-400),
+        streamContent: (j.streamContent || '').slice(-400),
+        streamAt: j.streamAt || 0,
+    }));
+}
+// The dashboard's Oversight window replaces its job list ONLY when a status
+// entry carries `jobsList`. If the last job finishes without anyone emitting a
+// zero-count entry, the finished job's row (and the "N job(s)" counter) stays
+// on the dashboard forever — false "still running" reporting. Track the last
+// emitted running-count so the transition to zero emits exactly one clearing
+// update here, instead of relying on every completion path to remember (the
+// artemis path forgot once; a stale `artemis-…` row sat on the dashboard).
+let lastEmittedRunningJobs = 0;
 function emitJobsStatus() {
     const running = [...backgroundJobs.values()].filter(j => j.status === 'running');
-    if (running.length === 0) return;
+    if (running.length === 0) {
+        if (lastEmittedRunningJobs > 0) {
+            lastEmittedRunningJobs = 0;
+            writeStatus({ phase: 'idle', label: 'all background jobs complete', jobs: 0, jobsList: [], ts: Date.now() });
+        }
+        return;
+    }
+    lastEmittedRunningJobs = running.length;
     const head = running[0];
     const elapsed = Math.round((Date.now() - head.startedAt) / 1000);
     const sinceLast = Math.round((Date.now() - head.lastActionAt) / 1000);
     const label = running.length === 1
         ? `${head.agent}-${head.shortId}: ${head.lastAction} — ${head.toolCallCount} call(s), ${elapsed}s elapsed (last action ${sinceLast}s ago)`
         : `${running.length} jobs running — ${head.agent}-${head.shortId}: ${head.lastAction} (+${running.length - 1} more)`;
-    writeStatus({ phase: head.agent, label, jobs: running.length, ts: Date.now() });
+    writeStatus({ phase: head.agent, label, jobs: running.length, jobsList: currentJobsList(), ts: Date.now() });
 }
 
-// ─── Direct Atlas passthrough ───────────────────────────────────────────
-// When the user asks to talk to Atlas directly, the orchestrator calls the
-// `atlas_direct` tool. That sets `atlasDirect.active` and the orchestrator's
-// turn ends. From then on, the idle loop routes the user's messages straight
-// to Atlas (a plain chat turn — Atlas asks questions, refines the task) until
-// the user exits ("back to Warden") or says go ("go"/"start"), at which point
-// Atlas is kicked off as a normal background job with the refined task and
-// the user is dropped back to normal orchestrator chat.
-let atlasDirect: { active: boolean; messages: { role: string; content: string }[] } | null = null;
+// ─── Running-jobs roster (survives a hard-kill) ────────────────────────────
+// A "stop" hard-kill SIGKILLs this runner, which drops the in-memory
+// backgroundJobs map AND the inbox together — the orchestrator's next turn then
+// sees "no jobs running" next to its own earlier "atlas-XXXX is posting" and
+// concludes the delegation "didn't stick", re-dispatching the same task as a
+// duplicate loop. Persist the running-jobs roster to disk on every start/stop;
+// on the next process start, rehydrate any job that never reached a terminal
+// status into the inbox as "interrupted — result lost" so the orchestrator
+// treats it as stopped, never as never-run.
+const JOBS_ROSTER_PATH = '/tmp/warden-jobs.json';
+
+function persistJobRoster(): void {
+    try {
+        const running = [...backgroundJobs.values()]
+            .filter((j) => j.status === 'running')
+            .map((j) => ({ jobId: `${j.agent}-${j.shortId}`, agent: j.agent, task: j.task, startedAt: j.startedAt, urgent: j.urgent }));
+        fs.writeFileSync(JOBS_ROSTER_PATH, JSON.stringify(running), 'utf-8');
+    } catch { /* best-effort — never crash the runner over the roster */ }
+}
+
+function rehydrateOrphanedJobs(): void {
+    try {
+        const raw = fs.readFileSync(JOBS_ROSTER_PATH, 'utf-8');
+        const jobs = JSON.parse(raw);
+        fs.unlinkSync(JOBS_ROSTER_PATH);
+        if (!Array.isArray(jobs) || jobs.length === 0) return;
+        for (const j of jobs) {
+            if (!j || !j.jobId || !j.task) continue;
+            inbox.push({
+                jobId: j.jobId,
+                agent: j.agent || 'atlas',
+                task: j.task,
+                fullResult: `${j.agent || 'atlas'} was interrupted by a runner restart while working on this task — its result was lost. It was NOT a failed attempt: do not re-dispatch the identical task as if it never ran. Tell the user the previous attempt was interrupted and ask whether to retry.`,
+                status: 'aborted',
+                urgent: false,
+            });
+        }
+        log(`[jobs-roster] rehydrated ${jobs.length} orphaned job(s) from a prior runner (interrupted, results lost)`);
+    } catch { /* no roster or malformed — nothing to reconcile */ }
+}
+
+// ─── Confirmed-failure retry ledger ─────────────────────────────────────
+// The hard cap behind the CONFIRM step in the inbox digest: a task that
+// already ran gets exactly ONE model-initiated automatic retry — a third
+// spontaneous dispatch of the same task is refused outright, so a failure can
+// never become a re-dispatch loop. The ledger is consulted ONLY on spontaneous
+// turns (inbox digest); user-driven turns always dispatch, so
+// the user saying "try it again" can never be blocked by it. In-memory: the
+// ledger shares the runner's lifetime, like the inbox.
+// (Turn-provenance flag lives here at module scope so retryGate can read it;
+// it is reset at the top of each idle-loop pass and set when a digest turn
+// is composed.)
+let turnWasInboxDigest = false;
+// True for the NEXT turn when the drained IPC message is an autonomous
+// background turn (the BotNet sweep). Its prompt + output are rolled back out
+// of the seat's live `messages` when the turn ends, so the sweep's "work
+// quietly … QUIET" instructions never leak into a normal chat turn.
+let sideTurnPending = false;
+// The genuine user ask, captured from real user input only (initial prompt +
+// each IPC-winning nextInput), tag-stripped. Fed to runCompletionVerdict so
+// its verdict judges against the real request — never against an injected
+// [Inbox] digest or urgent push.
+let lastUserAsk = '';
+
+/** The seat's CURRENT ask, parsed out of the host's turn prompt. The new
+ *  asks are the <message> lines inside the trailing <messages> block
+ *  (router.ts formatMessages); everything before it is re-injected context
+ *  (mercury blocks, chat history) and must NOT reach the ask. A plain
+ *  tag-strip regex on the whole prompt pairs orphan closing tags across
+ *  block boundaries and eats the ask entirely — lastUserAsk came out as
+ *  the literal string "</messages>", the playback leash refused every
+ *  song request, and the lazy browser dial never fired (2026-09-21). */
+function extractAsk(prompt: unknown): string {
+    const raw = String(prompt || '');
+    // Last <messages> block = this turn's new asks. History/mercury lines
+    // use <message> too, but only inside their own wrapper tags, which this
+    // match never enters.
+    const blocks = [...raw.matchAll(/<messages[^>]*>([\s\S]*?)<\/messages>/g)];
+    const block = blocks.length > 0 ? blocks[blocks.length - 1][1] : raw;
+    const lines = [...block.matchAll(/<message\b[^>]*>([\s\S]*?)<\/message>/g)].map(m => m[1]);
+    // Un-escape the XML entities router.ts escaped, then strip any residue.
+    const text = (lines.length > 0 ? lines.join('\n') : block)
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return text.slice(0, 400);
+}
+interface RetryLedgerEntry { failCount: number; lastAt: number; goal: string[]; }
+const retryLedger = new Map<string, RetryLedgerEntry>();
+function taskSig(task: string): string {
+    return task.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+// Goal identity that survives prose drift. The orchestrator re-words a retry
+// every time it obeys "name the gap" (observed 2026-08-24: "Rebuild the Baben
+// Sushi website from scratch…" → "…in a NEW folder ~/Warden/baben-sushi-v2
+// (create it first…" → "Create a complete, self-contained index.html for the
+// Baben Sushi restaurant site…"), and the old 80-char-prefix sig made the one-
+// retry rail inert against exactly the loop it exists to stop. A goal is a bag
+// of salient tokens (paths split into their parts, filler dropped); two tasks
+// are the same goal when they share >= 4 salient tokens covering at least half
+// of the smaller bag. Tasks too short for 4 salient tokens ("do it") can never
+// match, so the rail stays inert where it has nothing to key on.
+const GOAL_STOPWORDS = new Set(['the','a','an','to','in','on','of','for','and','or','with','it','its','is','are','was','were','at','that','this','these','those','you','your','i','me','my','we','our','they','them','their','there','here','what','which','who','how','why','when','up','out','about','after','before','same','again','once','only','all','any','each','some','one','two','do','does','did','done','be','been','being','as','so','if','now','have','has','had','can','could','should','would','will','just','also','please','make','makes','made','sure','from','into','by','onto','per','via','not','no','yes','then','than','but','over','under','more','most','less','least','other','others','first','second','next','last','new','old','own','let','lets','get','got','want','wants','need','needs','use','using','dont',"don't"]);
+function goalSig(task: string): Set<string> {
+    const toks = task.toLowerCase()
+        .replace(/["'`()[\]{}<>]/g, ' ')
+        .split(/[\s,;:!?/\\~_.-]+/)
+        .filter(t => t.length > 2 && !GOAL_STOPWORDS.has(t));
+    return new Set(toks);
+}
+function sameGoal(a: Set<string>, b: Set<string>): boolean {
+    if (a.size === 0 || b.size === 0) return false;
+    const shared = [...a].filter(t => b.has(t)).length;
+    return shared >= 4 && shared >= 0.5 * Math.min(a.size, b.size);
+}
+// Read-only form: is this goal's one automatic retry already consumed?
+// Used by the dedup target-overlap queue (a queued follow-up spawns later via
+// drainFollowups, which bypasses retryGate — so the gate must be able to
+// refuse the queue itself, without consuming a credit as a side effect).
+function goalRetryExhausted(task: string): boolean {
+    const goal = goalSig(task);
+    return [...retryLedger.values()].some(e => e.failCount >= 1 && sameGoal(goal, new Set(e.goal)));
+}
+// Check + (on allowance) consume the single retry credit for a spontaneous
+// re-dispatch. Returns null when the delegation may proceed, otherwise the
+// refusal text — which the caller returns as the tool result; no job spawns.
+// Only a FAILED precursor engages the rail: successful jobs in the inbox for
+// a similar goal are legitimate chained phases (rule 7), not retries.
+// Marks a verdict that was never actually formed — the second-reader pass was
+// skipped (supervisor Off, or no model configured), so the job was not judged
+// at all. 'unverifiable' alone cannot carry this: it is also the honest answer
+// when the judge DID look and could not tell from text (a song that started
+// playing), and that case must keep blocking re-dispatch.
+const VERDICT_NOT_JUDGED = 'not-judged';
+
+function retryGate(task: string): string | null {
+    const goal = goalSig(task);
+    if (!turnWasInboxDigest) {
+        // User turn: fresh user intent outranks the rail for the first two
+        // dispatches of a goal. The third identical dispatch is the churn
+        // signature (2026-09-26: the orchestrator re-delegated the same saga
+        // task on user turns until the user typed "stop calling vulkan we
+        // are done that task"). Aborted jobs don't count — the user stopped
+        // those on purpose and a deliberate re-ask must stay possible.
+        const prior = inbox.all().filter(i => i.status !== 'aborted' && sameGoal(goal, goalSig(String(i.task || ''))));
+        if (prior.length >= 2) {
+            log(`[retry-ledger] blocked dispatch #${prior.length + 1} of the same goal on a user turn: ${taskSig(task)}`);
+            return `STOP — this goal has already been dispatched ${prior.length} times (${prior.map(p => p.jobId).join(', ')} in your inbox) and it is not producing a new result. Do not dispatch it again. Tell the user in plain sentences what was tried, what happened, and what you would need to succeed.`;
+        }
+        return null;
+    }
+    const creditUsed = goalRetryExhausted(task);
+    const failedBefore = inbox.all().some(i => i.verdict === 'failed' && sameGoal(goal, goalSig(String(i.task || ''))));
+    // A digest turn is report-back only: a goal whose result already landed as
+    // CONFIRMED or UNVERIFIABLE must never be re-dispatched — that was the
+    // "play a song → re-delegate → new job → new digest → re-delegate" loop
+    // (2026-09-18). Re-delegating an already-good result is never a legitimate
+    // chain next-step (chains move to a materially different goal).
+    // An UNVERIFIABLE that was never judged (supervisor Off) is not evidence the
+    // goal is done — counting it meant that with the supervisor off, every
+    // finished job sealed its goal and a legitimate chained next-step on a
+    // similarly-worded task was refused on a digest turn.
+    const judged = (i: { verdict?: string; verdictReason?: string }) =>
+        i.verdict === 'confirmed'
+        || (i.verdict === 'unverifiable' && !String(i.verdictReason || '').startsWith(VERDICT_NOT_JUDGED));
+    const alreadyDone = inbox.all().some(i => judged(i) && sameGoal(goal, goalSig(String(i.task || ''))));
+    if (alreadyDone && !failedBefore && !creditUsed) {
+        log(`[retry-ledger] blocked re-delegation of an already-completed goal: ${taskSig(task)}`);
+        return `STOP — this task already ran and its result is in your inbox above. Do not dispatch it again. Report that result to the user, or stay silent if it is media already playing.`;
+    }
+    if (!failedBefore && !creditUsed) return null; // first dispatch of this goal
+    if (creditUsed) {
+        log(`[retry-ledger] blocked re-delegation of reworded retry: ${taskSig(task)}`);
+        return `STOP — this goal already ran and its one automatic retry has been used (the earlier attempts are in your inbox). Do not dispatch it again, and do not re-word it to slip past this rail — re-wording is exactly what this rail watches for. If the deliverable is still missing, tell the user in plain sentences what was tried, what happened, and what you would need to succeed.`;
+    }
+    retryLedger.set(taskSig(task), { failCount: 1, lastAt: Date.now(), goal: [...goal] });
+    log(`[retry-ledger] consuming the one automatic retry for goal: ${[...goal].slice(0, 12).join(' ')}`);
+    return null;
+}
+// Advisory record of a confirmed failure (via report_task_failure): the hard
+// cap lives in retryGate; this keeps the failure visible in the journal and
+// steers the model's one allowed retry. Matches on goal (not exact text) so a
+// re-worded report still lands on the goal's ledger entry.
+function recordConfirmedFailure(task: string, reason: string): void {
+    const goal = goalSig(task);
+    const key = [...retryLedger.entries()].find(([, e]) => sameGoal(new Set(e.goal), goal))?.[0] ?? taskSig(task);
+    const entry = retryLedger.get(key) ?? { failCount: 0, lastAt: 0, goal: [...goal] };
+    entry.lastAt = Date.now();
+    retryLedger.set(key, entry);
+    log(`[retry-ledger] confirmed failure reported for goal: ${[...goal].slice(0, 12).join(' ')} — ${reason.slice(0, 160)}`);
+}
+// ─── In-flight duplicate-dispatch gate ─────────────────────────────────────
+// The orchestrator can dispatch a background job for a task while an
+// identical one is already running — that spawned near-identical atlas/vulkan
+// jobs that raced one file and false-reported success. `dupSig` is a longer
+// key than `taskSig` (200 vs 80 chars) so it catches near-identical
+// paraphrases of the same long preamble. The backstop lives inside
+// spawnBackgroundJob so every dispatch source — orchestrator tool calls and
+// the atlas-direct "go" spawn — hits one guard. The handler-layer notice
+// (findDuplicateRunningJob) tells the model the job is already running
+// without consuming a retry credit.
+function dupSig(task: string): string {
+    return task.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+function findDuplicateRunningJob(agent: string, task: string): BackgroundJob | null {
+    const sig = dupSig(task);
+    for (const job of backgroundJobs.values()) {
+        if (job.status === 'running' && job.agent === agent && dupSig(job.task) === sig) return job;
+    }
+    return null;
+}
+// ─── Same-file concurrency gate ────────────────────────────────────────────
+// dupSig above is blind to WHAT FILE a task edits: "redesign week2.html" and
+// "edit week2.html to fold in the council fixes" hash completely differently,
+// so the orchestrator can launch a second writer job onto a file a running job
+// is already editing, and the two race. This gate matches on the file targets
+// instead of the task TEXT. A follow-up that names the same file(s) as a
+// running writer job is queued on that job and spawns when it finishes.
+const WRITER_AGENTS = new Set(['atlas', 'vulkan']);
+
+// Extract file targets from a free-text task: absolute paths and bare
+// filenames-with-extension. (The bare regex also matches the tail of an
+// absolute path, so an absolute-path task yields both forms — a bare-named
+// follow-up still collides with it.)
+function extractFilePaths(task: string): Set<string> {
+    const paths = new Set<string>();
+    const abs  = task.match(/(?:\/[\w@.\-]+)+\.[A-Za-z0-9]+/g) || [];
+    const bare = task.match(/\b[\w.\-]+\.(?:html?|css|js|ts|tsx|json|md|py|txt|csv|xml|ya?ml|sh|svg|png|jpe?g)\b/gi) || [];
+    for (const p of abs)  paths.add(p);
+    for (const b of bare) paths.add(b.toLowerCase());
+    return paths;
+}
+
+// Cross-agent: any running WRITER job whose file targets intersect the new
+// task's targets. Same-file concurrent writes clobber regardless of agent, so
+// scan atlas AND vulkan, not just the dispatching agent.
+function findRunningJobTargetingSameFiles(task: string): BackgroundJob | null {
+    const want = extractFilePaths(task);
+    if (want.size === 0) return null;
+    for (const job of backgroundJobs.values()) {
+        if (job.status !== 'running' || !WRITER_AGENTS.has(job.agent)) continue;
+        const have = extractFilePaths(job.task);
+        for (const p of want) if (have.has(p)) return job;
+    }
+    return null;
+}
+
+// Ids of results already re-marked unread once after their digest turn errored
+// (read-safety) — a second errored digest must not re-queue them again, or an
+// erroring digest would loop forever. The drained-id list is module-level
+// because the drain happens at the END of one loop iteration while the digest
+// turn (and its error path) runs in the NEXT.
+const digestRequeuedOnce = new Set<string>();
+let drainedDigestJobIds: string[] = [];
+
+// Atlas is focused on desktop operation, web browsing, and opening things.
+// Instead of shipping all 55 candidate tools (atlas-core + both-tier + every
+// active skill incl. every connected MCP server), rank the pool against the
+// task and send only the always-needed desktop/web/opening/file tools PLUS the
+// task-relevant extras. Mirrors the orchestrator's rankTools path so a "read
+// this file" task drops the browser/media/MCP chrome, while a "play a song on
+// youtube" task pulls in browser_click/type + media_control.
+// The ONLY tools exempt from ranking: the discovery escape hatch. Ranking these
+// out is a trap with no way back — the model cannot ask for what it can no
+// longer see. Everything else competes on relevance, including Bash, Read and
+// the browser: a pinned default is a tool the ranker never got to judge, and a
+// floor of 21 against a top-K of 18 meant relevance decided almost nothing.
+// When the right tool does not surface, fix the ranking signal, not the floor.
+const ATLAS_ALWAYS_INCLUDED_TOOLS = new Set<string>([
+    'list_skills', 'activate_skill',
+]);
+const ATLAS_DYNAMIC_TOP_K = 12;
+
+function selectAtlasTools(allTools: any[], task: string): any[] {
+    try {
+        const keywords = extractKeywords([{ role: 'user', content: task }]);
+        const pinned = (n: string) => ATLAS_ALWAYS_INCLUDED_TOOLS.has(n) || isPinnedTool(n);
+        const coreDefs = allTools.filter((t: any) => pinned(t?.function?.name));
+        if (keywords.length === 0) {
+            log(`[atlas] dynamic tools: ${coreDefs.length} of ${allTools.length} selected (generic task — core only)`);
+            return coreDefs;
+        }
+        const restDefs = allTools.filter((t: any) => !pinned(t?.function?.name));
+        const rankedNames = new Set(rankTools(restDefs, keywords, ATLAS_DYNAMIC_TOP_K));
+        if (rankedNames.size === 0) {
+            log(`[atlas] dynamic tools: ${coreDefs.length} of ${allTools.length} selected (no ranked matches — core only)`);
+            return coreDefs;
+        }
+        const extras = restDefs.filter((t: any) => rankedNames.has(t?.function?.name));
+        log(`[atlas] dynamic tools: ${coreDefs.length + extras.length} of ${allTools.length} selected (always ${coreDefs.length} + ranked ${extras.length})`);
+        return [...coreDefs, ...extras];
+    } catch (err: any) {
+        log(`[atlas] dynamic tool selection failed (${err?.message || err}) — using full list`);
+        return allTools;
+    }
+}
+
+// Per-delegate concurrency cap: at most this many jobs of the SAME delegate
+// (e.g. 3 vulkans, 3 atlases) run at once. This is a resource/cost safety
+// control, distinct from the same-file backstop below (which prevents two
+// jobs racing one file, regardless of delegate count). Removing the old
+// one-atlas-at-a-time gate (this session) left concurrency fully uncapped —
+// this restores a ceiling without going back to serial-only.
+const MAX_CONCURRENT_PER_DELEGATE = 3;
+
+// What actually happened to a dispatch. Callers MUST distinguish these when
+// reporting back to the orchestrator: a queued dispatch returns the id of the
+// job it is waiting behind, not a new one, so reporting it as "started" tells
+// the orchestrator a job exists that doesn't — and it then treats that other
+// job's result as this dispatch's result. (Concretely: "post 5 reddit posts
+// and a linkedin post" fires 6 calls, 3 start and 3 queue behind job 1; if all
+// six read as "started" the orchestrator sees job 1's id four times and calls
+// the linkedin post done when it never ran.)
+type SpawnOutcome = { jobId: string; outcome: 'started' | 'duplicate' | 'queued-cap' | 'queued-file' };
+
+// Turn a dispatch outcome into what the orchestrator is told. Every branch must
+// be honest about whether a NEW job exists: on a queued outcome the id belongs
+// to the job being waited behind, so the text must not imply this dispatch has
+// its own running job, and must tell the orchestrator not to re-send it.
+function describeSpawn(label: string, sp: SpawnOutcome, urgent: boolean): string {
+    const u = urgent ? ' (urgent — its result will interrupt you when ready)' : '';
+    switch (sp.outcome) {
+        case 'started':
+            return `${label} ${sp.jobId.split('-').pop()} started${u} — running. Result arrives in your inbox. Reply: running, result on the way. End your turn.`;
+        case 'duplicate':
+            return `${label} is already running this exact task as ${sp.jobId} — its result will arrive in your inbox. Do not dispatch it again.`;
+        case 'queued-cap':
+            return `Accepted and QUEUED — ${MAX_CONCURRENT_PER_DELEGATE} ${label.toLowerCase()} jobs are already running, so this one starts automatically when a slot frees. It has no job id of its own yet; it is waiting behind ${sp.jobId}. Its result will arrive in your inbox like any other. Do not re-dispatch it, and do not treat ${sp.jobId}'s result as this task's result.`;
+        case 'queued-file':
+            return `Accepted and QUEUED — ${sp.jobId} is still working on the same file(s), so this one starts when that finishes. It has no job id of its own yet. Its result will arrive in your inbox. Do not re-dispatch it, and do not treat ${sp.jobId}'s result as this task's result.`;
+    }
+}
+
+// Spawn whatever was queued on a finished job. Both queueing paths land here:
+// the same-file backstop (a follow-up naming a file a running writer holds) and
+// the per-delegate concurrency cap above. Must be called on ANY terminal status
+// — the file/slot is freed either way, and an undrained queue is a silently
+// dropped dispatch nobody ever hears about again. Re-spawning through
+// spawnBackgroundJob re-applies both gates, so queued items cascade correctly.
+function drainJobFollowups(jobRecord: BackgroundJob, jobId: string, context: any): void {
+    if (jobRecord.pendingFollowups.length === 0) return;
+    const queued = jobRecord.pendingFollowups.splice(0);
+    for (const q of queued) {
+        // The drain path spawns directly and so bypasses the handler-layer
+        // gate — re-check the ledger here. Without this, every re-dispatch
+        // the orchestrator made while a job held the file queued up and
+        // auto-spawned gate-free one after another as each job finished
+        // (2026-09-26: the saga task burned six spawns exactly this way).
+        if (goalRetryExhausted(q.task)) {
+            log(`[dedup] dropped queued follow-up after ${jobId} (${q.delegate}): this goal already failed and its retry is used — ${taskSig(q.task)}`);
+            continue;
+        }
+        try {
+            const spawned = spawnBackgroundJob(q.delegate, q.task, context, q.urgent);
+            log(`[dedup] drained follow-up after ${jobId} finished (${q.delegate}): ${spawned.outcome} → ${spawned.jobId}`);
+        } catch (e: any) {
+            log(`[dedup] queued follow-up spawn failed after ${jobId}: ${e?.message ?? e}`);
+        }
+    }
+}
 
 // Spawn a background job for an async delegate (atlas or vulkan). Used by
 // the delegate tool handlers and by the "go" exit from direct Atlas
 // passthrough. Returns the job id.
-function spawnBackgroundJob(delegate: string, task: string, context: any, urgent: boolean): string {
+function spawnBackgroundJob(delegate: string, task: string, context: any, urgent: boolean): SpawnOutcome {
     const def = SUBAGENT_BY_DELEGATE.get(delegate)!;
-    const model = delegate === 'vulkan' ? VULKAN_MODEL : ATLAS_MODEL;
+    // Dedup backstop: if an identical task for the same agent is already
+    // running, refuse the duplicate and hand back the existing job id. This
+    // is the single guard every dispatch source passes through — orchestrator
+    // tool calls and the atlas-direct "go" spawn. A
+    // near-identical paraphrase of the same long preamble matches (200-char
+    // signature). If the new call is urgent and the running one isn't, promote
+    // it so the result interrupts when ready.
+    const dup = findDuplicateRunningJob(delegate, task);
+    if (dup) {
+        const existingId = `${dup.agent}-${dup.shortId}`;
+        const elapsed = Math.round((Date.now() - dup.startedAt) / 1000);
+        log(`[dedup] refusing duplicate dispatch of ${existingId} (${delegate}, already running ${elapsed}s)`);
+        if (urgent && !dup.urgent) { dup.urgent = true; log(`[dedup] promoted ${existingId} to urgent`); }
+        return { jobId: existingId, outcome: 'duplicate' };
+    }
+    // Concurrency cap: MAX_CONCURRENT_PER_DELEGATE jobs of this delegate
+    // already running — queue behind the oldest one rather than spawn a 4th.
+    // Reuses the same pendingFollowups/drainFollowups mechanism the same-file
+    // backstop below uses, so a queued job fires automatically the moment a
+    // slot frees up.
+    const sameDelegateRunning = [...backgroundJobs.values()].filter(j => j.agent === delegate && j.status === 'running');
+    if (sameDelegateRunning.length >= MAX_CONCURRENT_PER_DELEGATE) {
+        const oldest = sameDelegateRunning.reduce((a, b) => (a.startedAt <= b.startedAt ? a : b));
+        oldest.pendingFollowups.push({ delegate, task, urgent });
+        if (urgent && !oldest.urgent) oldest.urgent = true;
+        log(`[dedup] concurrency-cap: ${MAX_CONCURRENT_PER_DELEGATE} ${delegate} jobs already running — queued behind ${oldest.agent}-${oldest.shortId}; will spawn when it finishes.`);
+        return { jobId: `${oldest.agent}-${oldest.shortId}`, outcome: 'queued-cap' };
+    }
+    // Parallel atlas/vulkan jobs are allowed (cloud seats and local toolcall
+    // seats both run concurrent; same local model = one loaded copy, Ollama
+    // parallelism). The old one-atlas-at-a-time gate existed to stop two jobs
+    // racing the browser's single activePage global; that browser is gone
+    // (browser work goes through the default-app MCP provider), so the race
+    // is structurally gone. File races are still covered by
+    // the same-file backstop below and duplicate dispatches by the dedup above.
+    // Same-file backstop: a differently-worded task on the SAME file(s) as a
+    // running writer job would clobber it. Don't spawn now and don't disturb
+    // the running job — queue the follow-up on it and spawn when it finishes.
+    // This protects every dispatch source that hits spawnBackgroundJob
+    // directly (the atlas-direct "go" spawn), which bypasses the
+    // handler-layer notice below.
+    const overlap = findRunningJobTargetingSameFiles(task);
+    if (overlap) {
+        overlap.pendingFollowups.push({ delegate, task, urgent });
+        if (urgent && !overlap.urgent) { overlap.urgent = true; }
+        log(`[dedup] target-overlap: queued ${delegate} follow-up behind ${overlap.agent}-${overlap.shortId} (same file(s)); will spawn when it finishes.`);
+        return { jobId: `${overlap.agent}-${overlap.shortId}`, outcome: 'queued-file' };
+    }
+    const model = delegate === 'vulkan' ? VULKAN_MODEL : (delegate === 'sentry' ? SENTRY_MODEL : ATLAS_MODEL);
     const jobShortId = Math.random().toString(36).slice(2, 6);
     const jobId = `${delegate}-${jobShortId}`;
     let tools = SUBAGENT_TOOL_DEFS.get(delegate)!;
-    if (skillState && skillState.skills.length > 0) {
+    // Sentry stays isolated like its SUBAGENT_TOOL_DEFS build (no BOTH_TOOL_DEFS
+    // merge above): a security scanner takes no skill/MCP tools either.
+    // Iris stays isolated too (2026-09-09): trained on its exact 41 tools only.
+    if (delegate !== 'sentry' && delegate !== 'iris' && skillState && skillState.skills.length > 0) {
         const allSkillNames = new Set(skillState.skills.map((s: any) => s.name));
         const mcpTools = mergeActiveSkillTools(skillState.skills, allSkillNames) as any[];
         const existing = new Set(tools.map((t: any) => t.function?.name));
         tools = [...tools, ...mcpTools.filter((t: any) => !existing.has(t.function?.name))];
+        // Default apps are global — substitution on background jobs too.
+        tools = applyDefaultApps(tools, mcpTools);
+    }
+    // RAG-style dynamic tool selection for every seat EXCEPT iris: rank the
+    // full pool against the task and keep the always-needed core plus the
+    // task-relevant extras (see selectAtlasTools). A capability that does not
+    // survive the ranking is still one `list_skills` + `activate_skill` away,
+    // so nothing is lost — it just stops being paid for on every turn. This
+    // matters most now that atlas and vulkan carry every installed MCP server.
+    //
+    // Iris is EXEMPT and keeps its whole list: it runs the small fine-tuned
+    // toolcall model, which was trained on exactly that fixed set — ranking it
+    // would hand the model a different tool list on every turn, off the
+    // distribution it learned.
+    if (delegate !== 'iris') {
+        tools = selectAtlasTools(tools, task);
     }
     const activeCount = backgroundJobs.size;
-    writeStatus({ phase: delegate, label: `${def.label} ${jobShortId}: ${task}${activeCount > 0 ? ` (${activeCount} running)` : ''}`, jobs: activeCount + 1, ts: Date.now() });
-    const abortFlag = { aborted: false };
+    writeStatus({ phase: delegate, label: `${def.label} ${jobShortId}: ${task}${activeCount > 0 ? ` (${activeCount} running)` : ''}`, jobs: activeCount + 1, jobsList: currentJobsList(), ts: Date.now() });
+    const abortFlag: { aborted: boolean; nudges: string[] } = { aborted: false, nudges: [] };
     const jobRecord: BackgroundJob = {
         promise: null as any, startedAt: Date.now(), agent: delegate, task, shortId: jobShortId,
-        toolCallCount: 0, lastAction: 'starting', lastActionAt: Date.now(), abortFlag,
-        status: 'running', activityLog: [],
+        urgent, toolCallCount: 0, lastAction: 'starting', lastActionAt: Date.now(), abortFlag,
+        status: 'running', activityLog: [], watchdogNudgedAt: 0, supervisorNudges: 0,
+        pendingFollowups: [],
     };
+    // Spawn follow-ups that were queued on this job because they named the same
+    // file(s). They run serialized, after this job frees the file. Re-spawning
+    // through spawnBackgroundJob re-applies the same-file gate, so multiple
+    // queued follow-ups on one file cascade (the 2nd queues behind the 1st).
+    // Called on any terminal status — the file is freed either way.
+    const drainFollowups = () => drainJobFollowups(jobRecord, jobId, context);
+    // Deterministic churn sensing (restored from 2727c1e, count-based — never
+    // time-based): N consecutive research-class calls with no action call
+    // between them means the job is circling. Inject a commit nudge; NEVER
+    // abort — the orchestrator alone decides stops.
+    let churnStreak = 0;
+    let churnNudges = 0;
     const job = runSubAgent(delegate, model, def.systemPrompt, tools, task, context, def.maxIterations, abortFlag, (toolName, argsSummary, resultPreview) => {
         jobRecord.toolCallCount++;
         jobRecord.lastAction = `${toolName}(${argsSummary})`;
         jobRecord.lastActionAt = Date.now();
         jobRecord.activityLog.push({ t: Date.now(), tool: toolName, args: argsSummary, result: resultPreview });
         if (jobRecord.activityLog.length > 200) jobRecord.activityLog.shift();
+        // Research-class call → grow the streak; anything else (Write, Edit,
+        // browser_click/type, send, …) is action and resets it. Exempt agents
+        // whose job IS read-only; skip young jobs (warmup, CHURN_MIN_AGE_S).
+        if (!CHURN_EXEMPT_AGENTS.has(delegate) && (Date.now() - jobRecord.startedAt) > CHURN_MIN_AGE_S * 1000) {
+            if (RESEARCH_TOOLS.has(toolName)) {
+                churnStreak++;
+                const dueAt = churnNudges === 0
+                    ? CHURN_NUDGE_AFTER
+                    : CHURN_NUDGE_AFTER + CHURN_RENUDGE_EVERY * churnNudges;
+                if (churnStreak >= dueAt) {
+                    churnNudges++;
+                    abortFlag.nudges.push(`NUDGE: You have made ${churnStreak} consecutive read/inspection calls (latest: ${toolName}) with no action between them. You have enough information — act NOW: produce the deliverable (write the file, click, type, submit, send). If you are genuinely missing one piece of information, get it in a single call and then act immediately. Do not keep probing.`);
+                    log(`[churn] ${delegate} ${jobShortId}: ${churnStreak} consecutive research calls — injected commit nudge ${churnNudges} (no abort)`);
+                    writeStatus({ phase: delegate, label: `${def.label} ${jobShortId}: ${churnStreak} consecutive inspection calls — nudging to act`, ts: Date.now() });
+                }
+            } else {
+                churnStreak = 0;
+            }
+        }
         emitJobsStatus();
     }, def.temperature)
-        .then(saResult => {
+        .then(async saResult => {
             writeStatus({ phase: delegate, label: `${def.label} ${jobShortId} complete`, ts: Date.now() });
             if (jobRecord.status === 'running') jobRecord.status = 'done';
-            inbox.push({ jobId, agent: delegate, task, urgent, status: jobRecord.abortFlag.aborted ? 'aborted' : 'done', fullResult: saResult.content || `${def.label} completed the task (no text output).`, activityLog: jobRecord.activityLog });
+            const fullResult = saResult.content || `${def.label} completed the task (no text output).`;
+            // Completion verdict: an independent tool-less second reader judges
+            // the finished output against the original ask (see Step 5). It
+            // stamps the InboxItem, records a confirmed failure, and may dispatch
+            // a structural follow-up so multi-part requests chain even if the
+            // orchestrator ignores CHAIN.
+            const verdict = await runCompletionVerdict({ task, fullResult, activityLog: jobRecord.activityLog, toolContext: context, jobId });
+            inbox.push({ jobId, agent: delegate, task, urgent, status: jobRecord.abortFlag.aborted ? 'aborted' : 'done', fullResult, activityLog: jobRecord.activityLog, verdict: verdict.verdict, verdictReason: verdict.reason });
+            // Advisory only: the verdict stamps the inbox item (surfaced in the
+            // digest for the orchestrator/user to read) and logs. It does NOT
+            // auto-execute — no auto report_task_failure, no auto follow-up
+            // dispatch. A false FAILED verdict must not trigger a destructive
+            // re-delegate loop; the human-in-the-loop (the user sees the report)
+            // and the orchestrator decide from the stamped verdict.
+            drainFollowups();
         })
         .catch(err => {
             if (jobRecord.status === 'running') jobRecord.status = 'errored';
-            inbox.push({ jobId, agent: delegate, task, urgent, status: 'errored', fullResult: `Error: ${err?.message ?? err}` });
+            const errMsg = String(err?.message ?? err);
+            // Stamp the inbox item 'failed' and record it in the retry ledger.
+            // Without this an errored job carried no verdict, so retryGate's
+            // failedBefore check and goalRetryExhausted both read it as "first
+            // dispatch of this goal" forever — every re-dispatch was allowed
+            // (2026-09-26: the same saga task errored and re-spawned all day).
+            // A user-requested abort is exempt: the user stopped it on purpose,
+            // and a later deliberate re-ask must stay possible.
+            if (!jobRecord.abortFlag.aborted) {
+                recordConfirmedFailure(task, `job errored: ${errMsg}`);
+                inbox.push({ jobId, agent: delegate, task, urgent, status: 'errored', fullResult: `Error: ${errMsg}`, verdict: 'failed' });
+            } else {
+                inbox.push({ jobId, agent: delegate, task, urgent, status: 'errored', fullResult: `Error: ${errMsg}` });
+            }
+            drainFollowups();
         })
         .finally(() => {
             if (jobRecord.status === 'running') jobRecord.status = 'done';
             // Refresh the jobs indicator: shows remaining running jobs, or
-            // emits a 0-count status so the dashboard clears when the last job
-            // finishes (emitJobsStatus no-ops when nothing is running, so
-            // emit an explicit zero here).
-            const remaining = [...backgroundJobs.values()].filter(j => j.status === 'running').length;
-            writeStatus({ phase: remaining > 0 ? delegate : 'idle', label: remaining > 0 ? `${remaining} job(s) still running` : `${def.label} ${jobShortId} complete`, jobs: remaining, ts: Date.now() });
+            // emits the zero-count clearing line when this was the last job
+            // (emitJobsStatus handles the transition-to-zero itself).
+            emitJobsStatus();
+            persistJobRoster();
             setTimeout(() => { backgroundJobs.delete(jobId); }, 60000).unref?.();
         });
     jobRecord.promise = job;
     backgroundJobs.set(jobId, jobRecord);
     emitJobsStatus();
-    return jobId;
+    persistJobRoster();
+    return { jobId, outcome: 'started' };
 }
 
-// Models that ALWAYS reason internally and cannot reliably honor think:false.
+// ── Job supervision ──────────────────────────────────────────────────────
+// The periodic LLM watchdog was removed 2026-09-17 (it false-flagged healthy
+// read/idle phases; disabled 2026-08-29, deleted once the replacement landed).
+// What supervises a job now: the deterministic count-based churn detector in
+// spawnBackgroundJob, the narration-volume watchdog in the stream loop, and
+// runCompletionVerdict below (a tool-less second reader judging a FINISHED
+// job's output). The orchestrator is the only thing that steers or stops a
+// running job. See git history for the removed ticker.
+
+const VERDICT_KEEP_ALIVE_S = 60;        // keep the verdict model resident briefly between job completions (no VRAM pinning)
+
+// Churn sensing is a deterministic host-side call-count detector (restored
+// 2026-09-17 with the LLM supervisor's removal): N consecutive research-class
+// calls with no action between them injects a commit nudge. It only ever
+// NUDGES. The orchestrator decides what to do — nudge again, stop_agent, or
+// let it run — and may nudge indefinitely. Host code NEVER aborts on a count:
+// there is no persistence ceiling, no abortIgnoredJob, no auto-escalate. The
+// only code-enforced stop is the 3h wall-clock (WALL_CLOCK_MS), a last resort.
+// The decision to steer or stop is always the orchestrator's; code only ticks.
+const CHURN_EXEMPT_AGENTS = new Set(['artemis', 'sentry']); // read-only by design — never flag them for reading/probing
+
+// Write/edit tools whose `args` carry a file_path — used to render the OFF-TASK
+// label (writes landing outside the task's deliverable directory, e.g. throwaway
+// /tmp solver scripts while the real deliverable goes untouched). This only
+// feeds a prompt label; no host action keys off it.
+const WRITE_PATH_TOOLS = new Set(['Write', 'write_file', 'Edit', 'edit_file']);
+
+// Does a stored activityLog `result` preview look like a failure? The result
+// preview is the tool's truncated output (stdout/stderr for Bash, "Error: …"
+// on a thrown exception). Crashes are otherwise invisible to the supervisor —
+// the tick prompt historically rendered only `tool(args)`, never the result —
+// so a job that writes a script and crashes it every turn reads as "actively
+// working". Surfacing `→ ERROR` on the call line lets the supervisor judge.
+function looksLikeError(result?: string): boolean {
+    if (!result) return false;
+    return /^Error:/i.test(result)
+        || /Traceback \(most recent call last\)/.test(result)
+        || /\bAttributeError\b/.test(result)
+        || /\bSyntaxError\b/.test(result)
+        || /Command failed/i.test(result)
+        || /No such file or directory/.test(result)
+        || /exited with non-zero status/i.test(result);
+}
+
+// Format an activity-log entry's age (its `t` timestamp) as a short "Nm/Ns ago"
+// tag, shown on each recent-call line the supervisor sees. This gives the
+// supervisor TIMING: a slow read of one large file shows calls spread minutes
+// apart (progress), while a true loop shows the same call bunched within a few
+// seconds. Without it, paginated or verified re-reads of one file render as
+// identical `Read(...)` lines and look like a verbatim-repeat loop.
+function fmtCallAge(t: number, now: number): string {
+    const s = Math.max(0, Math.round((now - t) / 1000));
+    return s >= 60 ? `${Math.round(s / 60)}m ago` : `${s}s ago`;
+}
+
+// Compress a tool-call args string for the supervisor's recent-calls list.
+// A plain head-truncate (.slice(0,60)) is dangerous: when calls share a long
+// prefix (e.g. `cd /home/.../seasonal-boat-leasing && sed -n '40,150p' index.html`),
+// the head is eaten entirely by the path and the only differing part — the line
+// range or target — is cut off, so distinct calls render as identical and the
+// supervisor misreads a page-through as a verbatim-repeat loop. Keep both the
+// head (tool context) and the tail (where the distinguishing arg usually sits),
+// eliding only the middle.
+function shortArgs(args: string, max = 90): string {
+    const a = (args || '').replace(/\s+/g, ' ').trim();
+    if (a.length <= max) return a;
+    const head = Math.floor(max * 0.5);
+    const tail = max - head - 1;
+    return a.slice(0, head) + '…' + a.slice(a.length - tail);
+}
+
+// Pull a file_path out of a Write/Edit args JSON string (best-effort; the args
+// summary for those tools is the file path itself, but JSON.parse handles both
+// the summary and the raw shape).
+function filePathFromArgs(args: string): string | null {
+    try {
+        const a = JSON.parse(args);
+        return a?.file_path || a?.path || null;
+    } catch {
+        // The summary is often already just the path string.
+        const s = (args || '').trim();
+        return s && !s.startsWith('{') ? s : null;
+    }
+}
+
+// Ground-truth check for the completion verdict: walk the activity log, pull
+// every Write/Edit file_path, resolve it the same way the tool layer does
+// (against WORKSPACE_ROOT), and stat it on disk. The completion verifier used
+// to judge the *result text* only, so it false-failed jobs that wrote a real
+// file whenever the prose didn't explicitly say "I wrote X" — driving a
+// false-fail → re-delegate → one-atlas-gate murder cycle. Feeding the model
+// "file X exists, NNN bytes" lets it judge ground truth; the deterministic
+// override below is the backstop for when it still false-fails.
+interface WrittenFile { rel: string; exists: boolean; size: number; mtime: string | null; prevJobId?: string; unchanged?: boolean }
+
+// Cross-run change detection (2026-09-18, the "ask for a change and it loops
+// the same wrong thing verbatim" defect): a correction run that rewrites the
+// deliverable BYTE-IDENTICAL to the previous run made NO change, but "file
+// exists with content" reads as success all the way down — the verdict model,
+// the false-fail backstop, and the orchestrator's report-back all see a real
+// file. Keep a session-lifetime sha256 per resolved written path so the
+// verdict turn can state UNCHANGED as a hard fact, and so the backstop stops
+// rescuing a correction that didn't happen. Genuinely idempotent re-runs
+// (same file re-produced on purpose) still pass: UNCHANGED is a fact for the
+// judge, not an automatic fail.
+const writtenFileHistory = new Map<string, { hash: string; jobId: string }>();
+const WRITTEN_HASH_CAP_BYTES = 4 * 1024 * 1024;
+function verifyWrittenFiles(activityLog: { t: number; tool: string; args: string; result?: string }[], jobId: string): WrittenFile[] {
+    const seen = new Map<string, WrittenFile>();
+    for (const e of activityLog) {
+        if (!WRITE_PATH_TOOLS.has(e.tool)) continue;
+        const raw = filePathFromArgs(e.args);
+        if (!raw) continue;
+        let resolved: string;
+        try { resolved = resolveInsideWorkspace(raw); }
+        catch { continue; } // resolve never throws; keep the guard shape anyway
+        if (seen.has(resolved)) continue;
+        let size = 0, mtime: string | null = null, exists = false;
+        try {
+            const st = fs.statSync(resolved);
+            if (st.isFile()) { exists = true; size = st.size; mtime = new Date(st.mtimeMs).toISOString().replace('T', ' ').slice(0, 19); }
+        } catch { /* not on disk */ }
+        let prevJobId: string | undefined, unchanged: boolean | undefined;
+        if (exists && size > 0 && size <= WRITTEN_HASH_CAP_BYTES) {
+            try {
+                const hash = createHash('sha256').update(fs.readFileSync(resolved)).digest('hex');
+                const prev = writtenFileHistory.get(resolved);
+                if (prev) {
+                    prevJobId = prev.jobId;
+                    unchanged = prev.hash === hash;
+                }
+                writtenFileHistory.set(resolved, { hash, jobId });
+            } catch { /* unreadable — leave delta unknown */ }
+        } else if (exists) {
+            // Oversized file: record the job so future comparisons still work if
+            // it shrinks, but say nothing this run.
+            writtenFileHistory.set(resolved, { hash: '', jobId });
+        }
+        seen.set(resolved, { rel: raw, exists, size, mtime, prevJobId, unchanged });
+    }
+    return [...seen.values()];
+}
+
+// Heuristic: does a `failed` reason indicate the deliverable CONTENT is wrong
+// (a real failure we must respect) vs. the result TEXT not confirming a file
+// (the false-fail signature we override)? Keywords that signal a genuine
+// content problem → keep `failed`. Everything else with a file on disk is a
+// textual false-fail.
+const REAL_FAIL_KEYWORDS = /\b(empty|blank|0 bytes|placeholder|wrong|incorrect|broken|malformed|garbled|missing the (menu|content|images|sections)|does not include the (menu|requested))\b/i;
+
+function writtenFilesSummary(files: WrittenFile[]): string {
+    const present = files.filter(f => f.exists && f.size > 0);
+    const absent = files.filter(f => !f.exists || f.size === 0);
+    const lines: string[] = [];
+    if (present.length) lines.push(...present.map(f => {
+        let line = `- ${f.rel}: EXISTS on disk, ${f.size} bytes (modified ${f.mtime})`;
+        if (f.unchanged === true) line += ` — UNCHANGED from job ${f.prevJobId} (byte-identical: this run made NO change to it)`;
+        else if (f.unchanged === false) line += ` — changed since job ${f.prevJobId}`;
+        return line;
+    }));
+    if (absent.length) lines.push(...absent.map(f => `- ${f.rel}: NOT on disk (or empty)`));
+    return lines.join('\n');
+}
+
+// Tolerant JSON extraction: strip code fences / prose, pull the first balanced
+// object. The local path has Ollama `format` enforcing valid JSON, but the
+// cloud-proxy path does not, so this stays as the safety net.
+function extractJsonObject(text: string): any | null {
+    if (!text) return null;
+    let t = text.trim();
+    const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) t = fence[1].trim();
+    const start = t.indexOf('{');
+    if (start < 0) return null;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < t.length; i++) {
+        const c = t[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === '\\') esc = true;
+            else if (c === '"') inStr = false;
+        } else {
+            if (c === '"') inStr = true;
+            else if (c === '{') depth++;
+            else if (c === '}') {
+                depth--;
+                if (depth === 0) {
+                    try { return JSON.parse(t.slice(start, i + 1)); } catch { return null; }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+// ── Completion verdict ─────────────────────────────────────────────────────
+// A tool-less second reader that judges a FINISHED job's output against the
+// original ask. The
+// orchestrator's own CONFIRM step grades its own chain's homework — it
+// declared "Done" today while a second job was still regressing the file.
+// This is the independent backstop: prompt + output + a compact activity
+// digest (tool names + one-line args, never payloads) → strict JSON. Runs
+// once per job completion, before inbox.push, on the supervisor model (falls
+// back to the orchestrator model — logged). Timeout/error → unverifiable,
+// never blocks reporting.
+// 12s measured as too tight: the supervisor model (toolcall-ft) is often not
+// resident (evicted by VRAM pressure from concurrent local jobs) and a cold
+// reload plus inference can exceed 12s, aborting the fetch and throwing the
+// whole verdict away as "unverifiable". 20s gives that reload room to finish.
+const VERDICT_FETCH_TIMEOUT_MS = 20_000;
+const COMPLETION_VERDICT_FORMAT = {
+    type: 'object',
+    properties: {
+        verdict: { type: 'string', enum: ['confirmed', 'failed', 'unverifiable'] },
+        reason: { type: 'string' },
+        remaining: { type: 'string' },
+        followup: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    agent: { type: 'string', enum: ['atlas', 'vulkan'] },
+                    task: { type: 'string' },
+                },
+                required: ['agent', 'task'],
+            },
+        },
+    },
+    required: ['verdict', 'reason'],
+};
+const COMPLETION_VERDICT_PROMPT = `You are the Warden completion verifier. You judge whether a finished background job actually delivered what the user asked for.
+
+CAPABILITIES: Read the user's request, the job's task, its final result text, a compact list of the tool calls it made, AND a ground-truth list of which files the job wrote and whether each one actually exists on disk. Decide confirmed, failed, or unverifiable. When the request has a next step the result did not start, name it as a follow-up.
+
+GUIDELINES:
+- CONFIRMED: the deliverable the user asked for is present and matches the request — the right file written (and it EXISTS on disk per the ground-truth list), the right answer given, the right action named with a concrete outcome.
+- FAILED: the deliverable is genuinely wrong or missing. For a task whose deliverable is a file or an edit: a result that claims a write but the ground-truth list shows the file is NOT on disk (or is empty), a result that claims edit work but the activity shows zero Edit/Write/Bash calls, or a result that contradicts the request. A task whose deliverable is an on-screen or system action (play a video, open a page, launch an app, send a message) has no file to check — judge a result that reports the action done as UNVERIFIABLE, never FAILED for having no write calls.
+- UNVERIFIABLE: whether it worked depends on screen or system state the text cannot show (a page rendered, an app launched), OR the deliverable file EXISTS on disk with real content but you cannot judge from text alone whether its content fully matches the request. Trust the on-disk file; do NOT mark failed merely because the result prose does not explicitly say "I wrote X" — the ground-truth list is authoritative for whether a file was written.
+- Use followup only when the user's request named a next step (e.g. "then redesign it") that this result did not start. Write the task as plain intent: the goal and the facts.
+
+FORMAT: Output one JSON object only.
+{"verdict": "confirmed", "reason": "", "remaining": "", "followup": []}`;
+
+interface CompletionVerdict {
+    verdict?: 'confirmed' | 'failed' | 'unverifiable';
+    reason?: string;
+    remaining?: string;
+    followup?: { agent?: string; task?: string }[];
+}
+
+/** If `wanted` is already loaded in Ollama, use it. If it is NOT loaded but the
+ *  seat's model IS, return that instead — loading `wanted` would evict the
+ *  resident one. Returns null when the check fails or tells us nothing, so
+ *  the caller just keeps its configured model. */
+async function pickResidentVerdictModel(wanted: string): Promise<string | null> {
+    const atlas = (ATLAS_MODEL || '').trim();
+    if (!atlas || atlas === wanted) return null;
+    if (/cloud/i.test(wanted) || /cloud/i.test(atlas)) return null; // cloud models hold no VRAM
+    try {
+        const ollamaUrl = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+        const res = await fetch(`${ollamaUrl}/api/ps`, { signal: AbortSignal.timeout(2000) });
+        if (!res.ok) return null;
+        const data = (await res.json()) as { models?: Array<{ name?: string; model?: string }> };
+        const loaded = (data.models || []).map(m => (m.name || m.model || '').trim()).filter(Boolean);
+        if (loaded.length === 0) return null;
+        const has = (n: string) => loaded.some(l => l === n || l.replace(/:latest$/, '') === n.replace(/:latest$/, ''));
+        if (has(wanted)) return null;      // already there — no eviction to avoid
+        return has(atlas) ? atlas : null;  // swap only when the seat's model is the resident one
+    } catch {
+        return null;
+    }
+}
+
+async function runCompletionVerdict(opts: { task: string; fullResult: string; activityLog: { t: number; tool: string; args: string; result?: string }[]; toolContext: any; jobId: string }): Promise<CompletionVerdict> {
+    const { task, fullResult, activityLog, jobId } = opts;
+    // The dashboard's supervisor On/Off now gates THIS — the completion verdict
+    // is the only surviving supervisor (the periodic watchdog tick was removed
+    // 2026-09-17), so "supervisor Off" has to mean "no second-reader pass" or
+    // the setting controls nothing at all.
+    if (!SUPERVISOR_ENABLED) { log('[completion-verdict] supervisor Off — skipping verdict'); return { verdict: 'unverifiable', reason: `${VERDICT_NOT_JUDGED}: supervisor disabled in settings` }; }
+    let model = (SUPERVISOR_MODEL || ATLAS_MODEL || '').trim();
+    if (!model) { log('[completion-verdict] no supervisor/seat model — skipping'); return { verdict: 'unverifiable', reason: `${VERDICT_NOT_JUDGED}: no model configured` }; }
+    // Don't evict a resident model to judge a job. The verdict is a two-second
+    // read, but when its model is not the one in VRAM, asking for it makes
+    // Ollama unload whatever is resident — and on this box that is a 17 GB
+    // orchestrator/atlas model whose reload costs ~85 s, paid by the NEXT user
+    // turn. Measured 2026-09-18: play a song → atlas runs → verdict pulls the
+    // 3 GB toolcall model in → the 30 B is evicted → the following turn sits
+    // through a full cold load, over and over ("it just loaded and unloaded
+    // VRAM on playing a song"). So when the configured verdict model is not
+    // already resident and the orchestrator's model IS, judge on the resident
+    // one: same verdict, no eviction, no reload. Settings are untouched — this
+    // only decides which of the user's own models answers right now.
+    const residentModel = await pickResidentVerdictModel(model);
+    if (residentModel && residentModel !== model) {
+        log(`[completion-verdict] ${model} is not resident — judging on the resident ${residentModel} instead of evicting it`);
+        model = residentModel;
+    }
+
+    // Ground truth: which files did the job write, and do they exist on disk?
+    const writtenFiles = verifyWrittenFiles(activityLog, jobId);
+    const filesBlock = writtenFiles.length
+        ? `\nWritten files verified on disk (authoritative — a file listed EXISTS was really written):\n${writtenFilesSummary(writtenFiles)}\n`
+        : '\nNo file-writing tool calls recorded in the activity log.\n';
+
+    // Compact activity digest: tool names + one-line args only, never payloads.
+    const activity = activityLog.slice(-40).map(e => `${e.tool}(${e.args})`).join('\n') || '(no tool calls recorded)';
+    const userMsg =
+        `User request: ${lastUserAsk.slice(0, 400) || '(not available)'}\n\n` +
+        `Job task: ${task.slice(0, 500)}\n\n` +
+        `Final result:\n${fullResult.slice(0, 3000)}\n\n` +
+        `Tool calls (most recent last, names + one-line args only):\n${activity}\n` +
+        filesBlock +
+        `\nOutput the JSON verdict. Judge against the on-disk file list: if a deliverable file EXISTS with real content, do not mark failed only because the result text does not spell that out. But a file marked UNCHANGED is byte-identical to the previous run's version — if the task asked for a change to that file, the change was NOT made, and that is a failure no matter what the result text claims.`;
+
+    const apiProxyUrl = process.env.API_PROXY_URL || '';
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+    const chatUrl = apiProxyUrl ? `${apiProxyUrl}/api/chat` : `${ollamaUrl}/api/chat`;
+    const isLocal = !apiProxyUrl;
+
+    const body: any = {
+        model,
+        messages: [
+            { role: 'system', content: COMPLETION_VERDICT_PROMPT },
+            { role: 'user', content: userMsg },
+        ],
+        stream: false,
+        keep_alive: keepAliveFor(model, VERDICT_KEEP_ALIVE_S),
+        // num_ctx from settings, like every other call. Sending none let Ollama
+        // choose its own window (32768), which forked a SECOND runner of the
+        // same weights beside the 8192 one the rest of the system uses — 3.9 GB
+        // instead of 2.5 GB, spilling onto CPU, with VRAM moving every time a
+        // job finished. getNumCtx pins the toolcall model to its dashboard ctx.
+        options: { temperature: 0, num_predict: 512, num_ctx: getNumCtx(model, ''), ...qwenSampling(model), ...graniteSampling(model) },
+    };
+    if (isLocal) body.format = COMPLETION_VERDICT_FORMAT;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), VERDICT_FETCH_TIMEOUT_MS);
+    let verdict: CompletionVerdict | null = null;
+    let raw = '';
+    try {
+        const resp = await fetch(chatUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+        if (resp.ok) {
+            const data: any = await resp.json();
+            raw = typeof data?.message?.content === 'string' ? data.message.content
+                : typeof data?.choices?.[0]?.message?.content === 'string' ? data.choices[0].message.content
+                : typeof data?.content === 'string' ? data.content : '';
+            verdict = extractJsonObject(raw);
+        } else {
+            log(`[completion-verdict] HTTP ${resp.status} ${resp.statusText}`);
+        }
+    } catch (err: any) {
+        log(`[completion-verdict] call failed — ${err?.message ?? err}`);
+    } finally {
+        clearTimeout(timer);
+    }
+
+    if (!verdict || !verdict.verdict) {
+        log(`[completion-verdict] no JSON verdict (model=${model}, raw: "${raw.slice(0, 120)}") — treating as unverifiable`);
+        return { verdict: 'unverifiable', reason: 'verifier returned no verdict' };
+    }
+
+    // Deterministic backstop: the verifier historically false-fails jobs that
+    // wrote a real file whenever the result prose didn't explicitly confirm it,
+    // and each false `failed` pushes the orchestrator toward report_task_failure
+    // → re-delegation → the one-atlas-gate murder cycle. If the model says
+    // `failed` but a file the job wrote is actually on disk with real content
+    // (>=100 bytes) AND the reason doesn't name a genuine content problem
+    // (empty/placeholder/wrong/missing-menu/…), this is a textual false-fail:
+    // downgrade to `unverifiable` so the orchestrator trusts the on-disk result
+    // instead of churning. A real content failure (reason names the defect) is
+    // respected and stays `failed`.
+    if (verdict.verdict === 'failed') {
+        // A file UNCHANGED from a previous run cannot rescue the verdict: the
+        // backstop exists for textual false-fails where the FILE is real work,
+        // but byte-identical output from a correction run is proof the
+        // correction did NOT happen — downgrading that to `unverifiable` would
+        // send the "claimed update, nothing changed" loop straight to the
+        // orchestrator as a success.
+        const realFile = writtenFiles.find(f => f.exists && f.size >= 100 && f.unchanged !== true);
+        const reason = String(verdict.reason || '');
+        if (realFile && !REAL_FAIL_KEYWORDS.test(reason)) {
+            const present = writtenFiles.filter(f => f.exists && f.size > 0).map(f => `${f.rel} (${f.size}B)`).join(', ');
+            log(`[completion-verdict] (model=${model}) OVERRODE failed→unverifiable: deliverable file(s) present on disk [${present}] but reason was textual, not a content defect — "${reason.slice(0, 120)}"`);
+            return { verdict: 'unverifiable', reason: `Deliverable file(s) present on disk [${present}]; verifier flagged the result text, not the file content — trusting the on-disk result.`, followup: verdict.followup };
+        }
+    }
+
+    // The verbatim-loop guard runs in BOTH directions: when the judge marks the
+    // job confirmed but a deliverable is UNCHANGED from a previous run, the
+    // correction did not happen — append the hard fact to the reason so it
+    // reaches the orchestrator's digest verbatim and can't be parroted away.
+    if (verdict.verdict === 'confirmed' && writtenFiles.some(f => f.unchanged === true)) {
+        const same = writtenFiles.filter(f => f.unchanged === true).map(f => f.rel).join(', ');
+        verdict.reason = `${String(verdict.reason || '')} [ground truth: ${same} is byte-identical to the previous run — no change was made to it]`.trim();
+        log(`[completion-verdict] confirmed, but UNCHANGED deliverable(s) [${same}] — annotated the reason with the no-change fact`);
+    }
+
+    log(`[completion-verdict] (model=${model}) verdict=${verdict.verdict}, followup=${verdict.followup?.length ?? 0} — ${String(verdict.reason || '').slice(0, 160)}`);
+    return verdict;
+}
+
 // kimi-k2.6:cloud is the known offender: when a request is sent with think:false
 // (iterations after planning), Ollama stops separating the reasoning stream and
 // kimi dumps its full chain-of-thought as plain UNTAGGED text in message.content —
@@ -1264,10 +2736,81 @@ function spawnBackgroundJob(delegate: string, task: string, context: any, urgent
 // fullThinking (never shown to users). Models that already behave with the
 // iteration-1-only policy (nemotron, deepseek, etc.) are deliberately NOT listed,
 // to avoid changing their token usage/latency; extend the pattern if another model
-// is caught leaking untagged reasoning.
-const ALWAYS_THINK_MODEL_RE = /^kimi/i;
+// is caught leaking untagged reasoning. glm leaks: with think off (atlas/vulkan
+// only think on iteration 0), glm-5.3:cloud streamed tool-mechanics reasoning as
+// CONTENT on later iterations (atlas-10gs iter 44, vulkan-8vzh iter 5, both
+// narrating about browser_type internals instead of calling it).
+const ALWAYS_THINK_MODEL_RE = /^(kimi|glm)/i;
 function modelRequiresThink(model: string): boolean {
     return ALWAYS_THINK_MODEL_RE.test(model || '');
+}
+
+// Granite 4.x models — including the orchatlas-ft seat fine-tune, which is
+// granite4.2 under a non-granite name — plan inside their normal turn. Forcing
+// a separate think pass on them spends the whole turn in the think channel and
+// comes back with no content (2026-10-18: "Dominic asked whether…" rumination
+// then a clean stop, 0 content, 0 tools). They are deliberately excluded from
+// every forced-think decision, matching the sub-agent loop's long-standing
+// granite exclusion.
+const GRANITE_MODEL_RE = /granite|orchatlas/i;
+
+// Max tokens one reply may generate — the dashboard's "Max output" row
+// (local:max_output_tokens), delivered in the spawn/turn payload. This is NOT
+// ctx: it caps a single response, and its job is to stop a model that has lost
+// the thread from generating until something times out. The old literals were
+// 65536 on both the orchestrator and sub-agent turns — a "cap" equal to the
+// whole window, so no cap at all — and 8192 on the two one-shot passes.
+//
+// Defaults when the row is blank: a sub-agent may legitimately emit a whole
+// file, so it gets room; the orchestrator speaks in sentences and a one-shot
+// pass answers a single question, so they get far less. A reply that needs
+// more than this has gone wrong, not long.
+const DEFAULT_MAX_OUTPUT = { subagent: 16384, orchestrator: 4096, oneshot: 4096 };
+let MAX_OUTPUT_SETTING = 0; // 0 = unset, use the defaults above
+
+function maxOutput(kind: keyof typeof DEFAULT_MAX_OUTPUT): number {
+    return MAX_OUTPUT_SETTING > 0 ? MAX_OUTPUT_SETTING : DEFAULT_MAX_OUTPUT[kind];
+}
+
+// Granite runs at temperature 0, everywhere, no exceptions. IBM's tool-calling
+// guidance is temperature 0 for reliable structured output, and every seat that
+// has ever drifted on Granite — hallucinated tool arguments, invented paths,
+// restated content it was told to copy — drifted with a non-zero temperature
+// underneath it. Spread AFTER the caller's options so this wins whatever the
+// seat, the retry path or a model-specific sampler asked for. num_ctx is never
+// touched here — that knob is the user's.
+function graniteSampling(model: string): Record<string, number> {
+    const m = String(model || '');
+    // orchatlas-ft is granite4.2 under a non-granite name — GRANITE_MODEL_RE
+    // matches it so the seat gets the model-card sampling, not the 0.3 default
+    // that replays the same path verbatim (see the note below).
+    if (!GRANITE_MODEL_RE.test(m)) return {};
+    // Toolcall-trained small granite (iris/byte/dexter, toolcall-ft): the
+    // fine-tune transcribes tool calls — deterministic is the point.
+    if (/toolcall-ft|granite4\.1:3b/i.test(m)) return { temperature: 0 };
+    // Conversational granite (the 8b/30b seats): argmax replayed the last
+    // successful path verbatim — "play X" came back as chillstep again
+    // (2026-09-19), and at 0.6 the seat kept answering Facebook asks with
+    // YouTube playback (2026-09-21). Granite 4.2's model card specifies
+    // temperature 1.0 / top_p 0.95 for open-ended generation — use those.
+    return { temperature: 1.0, top_p: 0.95 };
+}
+
+// Qwen-documented sampling (Qwen3.5 model card): any qwen model gets these;
+// everything else keeps its own settings. Spread AFTER the existing options
+// so qwen's numbers win; num_ctx is never touched — that knob is the user's.
+// Thinking row where think:true, non-thinking (instruct) row otherwise.
+// NO presence/frequency penalty: it punishes a token for appearing twice, and
+// tool-call XML is built from repeated tags — at 1.5 the sampler was pushed off
+// the correct closing tag and Ollama's parser dropped the whole call
+// ("element <function> closed by </parameter>", 2026-09-26 21:15). Qwen's own
+// docs warn penalties corrupt structured output; repetition risk is already
+// carried by temperature/top_p/top_k.
+function qwenSampling(model: string, thinking = false): Record<string, number> {
+    if (!/^qwen/i.test(String(model || ''))) return {};
+    return thinking
+        ? { temperature: 1.0, top_p: 0.95, top_k: 20 }
+        : { temperature: 0.7, top_p: 0.8, top_k: 20 };
 }
 
 // Per-model native context window, fetched once from Ollama /api/show and
@@ -1330,38 +2873,100 @@ function toolcallCtx(): number | undefined {
     const n = parseInt(raw, 10);
     return n > 0 ? n : undefined;
 }
+// Sticky per-model ctx (2026-09-26): two call paths asking different ctx for
+// the same model make Ollama reload it between requests — atlas loaded
+// qwen3.8:27b at 32k (backend default, ctx lost on one spawn path), a second
+// call asked 64k, and Ollama dumped and reloaded the model twice in seconds,
+// each reload also evicting the resident granites. The first ctx served to a
+// model here is the ctx EVERY later call for that model gets; a differing
+// request is logged and served the pinned value. One reload at most — never a
+// cycle.
+const STICKY_MODEL_CTX = new Map<string, number>();
+// Model-level ctx unification (2026-09-26): the seat's own calls pass
+// ATLAS_NUM_CTX, background jobs pass the per-agent knob, the verdict
+// and one-shot paths pass nothing — the SAME model could get 2-3 different
+// windows depending on the call path, and every switch is a full Ollama
+// reload (atlas loaded qwen3.8:27b at 32k, the next call asked 64k, dumped
+// and reloaded, all day; each reload also flipped the seat's context budget,
+// collapsing the conversation tail so follow-ups arrived context-blind).
+// When a call carries no override, fall back to the dashboard ctx set for
+// THIS model under any agent, so every path agrees on one window.
+const MODEL_CTX_UNIFY_LOGGED = new Set<string>();
+function modelCtxFromSettings(model: string): number | undefined {
+    const want = (model || '').replace(/^local:/, '').trim();
+    if (!want) return undefined;
+    const rows: Array<[string, string | undefined]> = [
+        [ATLAS_MODEL, process.env.ATLAS_NUM_CTX],
+        [VULKAN_MODEL, process.env.VULKAN_NUM_CTX],
+        [IRIS_MODEL, process.env.IRIS_NUM_CTX],
+        [ARTEMIS_MODEL, process.env.ARTEMIS_NUM_CTX],
+        [SENTRY_MODEL, process.env.SENTRY_NUM_CTX],
+    ];
+    for (const [m, raw] of rows) {
+        if ((m || '').replace(/^local:/, '').trim() !== want) continue;
+        const n = raw ? parseInt(raw, 10) : NaN;
+        if (Number.isFinite(n) && n > 0) {
+            if (!MODEL_CTX_UNIFY_LOGGED.has(want)) {
+                MODEL_CTX_UNIFY_LOGGED.add(want);
+                log(`[ctx] ${want}: this call path carried no override — using the dashboard ctx for this model (${n}) so every path loads the same window`);
+            }
+            return n;
+        }
+    }
+    return undefined;
+}
 function getNumCtx(model: string, ctxOverride?: string | number): number | undefined {
     const nativeMax = MODEL_CTX_CACHE.get(model); // undefined until fetchModelCtx populates it
     const cap = (v: number): number => (nativeMax && v > nativeMax) ? nativeMax : v;
+    let resolved: number | undefined;
     if (ctxOverride !== undefined && ctxOverride !== null && ctxOverride !== '') {
         const n = typeof ctxOverride === 'number' ? ctxOverride : parseInt(String(ctxOverride), 10);
         // An explicit dashboard override wins over the native cap only when it
         // is SMALLER — so a small model (e.g. granite4.1:8b) can be pinned to
         // 16k to keep its KV cache in VRAM. An override above the cap is clamped.
-        if (n > 0) return cap(n);
+        if (n > 0) resolved = cap(n);
     }
     // The shared toolcall model MUST stay at one ctx. If a caller passes no
     // override, Ollama falls back to the Modelfile default — often 2048 — which
     // is NOT the native window and forces a reload when the next toolcall agent
     // expects the configured toolcall ctx. Pin it to the dashboard toolcall ctx.
-    if (model === toolcallModel()) {
+    if (resolved === undefined && model === toolcallModel()) {
         const tc = toolcallCtx();
-        if (tc && tc > 0) return cap(tc);
+        if (tc && tc > 0) resolved = cap(tc);
     }
-    return undefined; // non-toolcall models with no override use backend default
+    // No override on this path: serve the model's dashboard window so paths
+    // that lost their override don't fork a second window of the same weights.
+    if (resolved === undefined) {
+        const unified = modelCtxFromSettings(model);
+        if (unified) resolved = cap(unified);
+    }
+    const pinned = STICKY_MODEL_CTX.get(model);
+    if (pinned) {
+        if (resolved && resolved !== pinned) {
+            log(`[ctx] ${model} pinned at ${pinned} — serving pinned ctx instead of requested ${resolved}`);
+        }
+        return pinned; // also covers resolved === undefined: no more backend-default reloads
+    }
+    if (resolved) STICKY_MODEL_CTX.set(model, resolved);
+    return resolved;
 }
 
 // Per-agent ctx override lookup, keyed by the agentName passed to runSubAgent.
 // Blank → the model's native window. Council seats inherit the Atlas ctx
 // (preserves prior behavior; council is dashboard-managed, not in the popover).
+// Ctx delivered IN THE SPAWN PAYLOAD, straight from the settings row for this
+// agent. This is the authoritative source: the environment relay below is the
+// legacy path, and for a background spawn it silently delivered nothing, so
+// atlas ran at whatever window Ollama chose (32k) while its setting said
+// 65536. Payload first, always.
+const PAYLOAD_AGENT_CTX = new Map<string, string>();
+
 const AGENT_CTX_OVERRIDE: Record<string, () => string> = {
-    byte: () => process.env.BYTE_NUM_CTX || '',
-    dexter: () => process.env.DEXTER_NUM_CTX || '',
     iris: () => process.env.IRIS_NUM_CTX || '',
     artemis: () => process.env.ARTEMIS_NUM_CTX || '',
     atlas: () => process.env.ATLAS_NUM_CTX || '',
     vulkan: () => process.env.VULKAN_NUM_CTX || '',
-    oculus: () => process.env.OCULUS_NUM_CTX || '',
+    sentry: () => process.env.SENTRY_NUM_CTX || '',
     // iris-digest (the hourly memory digest) is another one-shot on the toolcall
     // model; inherit the toolcall ctx so it reuses the resident instance instead
     // of reloading granite at native (a different ctx → Ollama reload + gap).
@@ -1372,12 +2977,30 @@ const AGENT_CTX_OVERRIDE: Record<string, () => string> = {
     'council-judge': () => process.env.ATLAS_NUM_CTX || '',
 };
 
-// The orchestrator loop serves both the orchestrator and Mercury (same loop,
+// Per-agent stream-silence budget (ms), same env-driven pattern as the ctx
+// override above. The sub-agent loop's silence watchdog (see SILENCE_MS at the
+// fetch) aborts a turn that streams no chunks for the limit — but a small
+// local model that buffers a very large tool-call JSON (sentry's
+// sentry_report inventory, atlas's big Writes) can legitimately sit silent
+// well past 120s, and the transient retry just regenerates the same heavy
+// call and dies the same way (observed 2026-09-08: sentry deep scans died
+// 5× at exactly 120s; the one run where the context trimmer shrank history
+// first succeeded in 10s). Blank/0 → the 120s default below.
+const AGENT_SILENCE_OVERRIDE: Record<string, () => string> = {
+    sentry: () => process.env.SENTRY_SILENCE_MS || '300000',
+};
+
+function subAgentSilenceMs(agentName: string): number {
+    const raw = Number(AGENT_SILENCE_OVERRIDE[agentName]?.() || '');
+    return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+}
+
+// The seat loop serves both the seat and Mercury (same loop,
 // sessionId distinguishes them). Mercury has its own ctx setting distinct from
-// the orchestrator's, so pick the right override.
-function orchestratorCtxOverride(): string {
+// the seat's, so pick the right override.
+function seatCtxOverride(_model?: string): string {
     if ((globalThis as any)._sessionId === 'mercury') return process.env.MERCURY_NUM_CTX || '';
-    return process.env.ORCHESTRATOR_NUM_CTX || '';
+    return process.env.ATLAS_NUM_CTX || '';
 }
 
 // Per-agent Ollama keep_alive (seconds). -1 = hold the model in VRAM
@@ -1392,30 +3015,55 @@ function keepAliveEnv(name: string, dflt: number): number {
     const n = e ? Number(e) : NaN;
     return Number.isFinite(n) ? n : dflt;
 }
-// Sub-agent chat calls (runSubAgent): the toolcall agents — byte, dexter,
-// iris, oculus, mercury, and the one-shot iris-digest spawn — share one
+// Sub-agent chat calls (runSubAgent): the toolcall agents —
+// iris, mercury, and the one-shot iris-digest spawn — share one
 // keep-alive knob (TOOLCALL_KEEP_ALIVE); atlas/vulkan/council/artemis use the
 // atlas knob (ATLAS_KEEP_ALIVE). Historic default for all sub-agents: 300.
+/** Ollama applies the keep_alive of EVERY request to the loaded model, so a
+ *  short-TTL call against a model another seat pinned resident (-1) silently
+ *  demotes it. The completion verdict (60s) and a sentry scan (300s) both fall
+ *  back to whatever is already resident — which on this box is the
+ *  orchestrator's own model — so after each finished job the "pinned" model was
+ *  quietly given a 60-second expiry and unloaded, forcing a full reload on the
+ *  next message (VRAM dropping between turns, 2026-09-18). Never shorten a
+ *  pinned model's residency: if any seat pins this model, the call keeps -1. */
+function keepAliveFor(model: string, desired: number): number {
+    const want = (model || '').replace(/^local:/, '').trim();
+    if (!want || desired === -1) return desired;
+    const pinned = (name: string, v: number) =>
+        v === -1 && (name || '').replace(/^local:/, '').trim() === want;
+    if (pinned(ATLAS_MODEL, keepAliveEnv('ATLAS_KEEP_ALIVE', 300))) return -1;
+    if (pinned(process.env.SUBAGENT_MODEL || '', keepAliveEnv('TOOLCALL_KEEP_ALIVE', 300))) return -1;
+    return desired;
+}
+
 function subAgentKeepAlive(agent: string): number {
-    if (['byte', 'dexter', 'iris', 'oculus', 'mercury', 'iris-digest'].includes(agent)) {
+    if (['iris', 'mercury', 'iris-digest'].includes(agent)) {
         return keepAliveEnv('TOOLCALL_KEEP_ALIVE', 300);
+    }
+    // Sentry gets its own knob (local:sentry_keep_alive). It used to fall
+    // through to the atlas knob, so an hourly security scan on a large local
+    // model pinned VRAM resident between runs — for a job that works a minute
+    // an hour. Atlas being resident is deliberate; sentry borrowing it was not.
+    if (agent === 'sentry') {
+        return keepAliveEnv('SENTRY_KEEP_ALIVE', 300);
     }
     return keepAliveEnv('ATLAS_KEEP_ALIVE', 300);
 }
-// Orchestrator loop: Mercury re-uses this loop but runs on the toolcall model,
-// so it follows the toolcall knob; the orchestrator itself uses ORCHESTRATOR_KEEP_ALIVE.
+// Seat loop: Mercury re-uses this loop but runs on the toolcall model,
+// so it follows the toolcall knob; the seat itself uses ATLAS_KEEP_ALIVE.
 // Historic default for both: -1 (resident).
 function orchestratorKeepAlive(): number {
     if ((globalThis as any)._sessionId === 'mercury') return keepAliveEnv('TOOLCALL_KEEP_ALIVE', -1);
-    return keepAliveEnv('ORCHESTRATOR_KEEP_ALIVE', -1);
+    return keepAliveEnv('ATLAS_KEEP_ALIVE', -1);
 }
 
 // Tell Ollama to unload a model immediately (free VRAM for the next agent's model).
 // Best-effort: a /api/generate call with keep_alive:0 evicts the model right away.
-// Skip the orchestrator's own model — it's the hot path and must stay loaded.
+// Skip the seat's own model — it's the hot path and must stay loaded.
 async function unloadModel(ollamaUrl: string, model: string): Promise<void> {
-    if (model === ORCHESTRATOR_MODEL) {
-        log(`[unload] skipped ${model} — orchestrator model (keep warm)`);
+    if (model === ATLAS_MODEL) {
+        log(`[unload] skipped ${model} — seat model (keep warm)`);
         return;
     }
     try {
@@ -1428,12 +3076,86 @@ async function unloadModel(ollamaUrl: string, model: string): Promise<void> {
     } catch { /* best-effort — model will expire via keep_alive anyway */ }
 }
 
+// Models pinned resident by a keep_alive checkbox (-1). Mirrors keepAliveFor's
+// rule — never shorten a pinned model's residency — for the eviction paths.
+function isPinnedResident(model: string): boolean {
+    const want = (model || '').replace(/^local:/, '').trim();
+    if (!want) return false;
+    const knob = (name: string, v: number) =>
+        want === (name || '').replace(/^local:/, '').trim() && v === -1;
+    return knob(ATLAS_MODEL, keepAliveEnv('ATLAS_KEEP_ALIVE', 300))
+        || knob(process.env.SUBAGENT_MODEL || '', keepAliveEnv('TOOLCALL_KEEP_ALIVE', 300))
+        || knob(SENTRY_MODEL, keepAliveEnv('SENTRY_KEEP_ALIVE', 300));
+}
+
+// In-flight local sub-agent runs, per model (refcount). A model another running
+// job is actively using must not be evicted mid-job — that was the load/dump
+// ping-pong: two atlas jobs and a vulkan spawn kept re-loading each other's
+// weights every request. Wired in runSubAgent.
+const ACTIVE_LOCAL_JOBS = new Map<string, number>();
+
+// ACTIVE_LOCAL_JOBS is per-PROCESS, but sentry/digest scans run as separate
+// runner children with an empty map — every hourly :23 sentry spawn evicted
+// whatever model the MAIN runner's in-flight job was generating on mid-stream
+// (2026-09-27/28: silence-abort → "This operation was aborted" → transient
+// retry → full context re-prefill, 21 aborts across the two days). So the
+// in-flight fact also lives in a shared file, keyed by pid: every process
+// registers the models its sub-agents are actively using, and the eviction
+// guard skips any model with a live foreign holder. Dead-pid entries are
+// pruned lazily on every read; a dead pid never pins a model for long.
+const ACTIVE_MODELS_PATH = '/tmp/warden-active-local-models.json';
+
+function readActiveModels(): Record<string, { pid: number; model: string; ts: number }> {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(ACTIVE_MODELS_PATH, 'utf-8'));
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
+}
+function pidAlive(pid: number): boolean {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+}
+function pruneActiveModels(map: Record<string, { pid: number; model: string; ts: number }>): void {
+    for (const k of Object.keys(map)) {
+        const e = map[k];
+        if (!e || typeof e.pid !== 'number' || !pidAlive(e.pid)) delete map[k];
+    }
+}
+function registerActiveModel(model: string): void {
+    try {
+        const map = readActiveModels();
+        pruneActiveModels(map);
+        map[`${process.pid}:${model}`] = { pid: process.pid, model, ts: Date.now() };
+        fs.writeFileSync(ACTIVE_MODELS_PATH, JSON.stringify(map), 'utf-8');
+    } catch { /* best-effort — never crash a job over the registry */ }
+}
+function unregisterActiveModel(model: string): void {
+    try {
+        const map = readActiveModels();
+        const key = `${process.pid}:${model}`;
+        if (map[key]) {
+            delete map[key];
+            fs.writeFileSync(ACTIVE_MODELS_PATH, JSON.stringify(map), 'utf-8');
+        }
+    } catch { /* best-effort */ }
+}
+function modelInUseElsewhere(model: string): boolean {
+    for (const e of Object.values(readActiveModels())) {
+        if (e?.model === model && e.pid !== process.pid && pidAlive(e.pid)) return true;
+    }
+    return false;
+}
+
 // On a GPU shared between the orchestrator and sub-agent models, two models
 // loaded at once squeeze KV cache out of VRAM → CPU-speed prefill (~250 tok/s
 // instead of ~1500+). Before switching to a model, evict every OTHER model
-// currently loaded on the same Ollama server so the new model gets full VRAM.
-// Best-effort: queries /api/ps and sends keep_alive:0 for each non-keep model.
-// (unloadModel above can't handle this — it skips ORCHESTRATOR_MODEL as the
+// currently loaded on the same Ollama server so the new model gets full VRAM —
+// this is what makes a finished atlas (whose keep_alive lingers after the job)
+// "go away" so the next seat can spawn. Best-effort: queries /api/ps and sends
+// keep_alive:0 for each evictable model. Never evicts: the keep model itself,
+// models pinned resident (-1, mirrors keepAliveFor's never-shorten rule), or
+// models with an in-flight sub-agent job (that evicted a RUNNING job's weights
+// and force-reloaded them on its next request).
+// (unloadModel above can't handle this — it skips ATLAS_MODEL as the
 // hot path, which is exactly why it lingers and contends.)
 async function unloadOtherModelsOnSameGpu(ollamaUrl: string, keepModel: string): Promise<void> {
     if (!keepModel) return;
@@ -1449,6 +3171,18 @@ async function unloadOtherModelsOnSameGpu(ollamaUrl: string, keepModel: string):
         for (const m of loaded) {
             const name = m.name || m.model;
             if (!name || name === keepModel) continue;
+            if (isPinnedResident(name)) {
+                log(`[gpu] keeping ${name} (pinned resident) while loading ${keepModel}`);
+                continue;
+            }
+            if ((ACTIVE_LOCAL_JOBS.get(name) || 0) > 0) {
+                log(`[gpu] keeping ${name} (in-flight job) while loading ${keepModel}`);
+                continue;
+            }
+            if (modelInUseElsewhere(name)) {
+                log(`[gpu] keeping ${name} (in-flight job in another runner process) while loading ${keepModel}`);
+                continue;
+            }
             try {
                 await fetch(`${ollamaUrl}/api/generate`, {
                     method: 'POST',
@@ -1474,14 +3208,72 @@ const SUBAGENT_MAX_TOOL_RESULT_CHARS = 4000;    // ~1K tokens — relevant bits,
 // budgets mean the model gets the recent essentials (atlas/delegation results +
 // last chat turns), not 150K tokens of stale accumulation.
 const SUBAGENT_MSG_BUDGET_CHARS = 24000;        // ~6K tokens — sub-agent tool results
-const ORCHESTRATOR_MSG_BUDGET_CHARS = 40000;    // ~10K tokens — fits 60k ctx; keeps recent dispatches + their results paired across turns
-
-function truncateToolResult(toolName: string, result: string): string {
-    if (typeof result !== 'string') result = String(result ?? '');
-    if (result.length <= SUBAGENT_MAX_TOOL_RESULT_CHARS) return result;
-    const head = result.slice(0, SUBAGENT_MAX_TOOL_RESULT_CHARS - 400);
-    return `${head}\n\n[…truncated ${result.length - SUBAGENT_MAX_TOOL_RESULT_CHARS + 400} chars by context budget…]`;
+// Per-agent tool-result caps. The default 4000-char budget is sized for
+// search-and-read agents; sentry's ONE Bash call emits the entire scan
+// inventory (~25K chars, self-capped by its recipe), and truncating it
+// mid-section feeds the diff a partial inventory → phantom findings.
+const AGENT_TOOL_RESULT_MAX_CHARS: Record<string, () => number> = {
+    sentry: () => Number(process.env.SENTRY_TOOL_RESULT_MAX_CHARS || '32000'),
+};
+// Per-TOOL result budget (checked before the per-agent default). The default
+// 4000-char head-cut is right for Bash/file tools, deadly for page dumps: on a
+// huge page the useful controls (late-DOM modals, composers) are at the END of
+// the tree text and get cut first — the 2026-09-21 reddit failure: read_page
+// succeeded, the title field was in the output, and the model never saw it.
+const TOOL_RESULT_MAX_CHARS: Record<string, number> = {
+    'mcp__browser-driving__chrome_read_page': 24000,
+};
+function toolResultMaxChars(agentName: string): number {
+    const raw = Number(AGENT_TOOL_RESULT_MAX_CHARS[agentName]?.() || '');
+    return Number.isFinite(raw) && raw > 0 ? raw : SUBAGENT_MAX_TOOL_RESULT_CHARS;
 }
+const ORCHESTRATOR_MSG_BUDGET_CHARS = 20000;    // fallback / floor when the model's window is unknown. In practice the budget is scaled to the orchestrator's real num_ctx (orchestratorMsgBudgetChars) — the pinned head alone (system prompt + mercury slot + first ask) is ~23K chars, so a flat 20K cap left the tail with NEGATIVE headroom and every mid-turn trim collapsed to the last message group (the "lost the emails answer" failure: user's question + Iris's results dropped mid-turn).
+
+/** Orchestrator message budget scaled to the model's actual num_ctx, mirroring
+ *  subAgentMsgBudgetChars. The budget covers the WHOLE messages array —
+ *  trimMessagesToBudget subtracts the pinned head itself. Never returns less
+ *  than the pinned head plus real working room: a budget under the head makes
+ *  every trim drop all but the newest group, which is how immediate context
+ *  (the live question and its sub-agent results) gets stripped mid-turn. */
+function orchestratorMsgBudgetChars(model: string, headChars: number, toolsChars: number): number {
+    const ctx = getNumCtx(model, seatCtxOverride(model));
+    const floor = Math.max(ORCHESTRATOR_MSG_BUDGET_CHARS, headChars + 20000);
+    if (!ctx || ctx <= 0) return floor; // window unknown — flat cap, but never below head + working room
+    const toolsTokens = Math.ceil(toolsChars / 3.5);
+    const outputReserve = 4096;                   // generation headroom
+    const availTokens = ctx - toolsTokens - outputReserve;
+    // The window is genuinely too small for even this configuration — fall back
+    // to the floor rather than a budget that instantly collapses the tail.
+    if (availTokens * 3 < floor) return floor;
+    return Math.min(availTokens * 3, 600000);     // ~3 chars/token (conservative)
+}
+
+function truncateToolResult(toolName: string, result: string, maxChars: number = SUBAGENT_MAX_TOOL_RESULT_CHARS): string {
+    if (typeof result !== 'string') result = String(result ?? '');
+    if (TOOL_RESULT_MAX_CHARS[toolName]) maxChars = TOOL_RESULT_MAX_CHARS[toolName];
+    if (result.length <= maxChars) return result;
+    const head = result.slice(0, maxChars - 400);
+    return `${head}\n\n[…truncated ${result.length - maxChars + 400} chars by context budget…]`;
+}
+
+// Image payloads (base64 in `images`, queued by Read/webcam_capture) count
+// against the context budgets at their real token cost. Ollama encodes our
+// 512px Read thumbnails at ~(512*512)/(758*758)*1710 ≈ 780 tokens; 1500 is a
+// conservative ceiling (covers framing and non-local proxy variance), and the
+// budget layer works in chars at ~3 chars/token. Before this, images rode
+// along FREE — the estimator saw only the tiny bracket note — so a message
+// list that "fit the budget" actually blew past num_ctx once the image landed,
+// and Ollama killed the whole job with a 400 (vulkan-7qm8, iteration 43: a
+// verification screenshot Read at the end of a long job).
+const IMAGE_TOKEN_COST = 1500;
+const IMAGE_CHARS_EQUIV = IMAGE_TOKEN_COST * 3;
+
+// Models that rejected an image-bearing request with "does not support image
+// input" (Ollama 400 — e.g. glm-5.3:cloud via the proxy, 2026-09-03: it killed
+// vulkan-7qm8 AND vulkan-gdpo mid-job). Learned on first refusal; from then on
+// every image attach point skips this model and leaves a text-only note, so a
+// visionless model never sees an image it would 400 on again.
+const MODELS_WITHOUT_VISION = new Set<string>();
 
 function estimateMessagesChars(msgs: any[]): number {
     let total = 0;
@@ -1489,17 +3281,115 @@ function estimateMessagesChars(msgs: any[]): number {
         const c = typeof m?.content === 'string' ? m.content : (m?.content ? JSON.stringify(m.content) : '');
         total += c.length;
         if (m?.tool_calls) total += JSON.stringify(m.tool_calls).length;
+        if (Array.isArray(m?.images)) total += m.images.length * IMAGE_CHARS_EQUIV;
     }
     return total;
 }
 
+/** Can `nImages` images be attached to this message list without blowing the
+ *  context? The trimmer only drops TAIL groups — the pinned head (system +
+ *  initial ask) and the just-attached image message always ride along — so
+ *  attaching is safe exactly when head + images fit the same budget the
+ *  trimmer enforces; whatever the tail costs gets trimmed before the request.
+ *  When they don't fit, attaching guarantees the next request 400s (Ollama
+ *  refuses rather than truncating), so the caller drops the images and leaves
+ *  a text note instead: a job that loses vision beats a job that dies. */
+function imagesFitBudget(msgs: any[], nImages: number, budgetChars: number): boolean {
+    const head = [msgs[0], msgs[1]].filter(Boolean);
+    return estimateMessagesChars(head) + nImages * IMAGE_CHARS_EQUIV <= budgetChars;
+}
+
+/** Sub-agent message budget scaled to the agent's own num_ctx: reserve room for
+ *  the system prompt + tool schemas + generation, and give the rest of the
+ *  window to tool results. Falls back to the flat SUBAGENT_MSG_BUDGET_CHARS when
+ *  num_ctx is unknown (native window not fetched) or too small to bother. This
+ *  lets a large-window agent (atlas @ 32k) actually spend its window on tool
+ *  results instead of being capped at the historic flat 24k — without overshooting
+ *  the window and triggering Ollama front-truncation of the system prompt. */
+function subAgentMsgBudgetChars(model: string, ctxOverride: string | undefined, systemChars: number, toolsChars: number): number {
+    const ctx = getNumCtx(model, ctxOverride);
+    if (!ctx || ctx <= 0) return SUBAGENT_MSG_BUDGET_CHARS;
+    const systemTokens = Math.ceil(systemChars / 3.5);
+    const toolsTokens = Math.ceil(toolsChars / 3.5);
+    const outputReserve = 4096;                   // generation headroom
+    const availTokens = ctx - systemTokens - toolsTokens - outputReserve;
+    if (availTokens < 2000) return SUBAGENT_MSG_BUDGET_CHARS;
+    return Math.min(availTokens * 3, 600000);     // ~3 chars/token (conservative); cloud hard-cap 600k
+}
+
+// ─── Stale browser snapshots ────────────────────────────────────────────────
+// A browsing run's context is mostly page snapshots, and every one is dead the
+// moment the page changes — its refs are stale and its content is superseded
+// by the next snapshot. Rather than dropping oldest WHOLE groups (which also
+// throws away the real action history), shrink old snapshots to a header stub.
+// Tool results are wrapped by untrustedContextMessage (not reliably parseable),
+// so snapshot-bearing tool messages are tagged in this WeakSet at push time.
+const BROWSER_SNAPSHOT_MSGS = new WeakSet<object>();
+const BROWSER_SNAPSHOT_RESULT_TOOLS = new Set([
+    'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_press_key',
+    'browser_select_option', 'browser_hover', 'browser_type',
+]);
+const SNAPSHOT_KEEP_FULL = 2;     // newest snapshots kept whole (current page + one back)
+const SNAPSHOT_STUB_MIN_CHARS = 1500; // a stub only pays for itself on real dumps
+
+// CDP debug-Chrome tools: registrations removed — the names no longer exist.
+
+/** Replace all but the newest few browser snapshot results in `msgs` with a
+ *  short "elided" stub (page title + URL preserved). Returns how many were
+ *  stubbed. Mutates the message objects in place — the caller's array sees it. */
+function stubStaleBrowserSnapshots(msgs: any[]): number {
+    let full = 0;
+    let stubbed = 0;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m?.role !== 'tool' || !BROWSER_SNAPSHOT_MSGS.has(m)) continue;
+        const c = m.content;
+        // Small results (click no-op notes, tiny snapshots) neither consume a
+        // keep-full slot nor get stubbed — only real dumps do.
+        if (typeof c !== 'string' || c.length < SNAPSHOT_STUB_MIN_CHARS) continue;
+        if (full < SNAPSHOT_KEEP_FULL) { full++; continue; }
+        const mm = /Page: (.*)\nURL: (.*)/.exec(c);
+        if (!mm) continue;
+        m.content = untrustedContextMessage(
+            `Older page snapshot elided (refs are stale — take a fresh browser_snapshot or browser_navigate if you need this page again).\nPage: ${mm[1]}\nURL: ${mm[2]}`,
+        );
+        stubbed++;
+    }
+    return stubbed;
+}
+
 /** Trim oldest non-system messages to fit the char budget. Always keeps
- *  the system prompt, the initial user task, and the most recent messages. */
+ *  the system prompt, the initial user task, and the most recent messages.
+ *
+ *  Cache economics: Ollama reuses the KV prefix of the previous request, so
+ *  an append-only turn costs only its NEW tokens — but dropping the OLDEST
+ *  groups changes the prompt at its front and forces a full re-prefill of
+ *  everything behind the head (~17K tokens on a 32K-window agent, the whole
+ *  per-iteration "thinking" latency of a browser run). Two countermeasures:
+ *  1. Before dropping groups, shrink STALE browser snapshots in place (see
+ *     stubStaleBrowserSnapshots) — browsing runs are made of them and they
+ *     are worthless once the page changed.
+ *  2. When groups must be dropped, drop down to a WATERMARK (~70% of budget)
+ *     instead of barely-under, so the next trim fires many iterations later
+ *     and the prefix stays valid (append-only) in between. */
+const TRIM_WATERMARK = 0.7;
+
 function trimMessagesToBudget(msgs: any[], budgetChars: number): any[] {
     if (msgs.length <= 2) return msgs;
-    const total = estimateMessagesChars(msgs);
+    let total = estimateMessagesChars(msgs);
     if (total <= budgetChars) return msgs;
+    const stubbed = stubStaleBrowserSnapshots(msgs);
+    if (stubbed > 0) {
+        total = estimateMessagesChars(msgs);
+        log(`[context] stubbed ${stubbed} stale browser snapshot(s); ~${(total / 1000).toFixed(0)}K chars`);
+        if (total <= budgetChars) return msgs;
+    }
     const system = msgs[0];
+    // The persistent orchestrator's layout is:
+    //   [system(+merged mercury summary), initialUser, ...tail]
+    // The mercury summary — the host's rolling compaction of older turns the
+    // verbatim tail has dropped — lives inside the system prompt (pinned, never
+    // trimmed; a separate messages[1] system slot trips Ollama renderers).
     const initialUser = msgs[1];
     const tail = msgs.slice(2);
     // Group the tail into complete units and drop oldest WHOLE groups: a group
@@ -1513,16 +3403,23 @@ function trimMessagesToBudget(msgs: any[], budgetChars: number): any[] {
         if (m?.role === 'tool' && groups.length) groups[groups.length - 1].push(m);
         else groups.push([m]);
     }
-    const headChars = estimateMessagesChars([system, initialUser]);
+    const headMsgs = [system, initialUser];
+    const headChars = estimateMessagesChars(headMsgs);
     let groupChars = groups.reduce((s, g) => s + estimateMessagesChars(g), 0);
     let start = 0;
-    while (start < groups.length - 1 && groupChars > budgetChars - headChars) {
+    // Watermark: trim well below budget (not barely under) so the next trim
+    // fires several iterations later — each fire invalidates the KV prefix
+    // cache and costs a full re-prefill, so firing every iteration (the old
+    // just-under behavior) paid that cost on EVERY model turn.
+    const tailTarget = (budgetChars - headChars) * TRIM_WATERMARK;
+    while (start < groups.length - 1 && groupChars > tailTarget) {
         groupChars -= estimateMessagesChars(groups[start]!);
         start++;
     }
     const kept = groups.slice(start).flat();
-    log(`[context] trimmed ${start} oldest group(s); ${kept.length + 2} of ${msgs.length} remain (~${(estimateMessagesChars([system, initialUser, ...kept]) / 1000).toFixed(0)}K chars)`);
-    return [system, initialUser, ...kept];
+    const headLen = headMsgs.length;
+    log(`[context] trimmed ${start} oldest group(s); ${kept.length + headLen} of ${msgs.length} remain (~${(estimateMessagesChars([...headMsgs, ...kept]) / 1000).toFixed(0)}K chars)`);
+    return [...headMsgs.filter(Boolean), ...kept];
 }
 
 /** Collapse the orchestrator's persistent `messages` to chat-history-only after
@@ -1534,6 +3431,17 @@ function trimMessagesToBudget(msgs: any[], budgetChars: number): any[] {
  *  for long-term memory here). This is what keeps the orchestrator from
  *  ballooning: it never carries raw tool chatter across turns, only a lean
  *  tail of the conversation itself. */
+// The most recent assistant reply is the one the NEXT turn is most likely to
+// need word for word: when the orchestrator writes a greeting, a post or the
+// narration for a demo, the delegation that delivers it usually happens on the
+// following turn. At the flat 1K cap that text came back as
+// "…[…truncated…]", so the orchestrator briefed atlas with "type the Warden
+// introduction" and atlas — which cannot see chat — spent eleven iterations
+// grepping the filesystem for a document that had only ever existed in a reply
+// (2026-09-18 12:12). A prompt rule cannot fix that: the words are genuinely
+// gone. So the newest assistant reply keeps a bigger allowance; everything
+// older stays at the lean cap.
+const LAST_REPLY_MAX_CHARS = 4000;
 function collapseToChatHistory(msgs: any[], keepMessages = 6, maxPerMsg = 1000): any[] {
     if (msgs.length <= 1) return msgs;
     const system = msgs[0];
@@ -1552,9 +3460,12 @@ function collapseToChatHistory(msgs: any[], keepMessages = 6, maxPerMsg = 1000):
         }
         return false;
     });
-    const kept = filtered.slice(-keepMessages).map((m: any) => {
+    const window = filtered.slice(-keepMessages);
+    const lastAssistant = [...window].reverse().find((m: any) => m.role === 'assistant');
+    const kept = window.map((m: any) => {
         const c = typeof m.content === 'string' ? m.content : '';
-        if (c.length > maxPerMsg) return { ...m, content: c.slice(0, maxPerMsg) + '\n[…truncated…]' };
+        const cap = m === lastAssistant ? Math.max(maxPerMsg, LAST_REPLY_MAX_CHARS) : maxPerMsg;
+        if (c.length > cap) return { ...m, content: c.slice(0, cap) + '\n[…truncated…]' };
         return m;
     });
     log(`[context] collapsed to chat history: ${kept.length + 1} of ${msgs.length} messages (~${(estimateMessagesChars([system, ...kept]) / 1000).toFixed(0)}K chars, ≤${maxPerMsg} per turn)`);
@@ -1569,10 +3480,51 @@ async function runSubAgent(
     task: string,
     toolContext: any,
     maxIterations = 200,
-    abortFlag?: { aborted: boolean },
+    abortFlag?: { aborted: boolean; nudges?: string[] },
     onToolCall?: (toolName: string, argsSummary: string, resultPreview?: string) => void,
     temperature = 1,
     format?: Record<string, any>,
+    jobId?: string,
+    job?: BackgroundJob,
+): Promise<{ content: string; modifiedFiles: string[] }> {
+    // Local-model VRAM management (2026-09-26): before a local model loads, evict
+    // idle non-pinned models (a finished job's keep_alive lingers and squatting
+    // weights are what blocked the next seat from spawning); then refcount this
+    // model as in-flight so parallel jobs don't evict each other mid-run.
+    const modelName = (model || '').replace(/^local:/, '').trim();
+    const isLocal = !!modelName && !/cloud/i.test(modelName);
+    if (isLocal) {
+        await unloadOtherModelsOnSameGpu(process.env.OLLAMA_URL || 'http://127.0.0.1:11434', modelName);
+        ACTIVE_LOCAL_JOBS.set(modelName, (ACTIVE_LOCAL_JOBS.get(modelName) || 0) + 1);
+        registerActiveModel(modelName);
+    }
+    try {
+        return await runSubAgentInner(agentName, model, systemPrompt, tools, task, toolContext, maxIterations, abortFlag, onToolCall, temperature, format, jobId, job);
+    } finally {
+        if (isLocal) {
+            const n = (ACTIVE_LOCAL_JOBS.get(modelName) || 1) - 1;
+            if (n <= 0) {
+                ACTIVE_LOCAL_JOBS.delete(modelName);
+                unregisterActiveModel(modelName);
+            } else ACTIVE_LOCAL_JOBS.set(modelName, n);
+        }
+    }
+}
+
+async function runSubAgentInner(
+    agentName: string,
+    model: string,
+    systemPrompt: string,
+    tools: any[],
+    task: string,
+    toolContext: any,
+    maxIterations = 200,
+    abortFlag?: { aborted: boolean; nudges?: string[] },
+    onToolCall?: (toolName: string, argsSummary: string, resultPreview?: string) => void,
+    temperature = 1,
+    format?: Record<string, any>,
+    jobId?: string,
+    job?: BackgroundJob,
 ): Promise<{ content: string; modifiedFiles: string[] }> {
     const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
     // No hardcoded fallback: if this agent's model is empty (a manually-cleared
@@ -1582,26 +3534,18 @@ async function runSubAgent(
         return { content: `Error: the ${agentName} sub-agent has no model configured (set it in the Agents panel). The task did not run.`, modifiedFiles: [] };
     }
     // Per-agent num_ctx override for this agent (blank → native window).
-    const ctxOverride = AGENT_CTX_OVERRIDE[agentName]?.() || '';
+    const ctxOverride = PAYLOAD_AGENT_CTX.get(agentName) || AGENT_CTX_OVERRIDE[agentName]?.() || '';
+    const resolvedCtx = getNumCtx(model, ctxOverride);
+    log(`[${agentName}] model=${model} num_ctx=${resolvedCtx ?? 'NONE (backend picks the window)'} (setting: ${ctxOverride || 'missing'})`);
     const modifiedFiles = new Set<string>();
     // Safety bounds — important for "unlimited" agents (maxIterations<=0) that also
     // hold powerful tools (e.g. Atlas with Bash): cap wall-clock time and keep an
     // absolute iteration ceiling so a misbehaving model can't loop forever burning
     // tokens or running shell. These are generous (real tasks finish well inside them).
-    const WALL_CLOCK_MS = 20 * 60 * 1000;  // 20 min hard time budget
+    const WALL_CLOCK_MS = 3 * 60 * 60 * 1000;  // 3 h hard time budget (supervisor + orchestrator steer/stop long before this)
     const HARD_CEILING = 500;              // absolute loop cap even when "unlimited"
     const cap = maxIterations > 0 ? maxIterations : HARD_CEILING;
     const deadline = Date.now() + WALL_CLOCK_MS;
-    // Give every sub-agent the current local time so time-based tools (e.g. the
-    // scheduler's schedule_task) can convert "in 5 minutes" into an absolute
-    // timestamp. Recomputed per delegation, so it never goes stale mid-session.
-    const nowLine = (() => {
-        const d = new Date();
-        const p = (n: number) => String(n).padStart(2, '0');
-        const localIso = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        return `Current local time: ${localIso} (${tz}). Convert any relative time (e.g. "in 5 minutes", "tomorrow 9am") into an absolute timestamp based on this.`;
-    })();
     // Per-agent reference library: the operator drops instructions + reference material into
     // data/agents/<agentName>/ (resolved against WORKSPACE_ROOT). We inject
     // <agentName>.md / instructions.md / README.md as extra system context ("doping"), and list
@@ -1610,7 +3554,6 @@ async function runSubAgent(
         try {
             const refRel = `data/agents/${agentName}`;
             const resolved = safeResolve(refRel);
-            if (!resolved.ok) return '';
             const dir = resolved.path;
             if (!fs.existsSync(dir)) return '';
             let instr = '', instrFile = '';
@@ -1641,10 +3584,14 @@ async function runSubAgent(
         } catch { return ''; }
     })();
     const messages: any[] = [
-        { role: 'system', content: `${systemPrompt}\n\n${nowLine}${agentRef}` },
+        { role: 'system', content: `${systemPrompt}${agentRef}` },
         { role: 'user', content: task }
     ];
     let lastContent = '';
+    let transientRetries = 0;  // transient provider errors get retries-with-backoff, not instant job death
+    let imageInputRefusals = 0; // 400 "does not support image input" — strip images + retry, once
+    let subIntentNudges = 0;   // announced-tool-action-without-call nudges (SUB_INTENT_RE), per run
+    let narrationNudges = 0;   // content-only-stream narration aborts (NARRATION_MAX_CHARS), per run
     const toolsRun: string[] = [];  // tools the sub-agent actually executed (fallback summary if it goes silent)
 
     log(`[${agentName}] Starting sub-agent: model=${model}, tools=${tools.length}, maxIter=${maxIterations > 0 ? maxIterations : '∞ (ceiling ' + HARD_CEILING + ')'}, task="${task.slice(0, 80)}"`);
@@ -1663,7 +3610,7 @@ async function runSubAgent(
     // schemas + task) already exceeds the model's num_ctx, ollama context-shifts
     // the FRONT of the prompt away — the model never sees its system prompt or
     // tool defs and emits garbage (observed 2026-07-03: subagent_ctx pinned to
-    // 4096 in the dashboard → iris/dexter returned "???…" and did nothing).
+    // 4096 in the dashboard → iris returned "???…" and did nothing).
     {
         const payloadChars = JSON.stringify(messages).length + JSON.stringify(tools).length;
         const estTokens = Math.round(payloadChars / 3.5);
@@ -1678,6 +3625,8 @@ async function runSubAgent(
             log(`[${agentName}] Wall-clock limit (${WALL_CLOCK_MS / 60000}m) reached after ${i} iteration(s) — stopping`);
             break;
         }
+        // Pick up interrupts written mid-turn (host soft-stop), then check.
+        drainInterruptOnly();
         // Check for interrupt signal
         if (interruptRequested) {
             log(`[${agentName}] Interrupt requested — stopping sub-agent`);
@@ -1687,27 +3636,212 @@ async function runSubAgent(
         // Per-job abort (set by stop_agent / orchestrator monitor)
         if (abortFlag?.aborted) {
             log(`[${agentName}] Per-job abort requested — stopping sub-agent after ${i} iteration(s)`);
-            break;
+            // Report the abort for what it is. Falling through to the
+            // iteration-ceiling tail below would tell the orchestrator the job
+            // "stopped at safety limit / task may be too large" — a fabricated
+            // failure that triggers a stop→re-delegate→stop churn loop.
+            const partial = lastContent ? ` Partial output before cancellation: "${lastContent.slice(0, 200)}".` : '';
+            return {
+                content: `${agentName} was CANCELLED externally (stop_agent) after ${i} iteration(s) — no failure, no limit hit.${partial} Tell the user it was cancelled. Retry at most once, only with a concrete fix.`,
+                modifiedFiles: [...modifiedFiles],
+            };
+        }
+        // Drain any orchestrator-injected nudges into the conversation so the
+        // model sees them on its next call. The orchestrator's nudge_agent tool
+        // pushes to abortFlag.nudges (the supervisor no longer pushes directly —
+        // it flags the orchestrator, which decides whether to nudge); runSubAgent
+        // is the only place that can reach the live `messages` array. splice(0)
+        // drains atomically.
+        if (abortFlag?.nudges && abortFlag.nudges.length > 0) {
+            const drained = abortFlag.nudges.splice(0);
+            for (const n of drained) messages.push({ role: 'user', content: n });
+            log(`[${agentName}] injected ${drained.length} orchestrator nudge(s)`);
         }
         writeStatus({ phase: agentName, label: `${agentName}: iteration ${i + 1} — thinking`, ts: Date.now() });
+
+        // ── Streaming ── Sub-agents stream (stream:true) like the orchestrator
+        // so a long file-write generation keeps bytes flowing — the connection
+        // is self-evidently alive and never brushes a fixed-duration wall. The
+        // old non-streaming provider.chat carried a 20-min hard abort that
+        // killed legitimate ~5-min generations (see memory atlas-fetch-failed-5min).
+        // A silence watchdog replaces the hard abort: each chunk resets the
+        // timer; a genuinely stuck/silent socket aborts and the transient
+        // retry below handles it. An active generation (chunks every ~25ms)
+        // resets the timer forever and never aborts. The budget is per-agent
+        // (AGENT_SILENCE_OVERRIDE above) — agents that emit large buffered
+        // tool calls on small local models need more than the 120s default.
+        // Two budgets: BEFORE the first chunk the allowance is generous
+        // (cloud models can spend minutes on prompt prefill before the first
+        // token — a 120s first-token cap killed glm jobs whose TTFT was
+        // legitimate and every retry re-paid the same silent prefill);
+        // AFTER the first chunk the normal silence budget applies.
+        // Declared outside the try so the catch can clear the timer on error.
+        const silenceController = new AbortController();
+        const SILENCE_MS = subAgentSilenceMs(agentName);
+        const FIRST_TOKEN_MS = Math.max(SILENCE_MS, 300_000);
+        let silenceTimer: any;
+        let gotFirstChunk = false;
+        const resetSilence = () => {
+            if (silenceTimer) clearTimeout(silenceTimer);
+            // Snapshot phase/armedAt at ARMING time — gotFirstChunk flips to true
+            // on the arming call itself, so reading it at fire time mislabels a
+            // 300s pre-first-token abort as a 120s post-first-chunk one.
+            const preFirstChunk = !gotFirstChunk;
+            const armedAt = Date.now();
+            const budgetMs = preFirstChunk ? FIRST_TOKEN_MS : SILENCE_MS;
+            silenceTimer = setTimeout(() => {
+                log(`[${agentName}] Stream silent for ${Math.round((Date.now() - armedAt) / 1000)}s (${preFirstChunk ? 'pre' : 'post'} first chunk, budget ${budgetMs / 1000}s) — aborting fetch`);
+                try { silenceController.abort(); } catch { /* already aborted */ }
+            }, budgetMs);
+            gotFirstChunk = true;
+        };
+        // Throttle the per-iteration progress status so a fast stream (~40 t/s)
+        // doesn't emit a status line per token; emit every ~400ms while generating.
+        let lastStatusAt = 0;
+        // Accumulate THIS iteration's streamed text so the throttled preview
+        // shows the output-so-far, not the fragment that happened to land on
+        // the tick. Slicing the current chunk emitted one word/character per
+        // status line, which flooded the progress ring (PROGRESS_MAX=40) and
+        // rendered as word-per-line in the Today feed's console. Tail of the
+        // accumulation = the newest words, so consecutive previews read as a
+        // growing transcript instead of unrelated fragments.
+        let iterContent = '';
+        let iterThinking = '';
+        // Narration watchdog state for THIS stream: narration is prose content
+        // with no tool call behind it. Tool-call fragments (m.tool_calls) mark a
+        // stream as action, however slow; their absence marks narration.
+        let narrationFired = false;
+        let streamToolCallSeen = false;
+        // Verbosity heartbeat state. Prompt eval emits no tokens, so onChunk
+        // below does not run during it: a ~12k-token prompt at ~490 tok/s is ~25s
+        // of total silence, and the Oversight row sits at "0 calls / idle" which
+        // reads as a hang. `waitTicker` ticks elapsed seconds until the first
+        // chunk arrives.
+        const stream = { firstChunk: false, ticker: null as any };
+        const onChunk = (chunk: any) => {
+            if (!stream.firstChunk) {
+                stream.firstChunk = true;
+                if (stream.ticker) { clearInterval(stream.ticker); stream.ticker = null; }
+            }
+            // stop_agent hard-kill: the abort flag is only checked at iteration
+            // boundaries, so a job cancelled mid-generation kept streaming —
+            // vulkan-cxei kept drafting in think-pass for minutes AFTER its
+            // stop_agent (2026-09-17), burning tokens on a dead job while the
+            // user watched "no tool calls". Abort the in-flight stream on the
+            // next chunk; the catch below exits as a cancellation, no retry.
+            if (abortFlag?.aborted) { try { silenceController.abort(); } catch { /* already aborted */ } return; }
+            resetSilence();
+            const m = chunk?.message;
+            if (!m) return;
+            if (m.thinking) iterThinking += String(m.thinking);
+            if (m.content) iterContent += String(m.content);
+            if (Array.isArray(m.tool_calls) && m.tool_calls.length) streamToolCallSeen = true;
+            // Narration watchdog: >NARRATION_MAX_CHARS of content with zero
+            // tool-call chunks means the model is writing prose instead of
+            // acting (atlas-10gs narrated a Reddit plan for minutes mid-stream;
+            // the intent nudge below only fires at stream END). Volume-based,
+            // not time-based: a slow local model emitting a big tool-call
+            // payload never trips it (tool_calls chunks arrive from the start),
+            // and thinking is exempt — only CONTENT counts. Abort the stream,
+            // inject an act-now nudge, and the catch retries the iteration
+            // immediately. Capped per run so a prose-happy model can't ping-pong.
+            if (!streamToolCallSeen && !narrationFired && iterContent.length > NARRATION_MAX_CHARS
+                && narrationNudges < NARRATION_MAX_NUDGES && !abortFlag?.aborted) {
+                narrationFired = true;
+                narrationNudges++;
+                abortFlag?.nudges?.push(`NUDGE: You have written ${iterContent.length} characters of prose this turn without a single tool call. In a sub-agent turn, prose is not progress. Either make the tool call that does the work NOW (in this turn), or — if the task is genuinely complete — end with a short final report of the result. Never narrate plans or describe actions instead of performing them.`);
+                log(`[${agentName}] Narration nudge ${narrationNudges}/${NARRATION_MAX_NUDGES}: ${iterContent.length} content chars, no tool-call chunks — aborting stream, retrying iteration ${i + 1}`);
+                writeStatus({ phase: agentName, label: `${agentName}: narration without action (${iterContent.length} chars) — nudging to act`, ts: Date.now() });
+                try { silenceController.abort(); } catch { /* already aborted */ }
+                return;
+            }
+            // Accumulate a capped streaming transcript on the job record so
+            // Oversight can show the live output / thinking / tool calls.
+            if (job) {
+                if (m.thinking) job.streamThinking = ((job.streamThinking || '') + m.thinking).slice(-800);
+                if (m.content) job.streamContent = ((job.streamContent || '') + m.content).slice(-1200);
+                if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+                    job.streamTools = m.tool_calls.map((t: any) => ({
+                        name: t.function?.name || '?',
+                        args: shortArgs(t.function?.arguments),
+                        t: Date.now(),
+                    })).slice(-12);
+                }
+            }
+            const now = Date.now();
+            if (now - lastStatusAt > 400) {
+                lastStatusAt = now;
+                if (job) job.streamAt = now;
+                // Prefer content; fall back to thinking when the iteration
+                // has only reasoned so far. Whitespace-collapsed tail slice.
+                const acc = (iterContent || iterThinking).replace(/\s+/g, ' ').trim();
+                const preview = acc.slice(-60);
+                // Carry the jobsList on the throttled stream status so
+                // Oversight's rows (and their output scrollby) refresh
+                // DURING a generation — emitJobsStatus only fires on job
+                // start and tool calls, so a long zero-tool-call think-pass
+                // froze the Oversight row at "starting… 0 calls" while
+                // tokens streamed (looked dead, 2026-09-17).
+                if (preview) writeStatus({ phase: agentName, label: `${agentName}: iteration ${i + 1} — ${iterContent ? 'generating' : 'thinking'} ${preview}`, ts: now, jobsList: currentJobsList() });
+            }
+        };
         try {
             const provider = getProvider();
-            // Trim history to fit context budget before each chat call.
-            const trimmed = trimMessagesToBudget(messages, SUBAGENT_MSG_BUDGET_CHARS);
-            if (trimmed.length !== messages.length) messages.length = 0, messages.push(...trimmed);
-            const chatResult = await provider.chat({
+            resetSilence();
+            const waitStartedAt = Date.now();
+            stream.ticker = setInterval(() => {
+                if (stream.firstChunk) return;
+                const secs = Math.round((Date.now() - waitStartedAt) / 1000);
+                writeStatus({
+                    phase: agentName,
+                    label: `${agentName}: iteration ${i + 1} — waiting on the model (${secs}s; prompt eval, no tokens yet)`,
+                    ts: Date.now(),
+                    jobsList: currentJobsList(),
+                });
+            }, 2000);
+            // Granite reasons on its own, so the forced first-iteration think
+            // pass is pure cost: the whole turn goes into the think channel and
+            // comes back with no content and no tool call, which the loop below
+            // scores as a dead turn and ends the job ("produced no output and
+            // ran no tools" twice in a row, 2026-09-18 14:09 and 14:11). The
+            // flag was written for models that needed a planning nudge; granite
+            // plans inside its normal turn and acts in the same one.
+            const forcedFirstThink = (agentName === 'atlas' || agentName === 'vulkan') && i === 0 && !GRANITE_MODEL_RE.test(model);
+            const subThink = forcedFirstThink || modelRequiresThink(model);
+            const chatResult = await provider.chatStream({
                 model,
                 messages,
                 tools,
-                options: { num_predict: 65536, temperature, num_ctx: getNumCtx(model, ctxOverride) },
-                keep_alive: subAgentKeepAlive(agentName),
-                // Only send think:true for models that support it — Ollama returns
-                // an error for non-thinking models (e.g. granite) with think:true.
-                think: modelRequiresThink(model),
+                options: { num_predict: maxOutput('subagent'), temperature, num_ctx: resolvedCtx, ...qwenSampling(model, subThink), ...graniteSampling(model) },
+                keep_alive: keepAliveFor(model, subAgentKeepAlive(agentName)),
+                // First iteration lets atlas/vulkan think/plan before acting — a
+                // planning step up front stops it diving into a read-edit-read-edit
+                // re-reading loop (it decides what it needs once, then reads each
+                // file a single time). Later iterations keep think off to preserve
+                // context for the visible answer. kimi and other leak-when-disabled
+                // models keep think on every request.
+                think: subThink,
                 ...(format !== undefined ? { format } : {}),
-            });
+                signal: silenceController.signal,
+            }, onChunk);
+            clearTimeout(silenceTimer);
+            if (stream.ticker) { clearInterval(stream.ticker); stream.ticker = null; }
 
             const data = { message: chatResult.message, usage: chatResult.usage } as any;
+
+            // Surface the sub-agent's thinking as a thinking phase in the Live
+            // Activity panel. provider.chat() is non-streaming, so the whole chain
+            // arrives at once in data.message.thinking — but it was being discarded,
+            // so atlas/vulkan's first-turn plan was invisible (the orchestrator
+            // streams its own thinking live via appendStatus({phase:'thinking'});
+            // sub-agents didn't). Show it the same way: a thinking status line with
+            // a cleaned preview of the chain.
+            const subThinking = String(data.message?.thinking ?? '').trim();
+            if (subThinking) {
+                const preview = subThinking.replace(/\s+/g, ' ').trim().slice(0, 280);
+                writeStatus({ phase: 'thinking', label: `${agentName} thinking: ${preview}`, ts: Date.now() });
+                log(`[${agentName}] thinking (${subThinking.length} chars): ${preview}`);
+            }
 
             if (data.message?.tool_calls?.length) {
                 // Capture any text emitted alongside tool calls, for a useful partial
@@ -1717,6 +3851,7 @@ async function runSubAgent(
                 messages.push(data.message);
 
                 // Execute each tool call
+                let lastToolResult = '';
                 for (const tc of data.message.tool_calls) {
                     const name = tc.function?.name;
                     const args = tc.function?.arguments || {};
@@ -1743,42 +3878,95 @@ async function runSubAgent(
                         })();
                         try {
                             const result = await executeXmlTool(name, args, toolContext, modifiedFiles);
-                            const truncated = truncateToolResult(name, result);
-                            messages.push({ role: 'tool', content: untrustedContextMessage(truncated) });
+                            const truncated = truncateToolResult(name, result, toolResultMaxChars(agentName));
+                            lastToolResult = truncated;
+                            const toolMsg: any = { role: 'tool', content: untrustedContextMessage(truncated) };
+                            if (BROWSER_SNAPSHOT_RESULT_TOOLS.has(name)) BROWSER_SNAPSHOT_MSGS.add(toolMsg);
+                            messages.push(toolMsg);
                             if ((name === 'Write' || name === 'Edit') && args.file_path && !result.startsWith('Error'))
                                 modifiedFiles.add(args.file_path);
                             onToolCall(name, argSummary, truncated.slice(0, 200));
                         } catch (err: any) {
+                            lastToolResult = `Error: ${err.message}`;
                             messages.push({ role: 'tool', content: `Error: ${err.message}` });
                             onToolCall(name, argSummary, `Error: ${err.message}`.slice(0, 200));
                         }
                     } else {
                         try {
                             const result = await executeXmlTool(name, args, toolContext, modifiedFiles);
-                            const truncated = truncateToolResult(name, result);
-                            messages.push({ role: 'tool', content: untrustedContextMessage(truncated) });
+                            const truncated = truncateToolResult(name, result, toolResultMaxChars(agentName));
+                            lastToolResult = truncated;
+                            const toolMsg: any = { role: 'tool', content: untrustedContextMessage(truncated) };
+                            if (BROWSER_SNAPSHOT_RESULT_TOOLS.has(name)) BROWSER_SNAPSHOT_MSGS.add(toolMsg);
+                            messages.push(toolMsg);
                             if ((name === 'Write' || name === 'Edit') && args.file_path && !result.startsWith('Error'))
                                 modifiedFiles.add(args.file_path);
                         } catch (err: any) {
+                            lastToolResult = `Error: ${err.message}`;
                             messages.push({ role: 'tool', content: `Error: ${err.message}` });
                         }
                     }
                 }
+                // Multi-call agents still stop early when the model writes its
+                // final line instead of a tool call. Agents capped at 1
+                // iteration (none currently; iris was raised to 3 on
+                // 2026-09-15) return the last tool result directly.
+                if (cap <= 1) {
+                    const ran = [...new Set(toolsRun)];
+                    const content = lastToolResult.trim()
+                        || (ran.length ? `Done. Actions taken: ${ran.join(', ')}.` : 'Task completed (no response)');
+                    log(`[${agentName}] Single-shot: returning after 1 tool call (${ran.join(', ') || 'none'})`);
+                    return { content, modifiedFiles: [...modifiedFiles] };
+                }
                 // Sub-agent vision: drain any images queued by Read/webcam_capture
                 // so the model sees them on the next iteration. Sub-agents are
                 // otherwise blind to _pendingImages (only the orchestrator's loop
-                // drained it). Mirrors the orchestrator's mid-loop drain.
+                // drained it). Mirrors the orchestrator's mid-loop drain — but
+                // only when the agent's context can actually hold them: an image
+                // the pinned head can't fit turns the next request into a 400
+                // that kills the whole job (vulkan-7qm8, iteration 43).
                 const _pi = (globalThis as any)._pendingImages;
                 if (Array.isArray(_pi) && _pi.length > 0) {
-                    messages.push({ role: 'user', content: '[The image(s) from the Read/webcam_capture tool are now visible in this message.]', images: _pi } as any);
                     (globalThis as any)._pendingImages = [];
+                    const imgBudget = subAgentMsgBudgetChars(model, ctxOverride, estimateMessagesChars([messages[0]!]), JSON.stringify(tools).length);
+                    if (imagesFitBudget(messages, _pi.length, imgBudget) && !MODELS_WITHOUT_VISION.has(model)) {
+                        messages.push({ role: 'user', content: '[The image(s) from the Read/webcam_capture tool are now visible in this message.]', images: _pi } as any);
+                    } else {
+                        const why = MODELS_WITHOUT_VISION.has(model) ? 'this model cannot see images' : 'the conversation is near the context limit and adding them would exceed it (the job would fail)';
+                        log(`[${agentName}] Image drain: ${_pi.length} image(s) NOT attached (${why}) — keeping the job alive`);
+                        // Visionless seat: don't just drop the image — have a
+                        // vision-capable model describe it so the job keeps its
+                        // eyes (the operator's design: glm seats can't see, so a
+                        // dedicated vision model answers questions about the
+                        // image). The agent can follow up via query_image.
+                        let visionReport = '';
+                        if (MODELS_WITHOUT_VISION.has(model)) {
+                            const vision = await askVisionModel(_pi,
+                                `An agent whose model cannot see images Read this image while working on the task: "${String(task).slice(0, 400)}". Describe factually and concretely what the image shows — layout, colors, any visible text, UI state — so that agent can continue its work without seeing it. Answer directly, no preamble.`);
+                            if (vision.ok && vision.answer) {
+                                visionReport = vision.answer;
+                                log(`[${agentName}] Vision report: "${visionReport.slice(0, 120)}"`);
+                            } else {
+                                log(`[${agentName}] Vision report failed: ${vision.error || 'no content'}`);
+                            }
+                        }
+                        messages.push({ role: 'user', content: visionReport
+                            ? `[The image(s) you Read were NOT attached (${why}) — a vision-capable model analyzed them for you:\n\n${visionReport}\n\nFor follow-up questions about the image, call query_image with its file_path and a specific question. Do not Read the image again. Finish the task.]`
+                            : `[The image(s) you Read were NOT attached: ${why}. Do not Read the image again. Continue from what you already know — verify files by reading their TEXT via Read/Grep/Bash — and finish the task.]` });
+                    }
                 }
             } else {
                 // Final text response. If the model went silent, synthesize a summary
                 // from the tools it ran so the orchestrator never gets a blank result.
+                // A turn with NO tools and NO text is not "completed" — it is a
+                // silent failure (observed 2026-09-02: fine-tuned iris emitted an
+                // empty turn on a reminder+calendar pair request). Report it as an
+                // error, like the degenerate-output guard below, so the orchestrator
+                // does not relay a fake success to the user.
                 const ran = [...new Set(toolsRun)];
                 const content = (data.message?.content || '').trim()
-                    || (ran.length ? `Done. Actions taken: ${ran.join(', ')}.` : 'Task completed (no response)');
+                    || (ran.length ? `Done. Actions taken: ${ran.join(', ')}.`
+                        : `Error: the ${agentName} sub-agent produced no output and ran no tools — the task did not happen. Tell the user it failed or retry with a clearer brief; do not claim success.`);
                 // Degenerate-result guard: pure punctuation / symbol soup (e.g. 31
                 // "?"s from a context-clamped granite, 2026-07-03) must reach the
                 // orchestrator as an ERROR — it was being relayed as ✅ success and
@@ -1791,6 +3979,30 @@ async function runSubAgent(
                         modifiedFiles: [...modifiedFiles],
                     };
                 }
+                // Announced-intent guard (looping agents only): a text-only turn
+                // that ANNOUNCES the next tool action ("Now write index.html…")
+                // is an unfulfilled promise, not a final answer — without this,
+                // runSubAgent completes the job with the deliverable unwritten.
+                // Exemptions mirror the orchestrator's guard: single-shot agents
+                // (cap <= 1) legitimately end on text; a reply carrying the
+                // actual deliverable (fenced code) or asking a question is final;
+                // short replies only — long prose is a report. One carve-in: a
+                // promise that NAMES a file it will write (SUB_INTENT_FILE_WRITE_RE)
+                // is nudged regardless of length or fences — the deliverable of a
+                // file task lives on disk, never in the reply text.
+                if (cap > 1 && subIntentNudges < SUB_INTENT_MAX_NUDGES && i + 1 < cap) {
+                    const subIntentMatch = content.match(SUB_INTENT_RE);
+                    const fileWritePromise = SUB_INTENT_FILE_WRITE_RE.test(content);
+                    if (subIntentMatch && !content.trim().endsWith('?')
+                        && (fileWritePromise || (!/```/.test(content) && content.length < 600))) {
+                        subIntentNudges++;
+                        const announcement = subIntentMatch[0].slice(0, 120);
+                        log(`[${agentName}] Intent nudge ${subIntentNudges}/${SUB_INTENT_MAX_NUDGES}: announced tool action without a tool call: "${announcement}"`);
+                        writeStatus({ phase: agentName, label: `${agentName}: pushing announced-but-unmade action back into the loop`, ts: Date.now() });
+                        messages.push({ role: 'user', content: `You wrote "${announcement}" but made no tool call — that action never happened. Do it NOW with your tools (make the call in this turn), or, if the task is already complete, reply with the final result only. Never end by announcing future work.` });
+                        continue;
+                    }
+                }
                 log(`[${agentName}] Done after ${i + 1} iteration(s): "${content.slice(0, 100)}"`);
                 // Do NOT unload this agent's model here. The GPU holds the
                 // orchestrator + one sub-agent resident simultaneously, and
@@ -1800,8 +4012,66 @@ async function runSubAgent(
                 return { content, modifiedFiles: [...modifiedFiles] };
             }
         } catch (err: any) {
-            log(`[${agentName}] Error on iteration ${i + 1}: ${err.message}`);
-            return { content: `${agentName} error: ${err.message}\n\n(System note: tell the user in plain language that this step failed and what you'll try instead — do not paste this raw error into your reply.)`, modifiedFiles: [] };
+            clearTimeout(silenceTimer);
+            if (stream.ticker) { clearInterval(stream.ticker); stream.ticker = null; }  // release the silence watchdog on any throw
+            const errMsg = err?.message || String(err);
+            // stop_agent fired mid-generation (onChunk hard-killed the stream
+            // above). Exit as a cancellation with the same message shape the
+            // loop-top check uses — do NOT fall into the transient-retry path
+            // (the aborted-fetch error matches its "abort" pattern and would
+            // sleep 8s then re-check).
+            if (abortFlag?.aborted) {
+                log(`[${agentName}] Stream aborted mid-generation by stop_agent after ${i} iteration(s)`);
+                const partial = lastContent ? ` Partial output before cancellation: "${lastContent.slice(0, 200)}".` : '';
+                return {
+                    content: `${agentName} was CANCELLED externally (stop_agent) after ${i} iteration(s) — no failure, no limit hit.${partial} Tell the user it was cancelled. Retry at most once, only with a concrete fix.`,
+                    modifiedFiles: [...modifiedFiles],
+                };
+            }
+            // Narration watchdog fired mid-stream (onChunk above): the aborted
+            // fetch lands here. Retry the SAME iteration immediately — the
+            // nudge was pushed to abortFlag.nudges and drains at the loop top.
+            // Must precede the transient-retry path: the abort error matches
+            // its "abort" pattern and would otherwise burn an 8s backoff.
+            if (narrationFired && !abortFlag?.aborted) {
+                i--; continue;
+            }
+            // A 400 "this model does not support image input" means an image
+            // reached a visionless model (e.g. glm-5.3:cloud killed both
+            // vulkan-7qm8 and vulkan-gdpo this way, 2026-09-03). That must NOT
+            // kill the job: learn the model, strip every image from the
+            // conversation (leave a text note in place), and retry the
+            // iteration text-only. The one-shot counter guards against a
+            // backend that keeps refusing even with no images attached.
+            if (/does not support image input/i.test(errMsg) && imageInputRefusals < 1) {
+                imageInputRefusals++;
+                MODELS_WITHOUT_VISION.add(model);
+                let stripped = 0;
+                for (const m of messages) {
+                    if (Array.isArray((m as any)?.images)) {
+                        (m as any).content = '[The image(s) in this message were removed: this model cannot see images. Continue text-only.]';
+                        delete (m as any).images;
+                        stripped++;
+                    }
+                }
+                log(`[${agentName}] Model "${model}" does not support image input — stripped images from ${stripped} message(s), retrying text-only (not fatal)`);
+                i--; continue;
+            }
+            // Transient provider failures (ollama mid-restart, the model still
+            // loading into VRAM, a socket blip) must NOT kill the job on contact
+            // — one 500 during a qwen reload cost a whole job plus ~2 min of
+            // orchestrator failure-report/re-delegate churn (2026-08-21). Retry
+            // the same iteration with backoff instead.
+            const transient = /overloaded|rate.?limit|Service Unavailable|HTTP 5\d\d|\b50[023]\b|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|timeout|Stream silent|terminated|abort/i.test(errMsg);
+            if (transient && transientRetries < 3) {
+                transientRetries++;
+                const backoffS = [8, 20, 40][transientRetries - 1];
+                log(`[${agentName}] Transient provider error on iteration ${i + 1} (${errMsg.slice(0, 120)}) — retry ${transientRetries}/3 in ${backoffS}s`);
+                await new Promise((r) => setTimeout(r, backoffS * 1000));
+                i--; continue;  // retry the same iteration
+            }
+            log(`[${agentName}] Error on iteration ${i + 1}: ${errMsg}`);
+            return { content: `${agentName} error: ${errMsg}\n\n(System note: if this error names a fixable cause, re-delegate once with the fix; otherwise tell the user it failed, in plain words. Never paste the raw error.)`, modifiedFiles: [] };
         }
     }
     // Hit the iteration ceiling or the wall-clock deadline without a clean finish.
@@ -1819,8 +4089,8 @@ interface ContainerInput {
     chatJid: string;
     isMain: boolean;
     isScheduledTask?: boolean;
-    /** When set (e.g. 'oculus'), main() runs that sub-agent directly instead
-     *  of the orchestrator loop — used for the background security agent. */
+    /** When set (e.g. 'sentry'), main() runs that sub-agent directly instead
+     *  of the orchestrator loop — used for the background security scanner. */
     agent?: string;
     assistantName?: string;
     voiceAttachments?: Array<{ relativePath: string; mediaType: string }>;
@@ -1829,19 +4099,29 @@ interface ContainerInput {
     vulkanModel?: string;
     // Per-agent models — every agent has its own concrete model (no blank, no
     // runtime fallback). The host resolves each from its router_state key.
-    byteModel?: string;
-    dexterModel?: string;
     irisModel?: string;
     artemisModel?: string;
+    sentryModel?: string;
     drivingForce?: string;
     contextClearAt?: string;
-    orchestratorModel?: string;
     councilSkepticModel?: string;
     councilPragmatistModel?: string;
     councilSynthesistModel?: string;
+    supervisorModel?: string;
+    supervisorEnabled?: boolean;
+    /** Default apps (capability -> 'builtin' | 'mcp:<server>'), from Settings.
+     *  Seeded into DEFAULT_APPS at boot so the seat gate is right on turn one. */
+    defaultApps?: Record<string, string>;
+    /** Pinned tools (router_state local:pinned_tools via the host) — exempt
+     *  from RAG ranking. May name MCP tools by full wire name. */
+    pinnedTools?: string[];
     userId?: string;
     userKeyId?: string;
     verbose?: boolean;
+    /** Autonomous background turn (the BotNet sweep): processed normally, but
+     *  its prompt and output must NOT persist into the seat's live conversation —
+     *  rolled back out of `messages` when the turn ends. Mirrors AgentInput.sideTurn. */
+    sideTurn?: boolean;
     showThinking?: boolean | string;
     memoryContext?: string;
     activeIdea?: string;
@@ -1856,14 +4136,31 @@ async function runNativeOllama(input: ContainerInput) {
     // Warm-runner window: inherited from data/env/env via the orchestrator's
     // process.env. Falls back to 30 minutes when unset or invalid.
     const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT || '', 10) || 30 * 60 * 1000;
+    // Headers-phase (time-to-first-byte) timeout: only the pre-headers window.
+    // Once headers arrive, the silence watchdog (90s/180s) + MAX_STREAM_DURATION_MS
+    // (10min) guard against genuinely stuck streams, so a larger TTFB only
+    // affects the wait for the first response byte. A local qwen3.8:27b cold
+    // reprocess of a ~22-24k-token prompt (SWA cache miss + model load) needs
+    // ~130s observed; default 180s for margin without making a stalled
+    // cloud-proxied request hang too long. Was hardcoded 120s, which fired on
+    // cold reprocess → 499. Env-tunable via ORCHESTRATOR_HEADERS_TIMEOUT_MS.
+    const HEADERS_TIMEOUT_MS = Math.max(
+        30_000,
+        parseInt(process.env.ORCHESTRATOR_HEADERS_TIMEOUT_MS || '', 10) || 180_000,
+    );
     const MAX_TOOL_ITERATIONS = 200;
 
     const MAX_STREAM_DURATION_MS = 10 * 60 * 1000; // 10 min total per stream
     const verbose = input.verbose !== false;
     // Thinking mode: 'max' keeps thinking on every iteration; 'true' only on the
     // first planning turn; anything else lets the model decide per request.
-    const thinkingMode = String(input.showThinking || '');
-    const showThinking = thinkingMode === 'true' || thinkingMode === 'max';
+    // Thinking is a SETTING (dashboard row thinking:<jid>), so read every form
+    // the row can hold. It stores "1"; the old test accepted only "true" and
+    // "max", so a switched-on setting read as off and thinking never ran —
+    // whatever the user had chosen.
+    const thinkingMode = String(input.showThinking ?? '').trim().toLowerCase();
+    const thinkingAlways = thinkingMode === 'max';
+    const showThinking = thinkingAlways || ['1', 'true', 'on', 'yes'].includes(thinkingMode);
     log(`Using ${API_PROXY_URL ? 'proxy' : 'Ollama'}: ${API_PROXY_URL || OLLAMA_URL}`);
     log(`Idle timeout: ${IDLE_TIMEOUT_MS / 1000 / 60} minutes`);
     // Orchestrator sees: every tool not owned by a sub-agent (plus shared tools), and one delegate stub per sub-agent.
@@ -1871,11 +4168,11 @@ async function runNativeOllama(input: ContainerInput) {
         type: 'function',
         function: {
             name: 'atlas_background',
-            description: 'Legacy alias of atlas (which now runs async by default). Starts a background Atlas job whose result arrives in your inbox. Prefer calling atlas directly.',
+            description: JSON.stringify({ what: 'background copy of yourself, your model and tools', use_when: 'work too long for one chat turn', returns: 'result to your inbox; you keep talking', finishable_now: 'do it yourself' }),
             parameters: {
                 type: 'object',
                 properties: {
-                    task: { type: 'string', description: 'What the USER wants done: the goal plus only the facts the agent cannot guess (file paths, URLs, names, dates, IDs, the exact outcome). Intent only — never steps, where to look, how to code, or tool names.' },
+                    task: { type: 'string', description: 'What the USER wants done: the goal plus only the facts the agent cannot guess (file paths, URLs, names, dates, IDs, the exact outcome). Intent only — never steps, where to look, how to code, or tool names. Worth backgrounding: minutes of browsing, a multi-step build.' },
                     urgent: { type: 'boolean', description: 'Inject the result into your context immediately when it finishes, even mid-task (default false).' },
                 },
                 required: ['task'],
@@ -1889,128 +4186,212 @@ async function runNativeOllama(input: ContainerInput) {
             description: 'Read the full stored output of a finished background job from your inbox (e.g. when the user asks for the raw result, or a preview was truncated). Call with no job_id to list all stored results.',
             parameters: {
                 type: 'object',
-                properties: { job_id: { type: 'string', description: 'Job id like "atlas-4f2a". Omit to list available results.' } },
+                properties: { job_id: { type: 'string', description: 'The job id exactly as your inbox entry for that finished job printed it. Omit to list available results, then read the id from that list.' } },
                 required: [],
             },
         },
     };
-    const ATLAS_DIRECT_TOOL_DEF = {
+    const REPORT_TASK_FAILURE_TOOL_DEF = {
         type: 'function',
         function: {
-            name: 'atlas_direct',
-            description: 'Hand the user straight to Atlas for a direct conversation. Use when the user explicitly asks to talk to Atlas directly, work with Atlas one-on-one, or refine a task with Atlas before it runs. After you call this, end your turn with one short line telling the user they are now talking to Atlas directly. From then on their messages go straight to Atlas (it can ask questions to get the task right) until they say "go" (Atlas starts the work in the background) or "back to Warden" (exit). You do NOT see or relay that conversation — Atlas runs it.',
-            parameters: { type: 'object', properties: {}, required: [] },
+            name: 'report_task_failure',
+            description: JSON.stringify({ what: 'record a finished job as PROVEN failed: its result shows the deliverable wrong or missing', when: 'before you re-delegate', budget: 'one automatic retry, then the runner refuses' }),
+            parameters: {
+                type: 'object',
+                properties: {
+                    task: { type: 'string', description: 'The failed task, as it was delegated.' },
+                    reason: { type: 'string', description: 'What proved it failed — the evidence from the result. A deliverable that is merely hard to see from the text is not proven failed; the retry budget is one dispatch, consumed on the next re-delegation.' },
+                },
+                required: ['task', 'reason'],
+            },
         },
     };
     const fullToolDefs = stripTier([
-        ...registry.getDefinitions(
-            registry.getAllToolNames().filter(n =>
-                !SUBAGENT_OWNED.has(n) || ORCHESTRATOR_SHARED_TOOLS.has(n)
-            )
-        ),
-        ...SUBAGENTS.map(delegateToolDef),
+        ...registry.getDefinitions([
+            // Atlas is this seat, so atlas-owned tools come through as its own.
+            ...registry.getAllToolNames().filter(n =>
+                !SUBAGENT_OWNED.has(n) || ORCHESTRATOR_SHARED_TOOLS.has(n) || ATLAS_OWNED.has(n)),
+        ]),
+        // No atlas delegate stub and no atlas_direct: this seat IS atlas, so
+        // there is nothing to hand local work to and no one to be handed to.
+        // vulkan / iris / artemis / sentry stubs remain — the real escalations.
+        ...SUBAGENTS.filter(s => s.delegate !== 'atlas').map(delegateToolDef),
         COUNCIL_TOOL_DEF,
         COUNCIL_STATUS_TOOL_DEF,
+        // Kept: a background copy of itself, for work too long for a chat turn.
         ATLAS_BACKGROUND_TOOL_DEF,
-        ATLAS_DIRECT_TOOL_DEF,
         READ_JOB_RESULT_TOOL_DEF,
+        REPORT_TASK_FAILURE_TOOL_DEF,
     ]);
-    // RAG-style dynamic tool selection: each turn, extract keywords from the
-    // conversation and rank the non-core tools by relevance, surfacing only the
-    // top-K to the model. This helps most when the user's prompt is vague or
-    // poorly specified — the keyword match still pulls in the right tools so the
-    // orchestrator can act instead of stalling. Core routing tools (sub-agents,
-    // Bash, Read, history, etc.) are always included; everything else is ranked.
-    const ALWAYS_INCLUDED_TOOLS = new Set<string>([
-        ...SUBAGENTS.map(s => s.delegate),
-        'council',
-        'council_status',
-        'atlas_background',
-        'atlas_direct',
-        'read_job_result',
-        'Read', 'get_chat_history', 'attach_file', 'clear_context', 'fabric_pattern',
-        'api_request', 'list_api_keys',
-        // Vision captures are orchestrator-only (sub-agents can't see images —
-        // _pendingImages is consumed only by runNativeOllama). desktop_screenshot,
-        // webcam_capture, and read_image are ALL keyword-gated via the dynamic
-        // top-K now. Always-exposing desktop_screenshot/webcam_capture let the
-        // small model grab them for unrelated requests — e.g. "show me my emails"
-        // matched the desktop_screenshot description ("use this to SEE a native
-        // desktop app") and the model took a screenshot instead of delegating to
-        // iris. They stay in ORCHESTRATOR_SHARED_TOOLS (so the SUBAGENT_OWNED
-        // filter doesn't strip them from the ranked pool) but are no longer
-        // always-on: they surface only when the user's words match (screen,
-        // screenshot, see, webcam, photo, camera, room).
-        // Orchestrator → Oculus direct line (registered by awareness-tools.ts,
-        // toolset 'chat'). Always exposed so presence/schedule notes from the
-        // user reach Oculus regardless of the dynamic top-K ranking.
-        'tell_oculus',
-        // Read-only latest AWARENESS data (is_known/label, counts, occupancy
-        // duration) for the webcam-vision skill. Always exposed so a vision
-        // question can combine a webcam_capture photo with Oculus's context.
-        'awareness_status',
-        // Live Oculus status query: spawns Oculus synchronously so it can decide
-        // the CURRENT room state instead of returning stale cached rows.
-        'oculus_query',
-    ]);
-    const DYNAMIC_TOOL_TOP_K = 5;
+    // Core base is always sent; RAG lives in mergeSkillTools.
     let activeToolDefs = fullToolDefs;
     function refreshActiveToolDefs() {
-        try {
-            const keywords = extractKeywords(messages);
-            if (keywords.length === 0) {
-                // Conversational turn (no extractable keywords — "hey", "thanks",
-                // "ok", etc.): don't dump the full 36-tool catalog at a small model.
-                // It hallucinates tool calls when it has nothing real to act on
-                // (the read_image parrot-path bug came from a tool being exposed on
-                // a trivial turn). Send an EMPTY base here; mergeSkillTools() still
-                // layers in the always-on "core" builtin skill on top — so the model
-                // sees only list_skills / activate_skill / deactivate_skill /
-                // install_mcp_server / create_skill + basic read/write/list_file. It
-                // can chat freely or pull in a skill, but sees no routing or hands-on
-                // tools it has no reason to call.
-                activeToolDefs = [];
-                log(`Tools: minimal (conversational — no keywords; skill meta-tools only via core skill)`);
-                return;
-            }
-            const coreDefs = fullToolDefs.filter((d: any) => ALWAYS_INCLUDED_TOOLS.has(d.function?.name));
-            const restDefs = fullToolDefs.filter((d: any) => !ALWAYS_INCLUDED_TOOLS.has(d.function?.name));
-            const rankedNames = new Set(rankTools(restDefs, keywords, DYNAMIC_TOOL_TOP_K));
-            if (rankedNames.size === 0) {
-                // Keywords existed but matched no tool — effectively still
-                // conversational. Same treatment as the no-keyword path: don't
-                // dump all 36 at the small model. Empty base; mergeSkillTools()
-                // layers in the always-on core skill meta-tools only.
-                activeToolDefs = [];
-                log(`Tools: minimal (nothing ranked — skill meta-tools only via core skill)`);
-                return;
-            }
-            activeToolDefs = [...coreDefs, ...restDefs.filter((d: any) => rankedNames.has(d.function?.name))];
-            log(`Tools: ${activeToolDefs.length} of ${fullToolDefs.length} selected (dynamic)`);
-        } catch (err: any) {
-            log(`Warning: dynamic tool selection failed (${err?.message || err}) — using full list`);
-            activeToolDefs = fullToolDefs;
-        }
+        activeToolDefs = fullToolDefs;
+        log(`Tools: ${fullToolDefs.length} core tool defs (always sent)`);
     }
-    /** Merge skill-layer tools (always-on core + active skill tools) into the active tool list. Dedupes by name. */
+    // ─── The orchestrator's hands: ONE definition, used twice ───────────
+    // This gate decides what the orchestrator may touch directly, and the
+    // `# YOUR OWN HANDS` line in its prompt is GENERATED from the same
+    // predicate. That is deliberate: every prompt-vs-tool-list bug this file
+    // has collected (browser tools it was told it didn't have and used anyway;
+    // a shell the prompt promised and the gate stripped for six days; an MCP
+    // tool named one way in prose and another on the wire) comes from a human
+    // maintaining a capability claim in prose next to the code that grants it.
+    // Generated from the gate, the claim cannot drift — it is the gate.
+    //
+    // What the orchestrator may touch DIRECTLY is a one-shot local action
+    // (Bash, Read, open_app, media, volume) — see ORCHESTRATOR_SHARED_TOOLS.
+    // Everything else is a specialist's.
+    //
+    // Bash was blocked here from 2026-07-27 ("shell → Atlas"), and the
+    // 2026-09-12 one-shot migration handed the orchestrator Bash without
+    // removing it — so for six days the prompt promised a shell the gate
+    // silently stripped, and the sibling comment in executeXmlTool already said
+    // "Bash is NO LONGER blocked". The 2026-09-12 decision is the newer one and
+    // the right one: a status check is one tool call, and spawning a background
+    // specialist to run `systemctl is-active` is heavier and slower. Bash came
+    // out of the blocked set 2026-09-18.
+    //
+    // WebSearch/WebFetch went IN on 2026-09-18 (the web removal): dropping them
+    // from ORCHESTRATOR_SHARED_TOOLS keeps them out of the ranked base, but an
+    // active skill can still carry them in through the skill layer, and a tool
+    // the model can see is a tool it will call. (2026-09-19: the CDP browser
+    // toolset they once rode with is retired below — the web tools remain,
+    // they need no browser.)
+    // The seat IS atlas (mcpServers ['*']): every connected MCP tool is a seat
+    // tool. Visibility within MCP is the RAG layer's job, not this gate's.
+    const orchToolBlocked = (_n: string): boolean => false;
+
+    /** Merge skill-layer tools into the core base. Only discovery, delegation
+     *  bookkeeping and user pins are always in; everything else (core
+     *  file/bash/meta, MARM, default-app providers) competes in the RAG pool,
+     *  top-K by turn keywords. */
+    let ragCache: { key: string; ranked: any[] } | null = null;
     function mergeSkillTools(): any[] {
-        // The orchestrator only orchestrates — it delegates hands-on work to
-        // sub-agents. Block every tool that lets it act directly on the host or
-        // browser: mcp__* (browser/MCP/desktop → Atlas), Bash (shell → Atlas),
-        // and ping_user (legacy, unused). This is the final gate before tools
-        // are sent to the model, so it covers both the activeToolDefs base and
-        // skill-layer extras regardless of how the tools entered.
-        const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['Bash', 'ping_user']);
         const blocked = (t: any) => {
             const n = t?.function?.name;
-            return typeof n === 'string' && (n.startsWith('mcp__') || BLOCKED_ORCHESTRATOR_TOOLS.has(n));
+            return typeof n === 'string' && orchToolBlocked(n);
         };
-        const base = (activeToolDefs as any[]).filter((t) => !blocked(t));
         const skillTools = (skillToolDefs() as any[]).filter((t) => !blocked(t));
-        if (skillTools.length === 0) return base;
-        const seen = new Set(base.map((t) => t.function?.name));
-        const extras = skillTools.filter((t) => !seen.has(t.function?.name));
-        return [...base, ...extras];
+        const activeFiltered = (activeToolDefs as any[]).filter((t) => !blocked(t));
+        const nameOf = (t: any) => String(t?.function?.name || '');
+        // The CURRENT ask, not a messages scan. This runs BEFORE this turn's
+        // user message is pushed, so the scan picked up an EARLIER user turn.
+        const lastUserText = lastUserAsk
+            || (() => {
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i]?.role === 'user') return String(messages[i].content || '');
+                }
+                return '';
+            })();
+        CURRENT_ASK = lastUserText;
+        // RAG gates the WHOLE menu. Core file/bash/meta tools, MARM and
+        // default-provider MCP all compete on relevance like everything else —
+        // nothing is exempt except what the user pinned (a pin is a deliberate
+        // "always show me this" of one or two tools, not a bucket). A greeting
+        // or small-talk turn matches no tool description, so it ranks nothing
+        // and the seat gets a near-empty menu: an 8B that sees only its
+        // bookkeeping tools has no unrelated delegate/browser tool to reach
+        // for (2026-10-18 — "hello" was delegating to Vulkan and editing the
+        // navbar, unprompted).
+        const alwaysIn = skillTools.filter((t) => isPinnedTool(nameOf(t)));
+        // Discovery + delegation bookkeeping stay unconditional: the model
+        // cannot ask for what it can no longer see (list_skills/activate_skill
+        // are the escape hatch to load a skill/MCP server on demand), and a
+        // delegated job needs its result reader (read_job_result) and failure
+        // reporter (report_task_failure).
+        const ALWAYS_IN_CORE = new Set(['list_skills', 'activate_skill', 'read_job_result', 'report_task_failure']);
+        const alwaysInCore = activeFiltered.filter((t) => {
+            const n = nameOf(t);
+            return ALWAYS_IN_CORE.has(n) || isPinnedTool(n);
+        });
+        const ragPool = (() => {
+            const pool = [
+                ...skillTools.filter((t) => !alwaysIn.includes(t)),
+                ...activeFiltered.filter((t) => !ALWAYS_IN_CORE.has(nameOf(t)) && !isPinnedTool(nameOf(t))),
+            ];
+            const byName = new Map<string, any>();
+            for (const t of pool) {
+                const n = nameOf(t);
+                if (n && !byName.has(n)) byName.set(n, t);
+            }
+            return [...byName.values()];
+        })();
+        // Rank once per distinct (history length, pool) pair — mergeSkillTools
+        // runs several times per request cycle and extractKeywords on a long
+        // history is not free.
+        let ragRanked: any[] = [];
+        if (ragPool.length > 0) {
+            // The current ask is the ranking signal. On the first call of a turn
+            // `messages` does not carry this turn's user message yet, so ranking
+            // off it scored the PREVIOUS ask's tools: "what do you remember
+            // about the BBS system" ranked time/filesystem and withheld
+            // bbs_read, and the seat invented a memory-server tool instead
+            // (2026-10-18). Append the live ask so it always drives the rank.
+            const askForRag = lastUserText
+                ? [...messages, { role: 'user', content: lastUserText }]
+                : messages;
+            const key = `${messages.length}|${lastUserText}|${ragPool.map(nameOf).join(',')}`;
+            if (!ragCache || ragCache.key !== key) {
+                const keywords = extractKeywords(askForRag);
+                const ranked = keywords.length > 0
+                    ? new Set(rankTools(ragPool, keywords, ATLAS_DYNAMIC_TOP_K))
+                    : new Set<string>();
+                ragCache = { key, ranked: ragPool.filter((t) => ranked.has(nameOf(t))) };
+                log(`Tools: RAG ${ragCache.ranked.length} of ${ragPool.length} tools ranked (discovery/pins exempt)`);
+            }
+            ragRanked = ragCache.ranked;
+        }
+        // Co-required tools surface TOGETHER: a web/media ask that ranked
+        // youtube must also hand it the browser page-drive tools (and vice
+        // versa), or the seat has a play control with no way to browse the
+        // player — "play a song" ranked youtube but withheld chrome_navigate
+        // and the seat rambled instead of acting (2026-10-18). Expand the
+        // ranked set with any group members still in the pool (a lazy browser
+        // not yet dialed simply contributes nothing until it is).
+        {
+            const WEB_MEDIA_GROUP = new Set([
+                'youtube', 'WebSearch', 'WebFetch',
+                'mcp__browser-driving__chrome_navigate',
+                'mcp__browser-driving__chrome_get_web_content',
+            ]);
+            const rankedNames = new Set(ragRanked.map(nameOf));
+            if ([...WEB_MEDIA_GROUP].some((n) => rankedNames.has(n))) {
+                for (const n of WEB_MEDIA_GROUP) rankedNames.add(n);
+                ragRanked = ragPool.filter((t) => rankedNames.has(nameOf(t)));
+            }
+        }
+        // Dedupe BEFORE default-app substitution, on the FULL union of all
+        // pools — activeToolDefs and skillTools carry the built-ins from
+        // different places (e.g. browser_navigate shows up in both), so
+        // running applyDefaultApps on one pool and merging the other back in
+        // unfiltered let a withheld built-in slip back in through whichever
+        // pool it wasn't dropped from (2026-09-19: browser_navigate kept
+        // reappearing after a default app was set for 'browser', because it
+        // survived in skillTools while activeToolDefs' copy got dropped).
+        // The union is alwaysIn + alwaysInCore + ragRanked ONLY: re-adding
+        // activeFiltered or skillTools here defeats RAG and puts every tool in
+        // front of the model again.
+        const seen = new Set<string>();
+        const merged: any[] = [];
+        for (const t of [...alwaysIn, ...alwaysInCore, ...ragRanked]) {
+            const n = t?.function?.name;
+            if (typeof n === 'string') {
+                if (seen.has(n)) continue;
+                seen.add(n);
+            }
+            merged.push(t);
+        }
+        // Default apps: a capability handed to a chosen MCP server stands the
+        // BUILT-IN down — substitution, not addition (same rule as the
+        // delegate path). Unconditional: the built-in drops the moment a
+        // default is set, whether or not the replacement is connected right
+        // now (a dead server surfaces as "no tool for this," not a silent
+        // fallback to the built-in the user turned off). Applied once, to the
+        // deduped union, so neither pool can reintroduce a withheld name.
+        // stripTier on the way out = the description clamp rides on every
+        // def that reaches the wire, skill/MCP tools included.
+        return applyDefaultApps(stripTier(merged), stripTier(skillTools));
     }
     log(`Tools: ${fullToolDefs.length} available`);
     // ─── Skill grouping layer (Task 23) ────────────────────────────────
@@ -2019,6 +4400,17 @@ async function runNativeOllama(input: ContainerInput) {
     // so its meta tools + basic file ops are always visible to the LLM. MCP
     // tool schemas only appear after the LLM calls activate_skill(name).
     try {
+        // Close the PREVIOUS turn's MCP clients before spawning this turn's.
+        // This block re-runs every turn inside the same long-lived process
+        // (the IPC loop below calls back in without the process exiting), and
+        // disconnectMcpClients() used to fire only on idle-exit — so every
+        // turn opened a fresh connection on top of the last one, never
+        // closed. Harmless for a stateless stdio subprocess (spawn another),
+        // but a single-session remote server (e.g. a browser extension's MCP
+        // endpoint) rejects the new connection outright: "Already connected
+        // to a transport" (2026-09-19, browser-driving's first http-transport
+        // run). Close what's there first so every turn starts from zero.
+        await disconnectMcpClients();
         // Spawn MCP clients here so we retain references for tool dispatch.
         // Pass them into loadSkills via mcpClients so it doesn't spawn again.
         const { loadExternalMcpClients } = await import('./mcp-client.js');
@@ -2055,117 +4447,52 @@ async function runNativeOllama(input: ContainerInput) {
     // Conversation state (`let` so a context clear can reset it to a fresh
     // system prompt — see the _clearContextRequested handling in the main loop).
     let messages: any[] = [];
-    // Load the durable project journal (JOURNAL.md) so lessons learned persist across turns.
-let journalSection = '';
-try {
-    const journalPath = path.join(process.env.WORKSPACE_ROOT || process.cwd(), 'JOURNAL.md');
-    if (fs.existsSync(journalPath)) {
-        const journalText = fs.readFileSync(journalPath, 'utf-8');
-        const tail = journalText.slice(-2000).trim();
-        if (tail) {
-            journalSection = `\n\n# PROJECT JOURNAL (recent entries)\n\n${tail}\n\nUse these learned facts and standing instructions when making decisions.`;
-        }
-    }
-} catch (err: any) {
-    journalSection = '';
-}
+    // JOURNAL.md is deliberately NOT injected. It is a third-person log of what
+    // each session was about ("User asked twice…", "User requests … Canva"),
+    // and the seat read that register as its own voice: it narrated the
+    // conversation about the user instead of answering them ("Dominic asked
+    // twice to say hello after no-Canva instructions…", 2026-10-18) and kept
+    // re-seeding topics the user had moved past — Canva chief among them.
+    // Durable facts reach the seat through MARM recall; the journal remains a
+    // human-readable file and never enters the prompt.
 
 // Driving force — the orchestrator's governing preamble. The default below is
 // used when no preset is selected; a dashboard-selected preset (data/driving-
 // forces/<id>.md) replaces it via buildSystemPrompt(). The routing core below
 // (roster, routing, mechanics) is fixed and always appended, so swapping the
 // driving force changes HOW the orchestrator thinks, not WHO it delegates to.
-const DEFAULT_PREAMBLE = `# ROLE
+// MARM recall layer — active only when the marm MCP server is enabled in
+// data/mcp-servers.json, so the prompt never references tools that don't
+// exist. Re-read per turn, so flipping the config applies on the next turn
+// without a rebuild. Matches the mcp__marm__ orchestrator exemption above.
+const marmEnabled = (() => {
+    try {
+        const cfgPath = process.env.MCP_SERVERS_CONFIG || path.join(process.cwd(), 'data', 'mcp-servers.json');
+        const servers = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as Array<{ name?: string; enabled?: boolean }>;
+        return servers.some((s) => s && s.name === 'marm' && s.enabled === true);
+    } catch {
+        return false;
+    }
+})();
+const marmRecallSection = marmEnabled
+    ? `\n{"long_term_recall":{"core":"durable facts live in MARM memory — pull them on demand with mcp__marm__marm_smart_recall when the ask needs past context; memory is never auto-injected into a turn","deep_dig":"mcp__marm__marm_smart_recall (that exact name) — semantic search over facts the memory system already holds","log_new":"only when the user asked you to remember it, or you asked first and they agreed → mcp__marm__marm_log_entry; never log a fact automatically","code_map":"this codebase (/opt/Warden) is indexed in the code graph and re-indexes automatically after edits — when working on Warden's own code: mcp__marm__marm_code_context for the symbols and source a task needs, mcp__marm__marm_graph_trace to follow a call path, mcp__marm__marm_graph_impact to see what a change touches before making it"}}\n`
+    : '';
 
-You are ${input.assistantName || 'Warden'} — the orchestrator at the top of a multi-model system. You don't do the hands-on work yourself; you understand what the user wants, hand a clean brief to the right specialist, and relay the result back in plain speech. You have no shell, no browser, no filesystem — you route, the specialists execute. So never reach for a tool you don't have, and never tell the user "I can't" when a specialist could do it — delegate.`;
-
-const ROUTING_CORE = `# THE ROSTER
-
-Each specialist is a separate model with its own tools and its own context — it can't see this conversation and you can't see its tools. You reach one by calling its delegate tool with a \`{task}\` string; it returns a short result. atlas and artemis run in the background: you get a job id and the full result arrives in your inbox as a new turn later — call it and move on, never block waiting for it.
-
-- **atlas** — execution: shell, browser, desktop, web search/fetch, files, documents. Anything hands-on that touches the internet or runs a command.
-- **vulkan** — coding, scripting, building, heavy bash: editing source, running builds and tests, refactoring, complex shell pipelines. Runs in the background like atlas.
-- **iris** — email, calendar, contacts, todos, digests. If what the user wants lives in an email — even when the ask is "find", "extract", "save", or "pull out" — it's iris. Compiling a digest/summary of recent activity and POSTing it to /api/summaries is iris's job.
-- **dexter** — scheduling, reminders, alarms. It creates schedule entries only; it never runs the scheduled work, and it can't tell you why one did or didn't fire.
-- **byte** — projects, deliverables, blockers, financials, work tasks, time tracking.
-- **artemis** — audit / second opinion on the conversation. Runs in the background like atlas.
-- **council** — three seats (Skeptic, Pragmatist, Synthesist) deliberate in parallel on a costly decision until they agree (see COUNCIL).
-- **oculus** — background security and situational awareness. AWARENESS events are piped to Oculus in code; you don't see them. Delegate only if the user explicitly asks for a security status check. For "who's / what's in the room", call \`oculus_query\` and relay its live report in one sentence — not \`awareness_status\` (stale), not \`webcam_capture\`.
-
-# ROUTING
-
-Answer directly, no tools, for plain conversation — advice, definitions, translation, summaries, greetings, banter, quick facts you already know, simple math. Mentioning a topic in passing isn't a request to act; delegate only when the user actually wants something done or looked up. When work is needed, route by what they want, not the verb — the roster above is the map, the cue words below just point intent at the right seat, and the recurring gotchas below that are the ones that actually trip routing. When in doubt, delegate to atlas — except coding, building, and heavy scripting, which go to vulkan.
-
-Cue words:
-- "read/check my emails", "any new emails", "what's in my inbox", "show me my emails/inbox" → **iris** (it reads email with read_emails). Email lives in iris's tools, not on the screen — never take a screenshot or webcam photo for an email request; delegate to iris.
-- "write/fix/refactor/build/test X" (code, scripts, builds) → **vulkan** with the file or feature and the goal as plain English intent, never a shell command or step list.
-- "play X on youtube", "youtube X", "put on X", "play that song", "change/skip the song/video" → **atlas** with the song/artist as plain English intent (e.g. "Play chillstep on YouTube"), never a shell command — atlas finds it on YouTube and sets playback.
-- a costly decision hard to reverse — architecture, "should we X or Y" → **council**.
-- Work tasks, to-dos, deliverables, blockers, priorities, financials, time tracking → **byte**. Delegate in one call with the item's title and required fields, then report the result.
-- "did you get that right", "double-check what we did" → **artemis**.
-- "let me talk to Atlas", "put me through to Atlas" → \`atlas_direct\`: call it and end your turn telling them they're with Atlas now; from then on their messages go straight to Atlas and you don't relay them. Only for an explicit handoff request, not ordinary work.
-- A message that starts with a name and a colon — "Iris:", "Byte:", "Dexter:", "Vulkan:" — goes to that agent. The rest of the message is the task.
-
-Recurring gotchas:
-- Task vs schedule — the #1 routing mistake. A work task or to-do has no time trigger ("create a task", "I need to X", a deliverable, a blocker) → byte (create_work_task), defaulting to the Personal project. A schedule fires on a clock ("remind me", "every morning", "on Mondays", "schedule X") → dexter (schedule_task). "Create a task" with no time → byte; the moment a time or recurrence is named → dexter.
-- "Do X every morning / every day / on a schedule" means create the recurring task via dexter, not do X once now.
-- Split multi-domain requests: "get the price and remind me tomorrow" is atlas-then-dexter, the second task carrying the number the first fetched. Scheduling never goes inside an atlas task — atlas has no scheduler and will improvise badly.
-- A scheduled task that didn't fire: ask artemis to audit what happened; call dexter only if the schedule entry itself needs fixing. dexter can't diagnose its own past runs.
-- A digest / "write a ... digest" task → **iris**. It POSTs to /api/summaries, but compiling the summary of email/calendar/task activity is iris's job.
-
-The delegates are tools you call with \`{task}\` — they are not skills; never \`activate_skill\` a delegate name. If the user asks what you can do or what tools you have, run \`activate_skill('self-check')\`. A clear instruction is permission — act on it and report; don't ask "shall I proceed?" or narrate a plan. Ask one short question only when the request is genuinely unclear.
-
-# DELEGATING — INTENT, NOT INSTRUCTIONS
-
-The \`{task}\` string is all the specialist sees — no chat history. Give it the facts it can't guess (paths, URLs, names, dates, values, the exact outcome wanted) as one or two clean sentences, then stop. State the WHAT, never the HOW: no shell commands, no step lists, no tool names, no "first do X then check Y", no implementation plan. It is the expert on its own domain; the instant you prescribe method you make it follow your worse plan. If the system blocks your task for containing a shell command, that guard is right — rephrase the goal in plain English and re-call.
-
-Keep personal info local. Atlas and Vulkan may run on a cloud model, so keep people's names, email addresses, phone numbers, and other identifying details out of any task you send either — describe the work without them and hold the local context yourself. The on-device specialists (iris, byte, dexter) need real names and addresses to do their jobs, so include those there.
-
-If you're not sure what the user actually wants, or you're missing a fact the specialist would need (which file, which account, which date, which of two options), don't guess and don't forward a vague task — ask one short question and wait. The user often rambles (voice, not typing): extract the real intent and compose a clean task; never forward the raw words. If a relevant pattern from the list below fits, call \`fabric_pattern(name)\` and weave its framing into your own clear words — don't paste it.
-
-Good brief: "In classroom/public/index.html the login form refreshes instead of submitting — find the cause, fix it, and confirm the fix." Bad: "call read_emails then get_email on the newest, then…" (prescribing tools and order); bad: "fix the login page" (no facts).
-
-When a result comes back wrong, re-delegate by naming the GAP — what they wanted vs what you got — never the fix. Let the specialist work out how to correct it; don't hand it steps or tell it which tool to retry.
-
-Emit independent delegate calls in one turn — they run in parallel; serialize only when one result feeds the next. You can watch your agents with \`list_running_agents\`, \`agent_logs\`, and \`read_job_result\`; when you need to know whether a job succeeded or what it changed, read its log — don't re-delegate the same work to double-check a success.
-
-# WHAT THE USER HEARS
-
-Only your final reply and a brief delegation announcement are shown to the user. The raw \`{task}\` string you pass to a delegate is only for the specialist — do NOT echo it verbatim to the user. You may say one short line like "I'll look that up" or "I've asked Atlas; I'll report back when it's done," but do not paste the task prompt itself. Think silently, speak the result.
-
-# OUTPUT
-
-Voice-first plain speech. No markdown — no asterisks, bullets, backticks, bold, or headers — those get read aloud and sound wrong. One to three sentences; yes/no first when asked yes/no. Relay the spoken answer from specialists, not raw output, paths, or JSON.
-
-Don't announce work before its result is in. "I've started it" while a job is still running is a false claim — wait until the result comes back, then report what happened in plain speech: the file written and where, the price found, the song now playing, the error that occurred. One short line is enough.
-
-# FINISHING
-
-You decide when the job is done — not a timer or a tool cap. **Done**: the ask is achieved — write the answer with no tool calls. **Blocked**: you genuinely can't proceed — say what's blocking you in a sentence and stop. **Keep going**: take the next useful step. A sub-agent's success result is final — relay its evidence, don't re-delegate to verify it, one clean confirmation and you're done. A failed tool isn't a stopping point: retry with a fix, or say plainly what didn't work and offer an alternative.
-
-# COUNCIL
-
-For a costly decision where being wrong is expensive, call \`council\` with a self-contained question. It runs in the background: the host tells you it's deliberating and you end your turn with no interim message; when the seats converge (up to 15 rounds) the host delivers the verdict to the user automatically. While it deliberates you can peek with \`council_status\`. Reserve it for real stakes, not routine questions.
-
-# ENVIRONMENT
-
-Arch Linux, KDE Plasma on Wayland. System packages via \`sudo pacman -S <pkg>\` (\`--needed\`, \`--noconfirm\`) — never apt, dnf, brew, or pip. sudo is interactive (the user types the password), so any system-package install goes to atlas: it runs pacman once and tells the user a password prompt is waiting. The dashboard has a Notes vault at \`~/Documents/Notes\` (plain \`.md\` with \`[[wiki-links]]\` and \`#tags\`); reading or editing notes is an atlas file task.
-
-# MEMORY
-
-MEMORY/TODO/HEARTBEAT are loaded below when present — use them without being told. When you learn something worth keeping (a preference, a decision, a fact about the user or setup), delegate to atlas to append one line to MEMORY.md — append only, never rewrite. Read JOURNAL.md or NOTES.md only if you need deeper history; if the user references an earlier conversation, check mercury_summary / mercury_context / chat_history first, and if it's not there delegate to artemis with the question and time range.
-${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
-
-`;
+// SUPERVISOR DISABLED 2026-08-29 — removed the [Supervisor flag] instruction that used to
+// live in the BRIEFING IRIS section below. The watchdog ticker was already no-op'd
+// (ensureWatchdogTicker/runSupervisorWatchdog returned early; zero ticks fired), but the
+// prompt paragraph still taught the orchestrator about [Supervisor flag] inbox items, so
+// the orchestrator ROLE-PLAYED a supervisor flag about its own read-only delegation
+// (atlas-czix, a file check it itself requested) and then stopped the re-delegation. With
+// this gone the orchestrator no longer emits or acts on supervisor flags. The deferred full
+// removal (flagJobForOrchestrator, runSupervisorWatchdog, ensureWatchdogTicker, the
+// WATCHDOG_* constants) happened 2026-09-17 — see git history for both.
     // Fabric pattern exposure (deferred pattern): list the top-ranked relevant
     // patterns by name + one-line description; the model loads one on demand
     // via the fabric_pattern tool. Section is omitted entirely if nothing ranks.
     let fabricSection = '';
     try {
-        fabricSection = buildRelevantPatternsSection(
-            extractKeywords([{ role: 'user', content: input.prompt }]),
-            5
-        );
+        fabricSection = buildRelevantPatternsSection(extractKeywords(messages), 5);
         if (fabricSection) {
             const count = (fabricSection.match(/^- /gm) || []).length;
             log(`Fabric: ${count} relevant patterns injected into system prompt`);
@@ -2179,8 +4506,13 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
     // available. Other skills require activate_skill(name).
     let skillIndexSection = '';
     if (skillState && skillState.skills.length > 0) {
-        skillIndexSection = '\n\n# SKILLS\n\n' + renderSkillIndex(skillState.skills)
-            + '\n\nThe "core" skill is already active. Call activate_skill(name) to load any other skill\'s tools into your context for this turn.';
+        // The full per-skill index (~6K chars for ~57 skills) was burned every turn
+        // for a list the model only needs when it should activate_skill. Skills
+        // load on demand and are keyword-discovered via fabricSection +
+        // refreshActiveToolDefs, so a one-line pointer to list_skills() carries
+        // discovery without the fixed cost. list_skills() still returns the full
+        // list when called.
+        skillIndexSection = `\n\n{"skills":{"discover":"list_skills() → names+descriptions","load":"activate_skill(name) — this turn","core":"already active"}}`;
     }
     // Inject the current local time so the orchestrator knows it without calling
     // any tool. mcp-server-time's get_current_time REQUIRES a timezone argument
@@ -2191,52 +4523,169 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
         const p = (n: number) => String(n).padStart(2, '0');
         const localIso = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        return `\n\n# CURRENT TIME\nIt is ${localIso} (${tz}), right now. Use this when the user asks the time or a date. Do not guess; if more than a minute has passed, run \`date\` via Bash to refresh.`;
+        return `\n\n{"now":{"local":"${localIso} (${tz})","rule":"use this for time and date asks; if more than a minute has passed, run \`date\` via Bash to refresh"}}`;
     })();
     // Compose the orchestrator system prompt from the selected driving-force
     // preamble (or the default) + the fixed routing core + the per-turn
     // sections. A closure so a mid-run context clear can rebuild it with a
     // freshly-selected driving force without re-running the whole turn setup.
     const buildSystemPrompt = (): string => {
-        let preamble = '';
+        // Atlas IS the orchestrator. Its prompt (role, machine, files, web,
+        // youtube, verifying) is the whole identity: this seat does the work
+        // itself. The routing core and the delegate brief-writing rules are
+        // gone — the only routing left is the short escalation rule below.
+        // Atlas's prompt was written for a sub-agent being handed a task by the
+        // orchestrator, so three of its lines are actively wrong for the seat
+        // that talks to the user. Left in place they contradict the ESCALATION
+        // block below, and a contradiction is worse than either rule alone:
+        //   - "The task states what the user needs" — there is no task; the user
+        //     is speaking, and follow-ups are a conversation, not a new brief.
+        //   - the EMAIL section ends the turn with "this routes to the email
+        //     specialist" — as the chat seat that is a dead end: the user asked
+        //     and got a routing note instead of their mail. Email ALWAYS goes to
+        //     iris, and this seat is the one that must call it.
+        //   - scheduling "belongs to the parent scheduler" — there is no parent.
+        // Rewritten on the merged copy only; the background atlas job keeps the
+        // sub-agent wording it was written for.
+        // The seat speaks as Warden. ORCH_SYSTEM is the
+        // text the orchatlas fine-tune was trained on, used verbatim so the
+        // model is conditioned at inference on the prompt it saw in training.
+        // The one token that may differ is the agent's own name — spoken as
+        // the dash sets it (AGENT_NAME, synced from ASSISTANT_NAME).
+        const atlasPrompt = AGENT_NAME && AGENT_NAME !== 'Warden'
+            ? ORCH_SYSTEM.replace('You are Warden,', `You are ${AGENT_NAME},`)
+            : ORCH_SYSTEM;
+        // The driving force (dashboard "Driving force") is the user's persona
+        // knob. It used to ride on the old routing preamble, so it must be
+        // applied here or the setting silently does nothing: persona leads,
+        // then the execution identity.
+        let force = '';
         if (DRIVING_FORCE_ID) {
             try {
-                const p = path.join(process.env.WORKSPACE_ROOT || process.cwd(), 'data', 'driving-forces', `${DRIVING_FORCE_ID}.md`);
-                if (fs.existsSync(p)) preamble = fs.readFileSync(p, 'utf-8').trim();
+                const fp = path.join(process.env.WORKSPACE_ROOT || process.cwd(), 'data', 'driving-forces', `${DRIVING_FORCE_ID}.md`);
+                if (fs.existsSync(fp)) force = fs.readFileSync(fp, 'utf-8').trim();
             } catch (err: any) {
-                log(`Warning: failed to load driving force "${DRIVING_FORCE_ID}" (${err?.message || err}) — using default preamble`);
+                log(`Warning: failed to load driving force "${DRIVING_FORCE_ID}" (${err?.message || err})`);
             }
         }
-        if (!preamble) preamble = DEFAULT_PREAMBLE;
-        return preamble + '\n\n' + ROUTING_CORE + journalSection + fabricSection + skillIndexSection + orchestratorNowLine;
+        // This seat always does the work itself — atlas IS the seat, and
+        // multi-specialist chains are its own tool loop now (delegate + verify
+        // with read_job_result), not a manager's. No branch here anymore:
+        // one rule set.
+        const modeBlock = '\n\n{"crew":{\n'
+              + crewBlock()
+              + '\n},"routing":{"mail":"email/calendar/reminders/tasks → always iris","long_work":"minutes of browsing, multi-step builds → atlas_background, keep talking","chains":"multi-specialist → call the specialists directly, one piece at a time, verify each result with read_job_result, keep talking","long_text":"a long written piece for the user to read (post, document, report) → call vulkan once with the ask inline, then deliver what it returns","else":"do it yourself — one call per intent"}'
+              // Proactive: the seat owns the machine it sits on — a broken thing
+              // it can fix with its own tools is its job, not a report to the
+              // user (2026-09-21: "it reports easily fixable things instead of
+              // fixing them"). Positive shape, one rule + one boundary.
+              + ',"proactive":{"rule":"something broken but fixable with your own tools → fix it first, then say what you did","report":"only what you cannot fix, or that needs the user\'s decision"}'
+              // Targets: the ask's own words name the destination — a
+              // subreddit, a site, a page, a channel. The fine-tune had too few
+              // distinct destinations, so asks collapsed to whichever one
+              // destination the corpus happened to show (2026-09-21: every
+              // reddit ask went to the single reddit URL the training set ever
+              // displayed). General rule, positive framing — naming any
+              // specific destination here would seed it instead (see
+              // feedback-no-negative-examples).
+              + ',"targets":{"rule":"go to exactly the destination the ask names","url":"build it from the ask\'s own words","source":"the ask, always"}}'
+              // Results: a result that answers the ask is the reply material —
+              // poll it again and the model burns the turn re-asking the same
+              // question (2026-09-21: play chillstep → 15 now_playing calls,
+              // 21 iterations, raw markup leaked as the answer). General
+              // rule, positive shape.
+              + ',"results":{"rule":"the result answers the ask → reply with it now, in your own words","same":"one call per fact — the first result carries the fact"}'
+              // Playback control (2026-09-21: "pause youtube" / "stop playing
+              // music" turns answered with ZERO tool calls and a hallucinated
+              // "playback is paused" while the music kept playing — the tool
+              // card read play/search only, so control asks mapped to no tool).
+              // Positive shape: the ask→action mapping + proof rule.
+              + ',"control":{"rule":"youtube or playing-music mention → the youtube tool; pause/stop = action pause, resume/unpause/continue = action resume","proof":"the tool result is the reply — never state a playback change without the call"}'
+              // BBS/BotNet grounding (2026-10-18): the friends/BBS tools joined
+              // atlas-core with no prompt grounding, so a question about the BBS
+              // answered with a confabulated dashboard URL + node port + a fake
+              // read_job_result id. Map the words to the tools, answer from the
+              // tool result, and forbid inventing an address.
+              + ',"mesh":{"rule":"BBS, BotNet, your node, or friends mentioned → bbs_read or friend_list first, then answer from what they return","address":"your only real address is what bbs_read and friend_list report — there is no public dashboard URL, hostname, or port to give"}}\n';
+        return (force ? force + '\n\n' : '') + atlasPrompt
+                // The roster is GENERATED from SUBAGENTS (crewBlock), not typed
+                // out here: a hand-written list goes stale the moment a seat is
+                // added, renamed or re-scoped, which is the whole reason
+                // crewBlock exists.
+                + modeBlock
+                // These sections ride on the routing-core branch and would be
+                // lost here: the skill index is the only thing that tells this
+                // seat its 60+ skills exist and how to activate one.
+                // defaultsSection() is generated from the same DEFAULT_APPS the
+                // tool gate uses — the claim and the tool list cannot drift.
+                // (JOURNAL.md is not among them — see the note where the seat's
+                // conversation state is initialized.)
+                + fabricSection + skillIndexSection
+                + defaultsSection()
+                + orchestratorNowLine + marmRecallSection;
     };
-    messages.push({ role: 'system', content: buildSystemPrompt() });
-    let prompt = input.prompt;
     // Per-agent model system — every agent has its own concrete model from
     // dashboard settings, re-synced each turn via applySettingsSync(). No
     // hardcoded fallbacks: a missing setting is surfaced as an error instead of
     // silently swapped for a baked-in model. The host's seedPerAgentModelSettings
     // materializes a value for every key on first boot, so these are never empty
     // in normal use; a manually-cleared key errors loudly.
-    let model = (input.orchestratorModel || '').replace(/^local:/, '');
+    // DRIVING_FORCE_ID must be assigned BEFORE buildSystemPrompt() below —
+    // the first system message is the only one ever composed (it is rebuilt
+    // only on a context-clear), so reading the driving force after the push
+    // made the selected preamble silently never apply on a fresh child.
+    // The chat seat's own generation model: Atlas IS the seat. No hardcoded
+    // fallback: when atlas:model is unset the agent errors loudly instead of
+    // silently swapping for a baked-in model. The host's db migration moved the
+    // old orchestrator row's value into atlas:model, and seedPerAgentModelSettings
+    // materializes a value on first boot.
+    let model = (input.model || '').replace(/^local:/, '');
     if (!model) {
-        writeOutput({ status: 'error', result: null, error: 'No orchestrator model configured in dashboard settings (set orchestrator:model). Refusing to fall back to a hardcoded default.' });
+        writeOutput({ status: 'error', result: null, error: 'No Atlas model configured in dashboard settings (atlas:model is empty). Refusing to fall back to a hardcoded default.' });
         return;
     }
-    ORCHESTRATOR_MODEL = model;
-    ATLAS_MODEL = (input.model || '').replace(/^local:/, '');
+    ATLAS_MODEL = model;
     VULKAN_MODEL = (input.vulkanModel || '').replace(/^local:/, '');
-    BYTE_MODEL = (input.byteModel || '').replace(/^local:/, '');
-    DEXTER_MODEL = (input.dexterModel || '').replace(/^local:/, '');
+    SUPERVISOR_MODEL = (input.supervisorModel || '').replace(/^local:/, '');
+    SUPERVISOR_ENABLED = input.supervisorEnabled !== false;
     IRIS_MODEL = (input.irisModel || '').replace(/^local:/, '');
     ARTEMIS_MODEL = (input.artemisModel || '').replace(/^local:/, '');
+    SENTRY_MODEL = (input.sentryModel || '').replace(/^local:/, '');
     DRIVING_FORCE_ID = input.drivingForce || '';
     CONTEXT_CLEAR_AT = input.contextClearAt || '';
     lastContextClearAt = CONTEXT_CLEAR_AT; // first sight — don't arm a clear
     COUNCIL_MODEL_SKEPTIC = (input.councilSkepticModel || '').replace(/^local:/, '');
     COUNCIL_MODEL_PRAGMATIST = (input.councilPragmatistModel || '').replace(/^local:/, '');
     COUNCIL_MODEL_SYNTHESIST = (input.councilSynthesistModel || '').replace(/^local:/, '');
+    // Default apps ride in the spawn payload too, but DEFAULT_APPS was only
+    // ever populated by the per-turn IPC settings sync — which first fires
+    // AFTER this boot section (drainIpcInput runs inside the loop below). The
+    // seat gate was therefore built against an empty DEFAULT_APPS and stayed
+    // that way for the whole process lifetime: every default provider's
+    // mcp__* tools were blocked alongside the rest of MCP, while
+    // applyDefaultApps() — reading the synced values — withheld the built-ins
+    // too. A defaulted capability ended up with NO tools at all ("atlas has
+    // no MCP servers", 2026-09-19). Seed it here so the gate is right on
+    // turn one; the per-turn syncs still keep it fresh.
+    if (input.defaultApps) applySettingsSync({ defaultApps: input.defaultApps });
+    if (input.pinnedTools) applySettingsSync({ pinnedTools: input.pinnedTools });
     const toolContext = { chatJid: input.chatJid, groupFolder: input.groupFolder, isMain: input.isMain, userId: process.env.WARDEN_USER_ID || '' };
+    messages.push({ role: 'system', content: buildSystemPrompt() });
+    // Log the seat identity the prompt actually resolved to. Which prompt is
+    // live has been guesswork twice now; one line makes it checkable.
+    {
+        const _sp = String(messages[0]?.content || '');
+        const _first = _sp.split('\n').find((l: string) => l.trim() && !l.startsWith('#')) || '(empty)';
+        log(`System prompt: ${_sp.length} chars — "${_first.slice(0, 90)}"`);
+    }
+    let prompt = input.prompt;
+    lastUserAsk = extractAsk(input.prompt) || lastUserAsk;
+    // A side turn (BotNet sweep) delivered as the FIRST turn of a freshly-spawned
+    // runner — the child was killed by timeout/restart and re-spawned — must roll
+    // back out of `messages` exactly like the IPC-delivered side turns do. The
+    // spawn payload carries `sideTurn` (agent-spawn.ts) but ContainerInput never
+    // read it, so that first sweep leaked (the hole the IPC path doesn't have).
+    sideTurnPending = input.sideTurn === true;
 
     if (input.activeIdea) {
         const ideaDir = path.join(process.cwd(), 'ideas', input.activeIdea);
@@ -2251,24 +4700,21 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
     // Drain any pending IPC messages for initial prompt
     const pending = drainIpcInput();
     if (pending.length > 0) {
-        prompt += '\n' + pending.join('\n');
+        prompt += '\n' + pending.map(p => p.text).join('\n');
     }
     // Main idle loop
     let isFirstUserTurn = true;
     // True when the current turn was triggered by the inbox draining a finished
-    // background job (a "digest turn"), as opposed to a real user message or a
-    // monitor tick. Digest turns are spontaneous — no host turn is pending when
+    // background job (a "digest turn"), as opposed to a real user message.
+    // Digest turns are spontaneous — no host turn is pending when
     // they emit their OUTPUT — so the host's turn-output resolution can't
     // deliver the reply. We route the reply through send_message instead (the
     // same path the Council verdict uses), so the report-back actually reaches
     // the user.
-    let turnWasInboxDigest = false;
-    // True when the current turn was triggered by a monitor-tick (the periodic
-    // supervision check that fires while background jobs run). Like digest
-    // turns, tick turns are spontaneous — no host turn is pending when they
-    // emit OUTPUT, so the reply must be routed through send_message to reach
-    // the user (otherwise the host drops it). Empty replies send nothing.
-    let turnWasMonitorTick = false;
+    // turnWasInboxDigest is module-level (see the retry ledger block) — a
+    // digest turn is spontaneous: no host turn is pending when it emits
+    // OUTPUT, so the reply must be routed through send_message to reach the
+    // user (otherwise the host drops it). Empty replies send nothing.
     while (true) {
         // Context clear (driving-force switch, or the clear_context tool): drop
         // the in-memory conversation and rebuild the system prompt so the new
@@ -2281,11 +4727,13 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             isFirstUserTurn = true;
             log(`Context cleared — conversation reset, system prompt rebuilt with driving force "${DRIVING_FORCE_ID || 'default'}"`);
         }
-        // Re-sync the orchestrator model each turn from ORCHESTRATOR_MODEL, which
-        // applySettingsSync() keeps fresh on every IPC message. Without this the
-        // local `model` stays pinned to the first turn's value and dashboard model
-        // changes never reach the actual LLM call (the "settings didn't apply" bug).
-        model = ORCHESTRATOR_MODEL;
+        // Re-sync the SEAT's model each turn from ATLAS_MODEL, which
+        // applySettingsSync() keeps fresh on every IPC message. Without this
+        // the local `model` stays pinned to the first turn's value and dashboard
+        // model changes never reach the actual LLM call (the "settings didn't
+        // apply" bug). Atlas IS the seat; an empty sync value keeps the
+        // last good model rather than blanking the turn.
+        model = ATLAS_MODEL || model;
         // Warm/refresh the native-ctx cache for this turn's model so getNumCtx can
         // cap the dashboard override at the model's real window (and serve it as
         // the default when no override is set). Cheap: cached per model after the
@@ -2293,46 +4741,82 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
         await fetchModelCtx(OLLAMA_URL, model);
         // No per-turn flow-control reminder — the model replies when done and emits a
         // tool call when it needs one. (Completion guidance lives in the system prompt.)
-        // The parent composes EVERY turn's prompt with <mercury_summary>/<mercury_context>/
-        // <chat_history> baked in. On a process's FIRST turn all of it is kept — a fresh
-        // spawn has no in-memory conversation, and without <chat_history> follow-ups like
-        // "run it again" or "I meant xyz" have no referent. On later turns the persistent
-        // `messages` array already carries the real conversation verbatim, so the
-        // re-injected blocks are pure duplication — strip them all.
+        // The parent composes the prompt with <chat_history> baked in. The
+        // persistent `messages` layout is [system, initialUser, ...verbatimTail].
+        // The verbatim tail carries the live conversation; <chat_history> is pure
+        // duplication on persistent turns and is stripped below.
         let cleanedPrompt = prompt;
         if (!isFirstUserTurn) {
+            // Persistent turn: strip the host's re-composed <chat_history> so it
+            // isn't duplicated — the in-memory verbatim tail already carries the
+            // conversation (Dockbox parity: history is injected once, then the
+            // live tail carries it).
             const before = cleanedPrompt.length;
-            cleanedPrompt = cleanedPrompt
-                .replace(/<chat_history[\s\S]*?<\/chat_history>\s*/g, '')
-                .replace(/<mercury_summary>[\s\S]*?<\/mercury_summary>\s*/g, '')
-                .replace(/<mercury_context[\s\S]*?<\/mercury_context>\s*/g, '');
+            cleanedPrompt = cleanedPrompt.replace(/<chat_history[\s\S]*?<\/chat_history>\s*/g, '');
             if (cleanedPrompt.length !== before) {
-                log(`Persistent turn: stripped ${before - cleanedPrompt.length} chars of re-injected context`);
+                log(`Persistent turn: stripped ${before - cleanedPrompt.length} chars of re-injected chat_history`);
+            }
+            // The first ask (messages[1]) kept <chat_history> on turn 1 for
+            // follow-up referents. Strip it once now that the verbatim tail
+            // carries the live conversation.
+            const m2 = messages[1];
+            if (m2 && typeof m2?.content === 'string' && /<chat_history/.test(m2.content)) {
+                m2.content = m2.content.replace(/<chat_history[\s\S]*?<\/chat_history>\s*/g, '').trim();
             }
         }
         isFirstUserTurn = false;
-        // messages[1] baked in the full turn-1 prompt (mercury summary + up to
-        // 12K of <chat_history> + <mercury_context>) and trim keeps it forever.
-        // Strip the stale re-injected blocks once so the permanent slot is just
-        // the mercury summary + the original ask — reclaiming that budget for the
-        // recent essentials.
-        const m1 = messages[1];
-        if (m1 && typeof m1?.content === 'string' && /<(chat_history|mercury_summary|mercury_context)/.test(m1.content)) {
-            // Mercury is pinned — strip its summary too, leaving just the first
-            // ask. The orchestrator keeps its own bounded chat history (see
-            // collapseToChatHistory) instead of relying on mercury.
-            m1.content = m1.content
-                .replace(/<chat_history[\s\S]*?<\/chat_history>\s*/g, '')
-                .replace(/<mercury_summary>[\s\S]*?<\/mercury_summary>\s*/g, '')
-                .replace(/<mercury_context[\s\S]*?<\/mercury_context>\s*/g, '')
-                .trim();
+        // Memory is NOT auto-injected per turn (Dockbox parity): auto-injecting
+        // weeks-old MEMORY.md + MARM recall on every turn is what made the seat
+        // answer questions with stale facts. Long-term recall is on demand, via
+        // the mcp__marm__* tools (see long_term_recall in the system prompt).
+        // The LAZY default browser provider: dial it EVERY turn, before the
+        // tool list is built — the default app IS the pipeline, and the only
+        // alternative is the stock built-in fallback, which must never
+        // happen (2026-09-21: undialed = stock tools or none = the open_app /
+        // pkill flail). A successful dial attaches into skillState for the
+        // runner's lifetime, so this costs nothing after the first turn; a
+        // failed dial is bounded by getOrCreateMcpClient's 10s and the gate's
+        // 5s fast-fail, and a 60s cooldown keeps a bridge-down day from
+        // paying that on every turn. The turn is never blocked either way.
+        const lazyBrowserServer = providerFor('browser') || providerFor('web');
+        if (lazyBrowserServer && isLazyMcpServer(lazyBrowserServer)
+            && !skillState?.skills.some(s => s.source === 'mcp' && s.name === lazyBrowserServer)
+            && Date.now() - lazyDialLastAttemptAt > 60_000) {
+            lazyDialLastAttemptAt = Date.now();
+            try {
+                const { getOrCreateMcpClient } = await import('./mcp-client.js');
+                await attachLazyServer(lazyBrowserServer, await getOrCreateMcpClient(lazyBrowserServer));
+                log(`[lazy-dial] ${lazyBrowserServer} dialed — the default browser provider owns the pipeline from turn one`);
+            } catch (err: any) {
+                log(`[lazy-dial] ${lazyBrowserServer} unreachable (${err?.message || err}) — retrying next turn`);
+            }
         }
         const userMsg: any = { role: 'user', content: cleanedPrompt.trim() };
-        // Attach any pending images from Read tool (vision)
+        // Attach any pending images from Read tool (vision) — but only when the
+        // orchestrator's context can hold them; an over-limit attach 400s the
+        // next request and kills the turn (same defect as the sub-agent drain).
         if ((globalThis as any)._pendingImages && (globalThis as any)._pendingImages.length > 0) {
-            userMsg.images = (globalThis as any)._pendingImages;
+            const _pi = (globalThis as any)._pendingImages;
             (globalThis as any)._pendingImages = [];
+            const orchImgBudget = orchestratorMsgBudgetChars(
+                model,
+                estimateMessagesChars(messages[1]?.role === 'system' ? messages.slice(0, 3) : messages.slice(0, 2)),
+                JSON.stringify(mergeSkillTools()).length,
+            );
+            if (imagesFitBudget(messages, _pi.length, orchImgBudget) && !MODELS_WITHOUT_VISION.has(model)) {
+                userMsg.images = _pi;
+            } else {
+                const why = MODELS_WITHOUT_VISION.has(model) ? 'this model cannot see images' : 'the conversation is near the context limit';
+                log(`[orchestrator] Image attach: ${_pi.length} image(s) NOT attached to this turn (${why})`);
+                userMsg.content += `\n[Note: image(s) you Read earlier are NOT visible — ${why}. Do not Read them again; proceed from what you already know.]`;
+            }
         }
+        // An autonomous background turn (the BotNet sweep) must not leak its
+        // "work quietly … QUIET" instructions into the seat's live conversation.
+        // Mark the turn's own user message so we roll the whole turn back out of
+        // `messages` once it ends (by reference — survives trim rebuilds).
+        const sideTurnMarker = sideTurnPending ? userMsg : null;
+        sideTurnPending = false;
         messages.push(userMsg);
         // Re-rank tools for this turn (never throws — falls back to full list)
         refreshActiveToolDefs();
@@ -2347,22 +4831,34 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
         let errorOutputWritten = false;  // set when the retryable-error path already wrote output — prevents double writeOutput and keeps the persistent child alive (was: `return`, which killed the child)
         // === Per-turn state for defensive loop patterns ============================
         let intentNudgesUsed = 0;          // #2: intent-without-action nudge cap
-        let circlingUselessRounds = 0;     // #3: consecutive useless rounds
-        let forceToolFreeRound = false;    // #3: set by breaker → next round runs with NO tools
-        const recentCallSigs: string[] = []; // #3: deque of last RECENT_CALL_SIG_DEPTH sigs
-        const callFreq: Record<string, number> = {}; // #3: call signature → count
-        let verifierRoundsUsed = 0;        // #1: verifier sub-agent round cap
-        let verifierActions: string[] = []; // #1: accumulated snapshot for the verifier
-        let verifierTriggeredThisTurn = false; // #1: only fires once per turn (re-arms on new effectful work)
-        // Pipe status updates through stdout — no file I/O
+        let pastedCallRuns = 0;            // #2b: pasted <function=…> blocks recovered as real calls
+        let delegatedThisTurn = false;     // #2: a delegate ran this turn — closing prose after a hand-off is a completion announcement, not unfulfilled intent (nudging it re-dispatches the same job)
+        let lastToolBatchWasError = false; // #2: the most recent tool batch returned only errors — a following no-tool-call turn is the terminal REPORT of that failure, and nudging it back into action produces forbidden retries and delegations (2026-10-08 browser-offline incident)
+        // Names of delegates actually invoked via a tool_call this turn. Used by
+        // the narrated-delegation guard to distinguish a genuine "Atlas is doing
+        // X now" promise (name mentioned, no call) from "Atlas reported X"
+        // citations of completed work (name mentioned AND was called).
+        const delegatesCalledThisTurn = new Set<string>();
+        let thinkBudgetRetries = 0;        // #3c: times a length-capped thinking-only round was retried with thinking off
+        let suppressThinkOnce = false;     // #3c: forces the next round's think=false
+        // Pipe status updates through stdout — no file I/O. `fg:1` marks this
+        // as the ORCHESTRATOR'S OWN turn status: the host routes fg entries to
+        // the dashboard live label and uses them to flag a turn in flight.
+        // Without the marker, background-job heartbeats sharing this stdout
+        // stream clobber the foreground label mid-turn, and spontaneous digest
+        // turns (report-back replies, no host runAgent wrapper) are invisible
+        // to the Oversight panel entirely.
         function appendStatus(entry) {
-            writeStatus({ ...entry, ts: Date.now() });
+            writeStatus({ ...entry, fg: 1, ts: Date.now() });
         }
         log(`Entering tool loop (max ${MAX_TOOL_ITERATIONS} iterations)`);
         while (toolIteration < MAX_TOOL_ITERATIONS) {
             toolIteration++;
             log(`Tool iteration ${toolIteration}`);
 
+            // Pick up interrupts written mid-turn (host soft-stop). Message
+            // files are left on disk for the turn-end drain.
+            drainInterruptOnly();
             // Check for interrupt signal
             if (interruptRequested) {
                 log('Interrupt requested — stopping tool loop');
@@ -2372,12 +4868,18 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             }
 
             // Urgent inbox items interrupt the current task mid-turn; normal items
-            // wait for the turn-end drain.
+            // wait for the turn-end drain. All urgent items are finished-job
+            // results the orchestrator must confirm.
             const urgentItems = inbox.unreadUrgent();
             if (urgentItems.length > 0) {
                 for (const item of urgentItems) inbox.markRead(item.jobId);
-                const body = urgentItems.map(i => `${i.jobId} (${i.status}) — task: "${i.task.slice(0, 160)}"\nResult:\n${i.fullResult.slice(0, 4000)}`).join('\n\n---\n\n');
-                messages.push({ role: 'user', content: `[Inbox — urgent background result${urgentItems.length > 1 ? 's' : ''}, delivered mid-task as requested. Fold this into what you are doing, or tell the user what matters. Do not paste raw output verbatim.]\n\n${body}` });
+                const body = urgentItems.map(i => {
+                    const v = i.verdict ? `Supervisor verdict: ${i.verdict.toUpperCase()} — ${i.verdictReason || ''}\n` : '';
+                    return `${i.jobId} (${i.status}) — task: "${i.task.slice(0, 160)}"\n${v}Result:\n${i.fullResult.slice(0, 4000)}`;
+                }).join('\n\n---\n\n');
+                const stillRunning = [...backgroundJobs.values()].filter(j => j.status === 'running' && !urgentItems.some(u => u.jobId === `${j.agent}-${j.shortId}`));
+                const stillLine = stillRunning.length > 0 ? `\n\nSTILL RUNNING (do not report complete until these land): ${stillRunning.map(j => `${j.agent}-${j.shortId}`).join(', ')}` : '';
+                messages.push({ role: 'user', content: `[Inbox — urgent background result${urgentItems.length > 1 ? 's' : ''}, delivered mid-task as requested. Confirm each against the original ask first: relay confirmed results in a sentence or fold them into what you are doing; if a result proves its deliverable wrong or missing (or the supervisor verdict is FAILED), call report_task_failure and re-delegate once naming the gap (the runner caps automatic retries); if success can only be judged by screen state, trust it. Do not paste raw output verbatim.]\n\n${body}${stillLine}` });
                 log(`[inbox] injected ${urgentItems.length} urgent item(s) mid-turn`);
             }
             if (!outputStarted) {
@@ -2392,41 +4894,70 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             let tokenCount = 0;
             let inThinkingBlock = false;
             let wroteThinkingStatus = false;
+            let wroteRespondingStatus = false;
             let doneReason = '';
             const collectedToolCalls = [];
+            // Repetition-loop guard (2026-09-21 11:57: a temp-0 youtube play
+            // looped 91× in one stream — 112s to the num_predict cap, then all
+            // 91 executed in the same second and their identical results fed
+            // the next round's degeneration). Track consecutive identical tool
+            // calls; at DUP_TOOL_ABORT copies, abort the stream — the call
+            // itself is real, only the repetition is noise.
+            const toolSig = (tc: any) => `${tc.function?.name || ''}|${JSON.stringify(tc.function?.arguments ?? {})}`;
+            let lastToolSig = '';
+            let dupToolStreak = 0;
+            let dupToolAborted = false;
             // Write thinking status — include what just happened so the user sees progress
             const thinkLabel = lastToolSummary
                 ? `${lastToolSummary} — planning next...`
                 : `Warden is thinking...`;
             appendStatus({ phase: 'thinking', label: thinkLabel });
-            // Trim history to fit context budget before each chat call.
-            const trimmedOrch = trimMessagesToBudget(messages, ORCHESTRATOR_MSG_BUDGET_CHARS);
-            if (trimmedOrch.length !== messages.length) messages.length = 0, messages.push(...trimmedOrch);
+            // Trim history to fit context budget before each chat call. The
+            // budget is scaled to the model's actual window — never flat, or the
+            // pinned head alone exhausts it and the tail collapses mid-turn.
+            const orchBudget = orchestratorMsgBudgetChars(
+                model,
+                estimateMessagesChars(messages[1]?.role === 'system' ? messages.slice(0, 3) : messages.slice(0, 2)),
+                JSON.stringify(mergeSkillTools()).length,
+            );
+            const trimmedOrch = trimMessagesToBudget(messages, orchBudget);
+            if (trimmedOrch !== messages) { messages.length = 0; messages.push(...trimmedOrch); }
             try {
-                // #3 Mid-loop breaker: if circling or runaway was detected last
-                // round, force this round to run with NO tools so the model must
-                // produce an answer instead of repeating the same call.
-                const wasForced = forceToolFreeRound;
-                if (wasForced) {
-                    forceToolFreeRound = false;
-                    circlingUselessRounds = 0;
-                    log(`[breaker] Forcing a tool-free round (circlingUseless was ${circlingUselessRounds})`);
-                    appendStatus({ phase: 'tool', label: 'Loop breaker: forcing a no-tools round to extract an answer' });
-                }
-                const _orchCtx = getNumCtx(model, orchestratorCtxOverride());
-                const requestBody: any = { model, messages, ...(wasForced ? {} : { tools: mergeSkillTools() }), stream: true, keep_alive: orchestratorKeepAlive(), options: { num_predict: 65536, temperature: 1, num_ctx: _orchCtx } };
+                const _orchCtx = getNumCtx(model, seatCtxOverride(model));
+                const requestBody: any = { model, messages, tools: mergeSkillTools(), stream: true, keep_alive: orchestratorKeepAlive(), options: { num_predict: maxOutput('orchestrator'), temperature: 0.3, num_ctx: _orchCtx, ...graniteSampling(model) } };
                 // First turn uses thinking so the orchestrator can plan; later iterations
                 // keep it off to preserve context for the visible answer. Models that leak
                 // reasoning when thinking is disabled (kimi) stay on every round.
                 // 'max' forces thinking on every iteration; 'false'/'off' disables it.
                 if (showThinking) {
-                    requestBody.think = (thinkingMode === 'max') || toolIteration === 1 || modelRequiresThink(model);
+                    // Same reason the sub-agent loop stopped forcing it (see
+                    // forcedFirstThink): granite plans inside its normal turn,
+                    // so spending iteration 1 in the think channel buys nothing
+                    // and risks a turn with no content. An explicit 'max' from
+                    // the user still wins — that knob is theirs.
+                    // A one-call mechanical ask (play/skip/pause — the playback
+                    // classifier) skips the planning pass entirely: 4.4k think
+                    // tokens before a single youtube call was ten seconds of
+                    // silence for nothing (2026-09-19).
+                    // lastUserAsk, not a messages scan — the current user slot on a
+                    // fresh runner embeds <chat_history>, and any old playback word
+                    // in it mis-flagged the turn (same defect as the stand-down
+                    // classifier, 2026-09-21).
+                    requestBody.think = thinkingAlways || modelRequiresThink(model)
+                        || (toolIteration === 1 && !PLAYBACK_ASK_RE.test(lastUserAsk) && !GRANITE_MODEL_RE.test(model));
                 } else {
                     // Explicitly disable thinking — otherwise thinking-capable models
                     // (granite4/gemma4) emit a `thinking` field with empty `content`,
                     // producing "Empty response." on every turn.
                     requestBody.think = false;
                 }
+                // #3c: a previous round burned its whole output budget inside the
+                // thinking channel — this round gets the budget for the answer.
+                if (suppressThinkOnce) {
+                    suppressThinkOnce = false;
+                    requestBody.think = false;
+                }
+                Object.assign(requestBody.options, qwenSampling(model, !!requestBody.think));
                 // AbortController lets the silence timer hard-abort a hung fetch —
                 // reader.cancel() alone doesn't interrupt a low-level TCP read on
                 // a cloud-proxied socket, so a stuck stream would otherwise hang
@@ -2436,7 +4967,8 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                 // the body stream exists. A cloud-proxied request that stalls
                 // BEFORE sending response headers would otherwise hang this
                 // await forever (observed: 11+ min dead chat, zero bytes).
-                const HEADERS_TIMEOUT_MS = 120_000;
+                // HEADERS_TIMEOUT_MS is derived at function scope from
+                // ORCHESTRATOR_HEADERS_TIMEOUT_MS (default 180s).
                 const headersTimer = setTimeout(() => {
                     log(`No response headers after ${HEADERS_TIMEOUT_MS / 1000}s — aborting fetch (stalled cloud request)`);
                     try { streamController.abort(); } catch { /* already aborted */ }
@@ -2496,9 +5028,12 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                     // If we already have content or tool calls, the model is working —
                     // give it room to buffer (Ollama buffers entire tool call JSON
                     // before sending). But still cap silence hard so a stuck cloud
-                    // socket can't hang the whole turn.
+                    // socket can't hang the whole turn. Pre-first-chunk, allow a
+                    // generous TTFT (cloud prefill can take minutes; a tight cap
+                    // killed jobs whose first token was merely late, and every
+                    // retry re-paid the same silent prefill).
                     const hasActivity = tokenCount > 0 || collectedToolCalls.length > 0 || fullThinking.length > 0;
-                    const silenceLimit = hasActivity ? 180_000 : 90_000;
+                    const silenceLimit = hasActivity ? 180_000 : (rawChunkCount === 0 ? 300_000 : 90_000);
                     const { done, value } = await Promise.race([
                         reader.read().then(r => { clearTimeout(streamTimer); return r; }).catch((e) => { clearTimeout(streamTimer); throw e; }),
                         new Promise<never>((_, reject) => {
@@ -2538,7 +5073,19 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                                 if (content.includes('</think>') || content.includes('</reasoning>')) {
                                     inThinkingBlock = false;
                                     // Transition from thinking to responding
-                                    appendStatus({ phase: 'responding', label: 'Generating response...' });
+                                    appendStatus({ phase: 'responding', label: 'Warden is generating...' });
+                                }
+                                // Separate-thinking-field models (qwen3.8, kimi) stream
+                                // reasoning in data.message.thinking and never emit the
+                                // inline tags above — so without this, no status reaches
+                                // the dashboard while the final reply streams and the
+                                // Oversight panel freezes on the last stale label. Emit
+                                // 'responding' once when real content starts outside a
+                                // thinking block. 'Warden is generating...' is what the
+                                // dashboard maps to "composing a reply…".
+                                if (!inThinkingBlock && !wroteRespondingStatus) {
+                                    wroteRespondingStatus = true;
+                                    appendStatus({ phase: 'responding', label: 'Warden is generating...' });
                                 }
                                 // For models that put thinking in <think> tags, update status with content preview
                                 if (inThinkingBlock && !wroteThinkingStatus && fullContent.length > 50) {
@@ -2562,6 +5109,17 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                                         appendStatus({ phase: 'tool', label: `Calling ${tc.function?.name || 'tool'}...` });
                                     }
                                     collectedToolCalls.push(tc);
+                                    const sig = toolSig(tc);
+                                    dupToolStreak = sig === lastToolSig ? dupToolStreak + 1 : 1;
+                                    lastToolSig = sig;
+                                    if (dupToolStreak >= DUP_TOOL_ABORT) {
+                                        dupToolAborted = true;
+                                        log(`Tool-call repetition loop: ${tc.function?.name} ×${dupToolStreak} identical — aborting stream, collapsing to one call`);
+                                        appendStatus({ phase: 'tool', label: `Loop guard: repeated ${tc.function?.name || 'tool'} call collapsed to one` });
+                                        try { streamController.abort(); } catch { /* already aborted */ }
+                                        reader.cancel().catch(() => {});
+                                        break;
+                                    }
                                 }
                             }
                             // Periodic progress log for long streams
@@ -2574,7 +5132,9 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                             // Buffer it so it gets prepended to the next chunk.
                             parseBuffer += line;
                         }
+                        if (dupToolAborted) break;
                     }
+                    if (dupToolAborted) break;
                 }
                 log(`Stream done: doneReason=${doneReason || 'none'}, contentLen=${fullContent.length}, thinkingLen=${fullThinking.length}, toolCalls=${collectedToolCalls.length}`);
                 if (doneReason === 'length') {
@@ -2605,6 +5165,27 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                         log(`Found ${collectedToolCalls.length} DSML tool calls in thinking`);
                     }
                 }
+                // Collapse runs of consecutive IDENTICAL tool calls to their
+                // first instance. Applies to both collection paths (native
+                // tool_calls and DSML text): a degenerate stream that was
+                // aborted mid-run ends with the duplicate tail, and the 91
+                // copies must never reach history/execution either way —
+                // identical results fed back are what seeded the next round's
+                // repetition.
+                {
+                    let prevSig = '';
+                    let write = 0;
+                    for (let i = 0; i < collectedToolCalls.length; i++) {
+                        const sig = toolSig(collectedToolCalls[i]);
+                        if (sig === prevSig) continue;
+                        prevSig = sig;
+                        collectedToolCalls[write++] = collectedToolCalls[i];
+                    }
+                    if (write < collectedToolCalls.length) {
+                        log(`Collapsed ${collectedToolCalls.length - write} consecutive duplicate tool call(s) → ${write}`);
+                        collectedToolCalls.length = write;
+                    }
+                }
                 // A duration-cap abort with no tool calls produced no usable answer —
                 // observed 2026-07-03: a 10-min degenerate stream's partial garbage
                 // became a "success" reply. Throw instead ("aborted" is retryable),
@@ -2626,6 +5207,31 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                 const channelIdx = historyContent.lastIndexOf('<channel|>');
                 if (channelIdx !== -1) historyContent = historyContent.slice(channelIdx + '<channel|>'.length);
                 historyContent = historyContent.trim();
+                // #3c Thinking burned the whole output budget (2026-09-26): a round
+                // ending done_reason=length with zero content and zero tool calls
+                // spent everything it had inside the thinking channel — the
+                // user-visible turn is empty ("did you do it?" → 809 chars of
+                // thinking, 0 content, garbage out). Retry the same round with
+                // thinking off so whatever budget exists goes to the answer. The
+                // empty assistant turn is NOT pushed to history. Thinking may not
+                // survive to the runner at all (stream chunks dropped) — so the
+                // retry covers ANY non-clean termination that delivered nothing:
+                // 'length' (budget), missing/empty reason (qwen emitted a malformed
+                // tool call at 21:15 — Ollama's parser dropped it server-side and
+                // returned 200 with no done_reason, 0 content, 0 tool calls), or
+                // any other dead end. A clean 'stop' is NOT retried: the granite
+                // seats are never forced into the think channel (GRANITE_MODEL_RE
+                // at the think decision below), so an empty clean stop is the
+                // model's own finish — handled by the empty-reply fallback, not by
+                // forcing thinking off.
+                if (doneReason !== 'stop' && !fullContent.trim() && collectedToolCalls.length === 0
+                    && thinkBudgetRetries < 1) {
+                    thinkBudgetRetries++;
+                    suppressThinkOnce = true;
+                    log(`[think-budget] round ended without a clean stop and produced nothing (doneReason=${doneReason || 'none'}, thinking ${fullThinking.length} chars) — retrying this round with thinking off`);
+                    appendStatus({ phase: 'thinking', label: 'Retry: thinking overran the reply budget' });
+                    continue;
+                }
                 if (collectedToolCalls.length > 0) {
                     messages.push({ role: 'assistant', content: historyContent, tool_calls: collectedToolCalls });
                 } else {
@@ -2689,53 +5295,49 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                         }
                     }));
                     for (const result of toolResults) {
-                        const body = truncateToolResult('orchestrator', result.content);
+                        const body = truncateToolResult(result.toolName || 'orchestrator', result.content);
                         messages.push({ role: 'tool', content: TRUSTED_RESULT_TOOLS.has(result.toolName) ? body : untrustedContextMessage(body) });
                     }
-                    // #3 Mid-loop breaker tracking: record each call sig, detect
-                    // runaway (same sig >= RUNAWAY_CALL_LIMIT) and circling
-                    // (repeated recent sig + no answer text). Either forces a
-                    // tool-free round on the next iteration.
-                    // #1 Verifier snapshot: append each effectful tool call to
-                    // the actions snapshot so a fresh-context verifier can judge
-                    // SUCCESS/FAIL after the turn.
-                    const lastSigs = collectedToolCalls.map(tc => callSignature(tc.function?.name || '', tc.function?.arguments || {}));
-                    const repeatsRecent = lastSigs.some(s => recentCallSigs.includes(s));
+                    lastToolBatchWasError = toolResults.length > 0
+                        && toolResults.every(r => /^Error/i.test(String(r.content).trim()));
+                    // Track which delegates were actually invoked this turn (used by
+                    // the narrated-delegation guard to tell a promise from a citation).
                     for (let k = 0; k < collectedToolCalls.length; k++) {
-                        const tc = collectedToolCalls[k];
-                        const name = tc.function?.name || '';
-                        const args = tc.function?.arguments || {};
-                        const sig = lastSigs[k];
-                        recentCallSigs.push(sig);
-                        if (recentCallSigs.length > RECENT_CALL_SIG_DEPTH) recentCallSigs.shift();
-                        callFreq[sig] = (callFreq[sig] || 0) + 1;
-                        if (VERIFIER_EFFECTFUL_TOOLS.has(name)) {
-                            const resultPreview = (toolResults[k]?.content || '').slice(0, 300).replace(/\n/g, ' ');
-                            verifierActions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${resultPreview}`);
-                            verifierTriggeredThisTurn = true;
+                        const name = collectedToolCalls[k].function?.name || '';
+                        if (SUBAGENT_BY_DELEGATE.has(name)) {
+                            delegatedThisTurn = true;
+                            delegatesCalledThisTurn.add(name);
                         }
-                    }
-                    const topFreqEntry = Object.entries(callFreq).sort((a, b) => b[1] - a[1])[0];
-                    if (topFreqEntry && topFreqEntry[1] >= RUNAWAY_CALL_LIMIT) {
-                        log(`[breaker] Runaway: "${topFreqEntry[0].slice(0, 80)}" called ${topFreqEntry[1]}x — forcing tool-free round`);
-                        appendStatus({ phase: 'tool', label: `Loop breaker: runaway call (${topFreqEntry[1]}x same signature)` });
-                        forceToolFreeRound = true;
-                    }
-                    const hasAnswerText = (historyContent || '').trim().length > 50;
-                    if (!hasAnswerText && repeatsRecent) {
-                        circlingUselessRounds++;
-                        if (circlingUselessRounds >= CIRCLING_USELESS_LIMIT) {
-                            log(`[breaker] Circling: ${circlingUselessRounds} useless rounds — forcing tool-free round`);
-                            appendStatus({ phase: 'tool', label: `Loop breaker: ${circlingUselessRounds} circling rounds` });
-                            forceToolFreeRound = true;
-                        }
-                    } else {
-                        circlingUselessRounds = 0;
                     }
                     // If Read tool queued images, inject them as a user message for vision
+                    // — only when they fit the context budget (an over-limit attach
+                    // 400s the next request and kills the turn).
                     if ((globalThis as any)._pendingImages && (globalThis as any)._pendingImages.length > 0) {
-                        messages.push({ role: 'user', content: '[The image(s) from the Read tool are now visible in this message.]', images: (globalThis as any)._pendingImages } as any);
+                        const _pi = (globalThis as any)._pendingImages;
                         (globalThis as any)._pendingImages = [];
+                        const orchImgBudget2 = orchestratorMsgBudgetChars(
+                            model,
+                            estimateMessagesChars(messages[1]?.role === 'system' ? messages.slice(0, 3) : messages.slice(0, 2)),
+                            JSON.stringify(mergeSkillTools()).length,
+                        );
+                        if (imagesFitBudget(messages, _pi.length, orchImgBudget2) && !MODELS_WITHOUT_VISION.has(model)) {
+                            messages.push({ role: 'user', content: '[The image(s) from the Read tool are now visible in this message.]', images: _pi } as any);
+                        } else {
+                            const why = MODELS_WITHOUT_VISION.has(model) ? 'this model cannot see images' : 'the conversation is near the context limit and adding them would exceed it';
+                            log(`[orchestrator] Image drain: ${_pi.length} image(s) NOT attached (${why}) — keeping the turn alive`);
+                            let visionReport = '';
+                            if (MODELS_WITHOUT_VISION.has(model)) {
+                                const vision = await askVisionModel(_pi,
+                                    'Warden Read this image but its model cannot see images. Describe factually and concretely what the image shows — layout, colors, any visible text — so the seat can continue. Answer directly, no preamble.');
+                                if (vision.ok && vision.answer) {
+                                    visionReport = vision.answer;
+                                    log(`[orchestrator] Vision report: "${visionReport.slice(0, 120)}"`);
+                                }
+                            }
+                            messages.push({ role: 'user', content: visionReport
+                                ? `[The image(s) you Read were NOT attached (${why}) — a vision-capable model analyzed them for you:\n\n${visionReport}\n\nFor follow-up questions call query_image with the image's file_path. Continue and answer.]`
+                                : `[The image(s) you Read were NOT attached: ${why}. Do not Read them again — continue from what you already know and answer.]` });
+                        }
                     }
                     finalThinking += (finalThinking && fullThinking ? '\n' : '') + fullThinking;
                     const newlySent = [...modifiedFiles].filter(f => !attachedFiles.has(f));
@@ -2757,80 +5359,145 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                 // like"), advice about the user's own actions, or a reply that
                 // ends by asking the user something. Those are legitimate final
                 // answers — nudging them manufactures tool calls nobody wanted.
-                const conversationalReply = /\b(?:if you(?:'d| would)?(?: like| want)?|want me to|would you like|shall i|just say|let me know|whenever you|later|tomorrow|tonight|you should|you could|you can|you're|you are|you'll|you will)\b/i.test(historyContent)
-                    || historyContent.trim().endsWith('?');
-                if (intentNudgesUsed < INTENT_MAX_NUDGES && historyContent.length < 400 && !/```/.test(historyContent) && !conversationalReply) {
+                // Hallucinated hand-off: the model CLAIMS it already delegated
+                // ("I've asked Atlas to…") but no delegate call happened this turn.
+                // That is never a conversational reply — polite tail phrases like
+                // "I'll let you know" must not suppress the nudge (2026-08-21: a
+                // claimed YouTube delegation passed exactly that way, no job ran).
+                const claimedDelegation = !delegatedThisTurn
+                    && /\bi(?:'ve| have) (?:asked|sent|delegated|passed|handed)\b[\s\S]{0,60}?\b(?:iris|vulkan|artemis|sentry)\b/i.test(historyContent);
+                // Narrated delegation: a delegate is named in the reply but was
+                // never called this turn, and the mention is NOT a past-tense
+                // citation ("Atlas reported…") or a possessive ("Atlas's
+                // report"). Catches present-progressive ("Atlas is opening the
+                // page now") and future ("I'll have Atlas do X — I'll let you
+                // know") hand-offs that escape both INTENT_RE and the past-tense
+                // claimedDelegation regex. Returns the named delegate so the
+                // nudge can name the exact tool to call.
+                let narratedDelegation = '';
+                if (!delegatedThisTurn) {
+                    for (const dn of DELEGATE_NAMES) {
+                        if (delegatesCalledThisTurn.has(dn)) continue;
+                        const re = new RegExp(`\\b${dn}\\b`, 'gi');
+                        let m: RegExpExecArray | null;
+                        while ((m = re.exec(historyContent)) !== null) {
+                            const idx = m.index;
+                            // Possessive "Atlas's" → citation of a prior artifact.
+                            if (historyContent[idx + dn.length] === "'" && historyContent[idx + dn.length + 1] === 's') continue;
+                            // Past-tense citation, two English orders:
+                            //  (a) marker before the name — "according to Atlas",
+                            //      "from Atlas", "per Atlas", "as Atlas said";
+                            //  (b) subject-verb after the name — "Atlas noted…",
+                            //      "Vulkan reported…", "Atlas said X". This is the
+                            //      common case for a completion report citing a
+                            //      delegate's result ("Vulkan noted the file had
+                            //      no localhost:8001 wiring") and MUST be excluded
+                            //      or the guard false-fires on the very report it
+                            //      should let through, re-dispatching a finished
+                            //      job. Scan both directions (~40 chars each).
+                            const preceding = historyContent.slice(Math.max(0, idx - 40), idx);
+                            if (PAST_TENSE_MARKER_RE.test(preceding)) continue;
+                            const following = historyContent.slice(idx + dn.length, idx + dn.length + 40);
+                            if (PAST_TENSE_MARKER_RE.test(following)) continue;
+                            // Scope statement: "iris owns email and calendar"
+                            // names the delegate to state what it IS — not to
+                            // narrate a hand-off. (2026-10-08: a correct routing
+                            // explanation was nudged into a wrong delegation
+                            // exactly this way.)
+                            if (/^\s+(?:owns|handles|covers|means|is\s+the|is\s+a|is\s+not)\b/i.test(following)) continue;
+                            narratedDelegation = dn;
+                            break;
+                        }
+                        if (narratedDelegation) break;
+                    }
+                }
+                const conversationalReply = !claimedDelegation && !narratedDelegation && (/\b(?:if you(?:'d| would)?(?: like| want)?|want me to|would you like|shall i|just say|let me know|whenever you|later|tomorrow|tonight|you should|you could|you can|you're|you are|you'll|you will)\b/i.test(historyContent)
+                    || historyContent.trim().endsWith('?'));
+                // Narrations can be long ("I'll have Atlas open the page and
+                // report exactly what's on screen, then I'll summarize…"), so
+                // exempt narratedDelegation from the 400-char cap that bounds
+                // the INTENT_RE path; intent/claimed paths keep the cap.
+                if (intentNudgesUsed < INTENT_MAX_NUDGES && (narratedDelegation || historyContent.length < 400) && !/```/.test(historyContent) && !conversationalReply && !delegatedThisTurn && !lastToolBatchWasError) {
                     const intentMatch = historyContent.match(INTENT_RE);
-                    if (intentMatch) {
+                    if (intentMatch || claimedDelegation || narratedDelegation) {
                         intentNudgesUsed++;
-                        const announcement = intentMatch[0].slice(0, 120);
+                        const announcement = (intentMatch ? intentMatch[0] : historyContent).slice(0, 120);
                         log(`Intent nudge ${intentNudgesUsed}/${INTENT_MAX_NUDGES}: model announced action without tool_call: "${announcement}"`);
                         appendStatus({ phase: 'thinking', label: `Nudge ${intentNudgesUsed}/${INTENT_MAX_NUDGES}: model announced action without tool call — pushing back` });
-                        messages.push({ role: 'user', content: `You wrote "${announcement}" but did not emit a tool call. Stop announcing — act now. Delegate to the right sub-agent (atlas, iris, dexter, byte) with a {task}, or use Read/get_chat_history for a quick lookup. Do not write another sentence describing what you will do — do it.` });
+                        const delegateList = 'iris/vulkan/artemis/sentry';
+                        let nudgeMsg: string;
+                        if (narratedDelegation) {
+                            nudgeMsg = `You wrote "${announcement}" and named ${narratedDelegation}, but you made no ${narratedDelegation} tool call — the delegation did not happen. Call the ${narratedDelegation} tool with a {task} now, or drop the narration and answer directly.`;
+                        } else if (claimedDelegation) {
+                            nudgeMsg = `You wrote "${announcement}" but made no delegate call — the delegation did not happen. Call the delegate tool (${delegateList}) with a {task} now.`;
+                        } else {
+                            nudgeMsg = `You wrote "${announcement}" but emitted no tool call. Act now: do it yourself with your own tools, or hand it to the specialist that owns it (${delegateList}) with a {task}.`;
+                        }
+                        messages.push({ role: 'user', content: nudgeMsg });
                         continue;
                     }
                 }
-                /* VERIFIER DISABLED 2026-07-01 — it judges from a TEXT snapshot of effectful
-                   actions only (verifierActions) and cannot see screenshots or page/DOM state,
-                   so it systematically false-fails visual/browser tasks and makes the agent
-                   undo correct work (e.g. unpausing a video it had just paused). Re-enable
-                   only when it can inspect real state. See memory: project-verifier-disabled.
-                // No nudge fired — text-only response is the final answer,
-                // unless the fresh-context verifier (opt-in via
-                // AGENT_VERIFIER_SUBAGENT=1) judges the work FAIL. The verifier
-                // sees the user's original request + a snapshot of effectful
-                // tool calls — NOT the conversation history — so it can't
-                // rationalize the agent's own reasoning. Capped at
-                // VERIFIER_MAX_ROUNDS per turn.
-                if (AGENT_VERIFIER_SUBAGENT && verifierTriggeredThisTurn && verifierRoundsUsed < VERIFIER_MAX_ROUNDS && toolIteration < MAX_TOOL_ITERATIONS) {
-                    verifierRoundsUsed++;
-                    const userRequest = (input.prompt || '').slice(0, 1000);
-                    const actionsSnap = verifierActions.length > 0 ? verifierActions.join('\n') : '(no effectful actions taken)';
-                    const verifierPrompt = `You are a strict verifier. Judge whether the agent successfully completed the user's request.\n\nUSER REQUEST:\n${userRequest}\n\nACTIONS TAKEN BY THE AGENT (effectful tool calls only, with result preview):\n${actionsSnap}\n\nReply with one of:\n- SUCCESS: <one-line reason>\n- FAIL: <bullet list of specific issues the agent should fix>\n\nBe strict. If any concrete deliverable the user asked for is missing or unverified, reply FAIL. If the agent claims success but no effectful action was taken, reply FAIL.`;
-                    log(`[verifier] Round ${verifierRoundsUsed}/${VERIFIER_MAX_ROUNDS}: running fresh-context check (${verifierActions.length} actions)`);
-                    appendStatus({ phase: 'artemis', label: `Verifier round ${verifierRoundsUsed}/${VERIFIER_MAX_ROUNDS}: checking work...` });
-                    try {
-                        const verifierResp = await fetch(CHAT_URL, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                model,
-                                messages: [
-                                    { role: 'system', content: 'You are a strict verifier. Judge SUCCESS or FAIL only. Do not engage with the request itself.' },
-                                    { role: 'user', content: untrustedContextMessage(verifierPrompt) },
-                                ],
-                                stream: false,
-                                keep_alive: -1,
-                                options: { num_predict: 1024, temperature: 0.2, num_ctx: getNumCtx(model, orchestratorCtxOverride()) },
-                            }),
-                        });
-                        if (verifierResp.ok) {
-                            const verifierData = await verifierResp.json();
-                            const verdict = ((verifierData.message?.content || '') + '').trim();
-                            log(`[verifier] Verdict: ${verdict.slice(0, 200)}`);
-                            if (/^FAIL/i.test(verdict) || /^FAIL:/.test(verdict) || /\bFAIL:/i.test(verdict)) {
-                                appendStatus({ phase: 'artemis', label: `Verifier: FAIL — pushing issues back to the agent` });
-                                messages.push({ role: 'user', content: `[Verifier feedback — a fresh-context check found issues with your work]\n\n${verdict}\n\nFix these issues. Do not claim success until each one is addressed with a concrete tool call that verifies or corrects the deliverable.` });
-                                verifierActions = [];
-                                verifierTriggeredThisTurn = false;
-                                continue;
-                            } else {
-                                appendStatus({ phase: 'artemis', label: 'Verifier: SUCCESS' });
-                            }
-                        } else {
-                            log(`[verifier] HTTP ${verifierResp.status} — accepting the answer without verification`);
+                // ─── Pasted tool-call guard ───────────────────────────────
+                // A cornered small model (loop breaker fired, tools yanked)
+                // emits the tool call AS CONTENT — "<function=x>…</function>"
+                // — which used to become the chat reply verbatim (2026-09-21
+                // "look up cats": four refused youtube calls, then the raw
+                // <function=youtube> block pasted as the final answer). Parse
+                // the block, run the call it names, and continue with the
+                // result + a demand for plain text. Capped: a model that keeps
+                // pasting gets its text accepted as the answer instead.
+                if (pastedCallRuns < 2 && /<function=[\w.-]+>/i.test(historyContent)) {
+                    // Truncated blocks are the common case (2026-09-21 "lofi
+                    // study mix": stream stopped before </function>), so the
+                    // close tags are optional — an unclosed block matches to
+                    // end-of-content instead of leaking to the chat reply.
+                    const fnMatch = historyContent.match(/<function=([\w.-]+)>([\s\S]*?)(?:<\/function>|$)/i);
+                    if (fnMatch) {
+                        const fnName = fnMatch[1];
+                        const fnArgs: Record<string, string> = {};
+                        for (const pm of fnMatch[2].matchAll(/<parameter=([\w.-]+)>\s*([\s\S]*?)\s*(?:<\/parameter>|$)/g)) {
+                            fnArgs[pm[1]] = pm[2];
                         }
-                    } catch (verifierErr) {
-                        log(`[verifier] Failed: ${verifierErr.message} — accepting the answer without verification`);
+                        // Only recover a call the model can actually SEE this
+                        // turn. A name absent from the tool menu is the model
+                        // inventing one — running it would hand back a result
+                        // for a tool it was never offered, and the reply would
+                        // report the hallucinated action as done. Strip the
+                        // block instead: the text around it is the answer, and
+                        // an empty remainder hits the empty-reply fallback.
+                        const visible = new Set(mergeSkillTools().map((t: any) => String(t?.function?.name || '')));
+                        const bareFull = resolveBareMcpName(fnName);
+                        const callName = visible.has(fnName) ? fnName : (bareFull && visible.has(bareFull) ? bareFull : '');
+                        if (!callName) {
+                            log(`[pasted-call] <function=${fnName}> names a tool outside this turn's menu — stripped, not run`);
+                            // Strip the wrapper too — matching only the
+                            // <function=…> body left <tool_call></tool_call>
+                            // dangling at the end of the reply (2026-10-18).
+                            finalContent = historyContent
+                                .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+                                .replace(/<function=[\w.-]+>[\s\S]*?(?:<\/function>|$)/i, '')
+                                .replace(/<\/?tool_call>/gi, '')
+                                .trim();
+                            finalThinking += (finalThinking && fullThinking ? '\n' : '') + fullThinking;
+                            break;
+                        }
+                        pastedCallRuns++;
+                        log(`[pasted-call] model emitted <function=${fnName}> as content — recovering it as a real tool call`);
+                        appendStatus({ phase: 'tool', label: `Recovered pasted tool call: ${callName}` });
+                        const fnResult = await executeXmlTool(callName, fnArgs, toolContext, modifiedFiles, { orchestrator: true });
+                        // The assistant turn (with the pasted XML) was already
+                        // pushed above — only the tool result rides in now.
+                        messages.push({ role: 'user', content: `The ${callName} call you wrote out just ran. Result:\n${truncateToolResult('orchestrator', String(fnResult))}\n\nReply to the user now in plain text — no tool calls.` });
+                        continue;
                     }
-                } */
+                }
                 finalContent = historyContent;
                 finalThinking += (finalThinking && fullThinking ? '\n' : '') + fullThinking;
                 break;
             }
             catch (err) {
                 const errMsg = err.message || String(err);
-                const isRetryable = errMsg.includes('overloaded') || errMsg.includes('rate_limit') || errMsg.includes('Rate limit') || errMsg.includes('Service Unavailable') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('ECONNRESET') || errMsg.includes('ECONNREFUSED') || errMsg.includes('timeout') || errMsg.includes('Stream silent') || errMsg.includes('terminated') || errMsg.includes('aborted') || errMsg.includes('AbortError');
+                const isRetryable = errMsg.includes('overloaded') || errMsg.includes('rate_limit') || errMsg.includes('Rate limit') || errMsg.includes('Service Unavailable') || errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('fetch failed') || errMsg.includes('ECONNRESET') || errMsg.includes('ECONNREFUSED') || errMsg.includes('timeout') || errMsg.includes('Stream silent') || errMsg.includes('terminated') || errMsg.includes('aborted') || errMsg.includes('AbortError');
                 log(`Ollama error: ${errMsg} (retryable: ${isRetryable})`);
                 if (isRetryable && toolIteration < MAX_TOOL_ITERATIONS) {
                     const MAX_RETRIES = 5;
@@ -2840,14 +5507,20 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                         log(`Retry ${attempt}/${MAX_RETRIES} in ${delay/1000}s...`);
                         await new Promise(r => setTimeout(r, delay));
                         try {
-                            const trimmedRetry = trimMessagesToBudget(messages, ORCHESTRATOR_MSG_BUDGET_CHARS);
-                            if (trimmedRetry.length !== messages.length) messages.length = 0, messages.push(...trimmedRetry);
-                            const retryBody: any = { model, messages, tools: mergeSkillTools(), stream: true, keep_alive: orchestratorKeepAlive(), options: { num_predict: 65536, temperature: 1, num_ctx: getNumCtx(model, orchestratorCtxOverride()) } };
-                            if (toolIteration <= 1 || modelRequiresThink(model)) {
-                                retryBody.think = true;
+                            const retryBudget = orchestratorMsgBudgetChars(
+                                model,
+                                estimateMessagesChars(messages[1]?.role === 'system' ? messages.slice(0, 3) : messages.slice(0, 2)),
+                                JSON.stringify(mergeSkillTools()).length,
+                            );
+                            const trimmedRetry = trimMessagesToBudget(messages, retryBudget);
+                            if (trimmedRetry !== messages) { messages.length = 0; messages.push(...trimmedRetry); }
+                            const retryBody: any = { model, messages, tools: mergeSkillTools(), stream: true, keep_alive: orchestratorKeepAlive(), options: { num_predict: maxOutput('orchestrator'), temperature: 0.3, num_ctx: getNumCtx(model, seatCtxOverride(model)), ...graniteSampling(model) } };
+                            if (showThinking) {
+                                retryBody.think = thinkingAlways || toolIteration <= 1 || modelRequiresThink(model);
                             } else {
                                 retryBody.think = false;
                             }
+                            Object.assign(retryBody.options, qwenSampling(model, !!retryBody.think));
                             const retryController = new AbortController();
                             const retryResp = await fetch(CHAT_URL, {
                                 method: 'POST',
@@ -2939,8 +5612,16 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
                     }
                     if (retryOk) continue; // Back to main tool loop
                 }
-                writeOutput({ status: 'error', result: null, error: `Ollama error: ${errMsg}` });
+                writeOutput({ status: 'error', result: null, error: errMsg.startsWith('Ollama error:') ? errMsg : `Ollama error: ${errMsg}`, spontaneous: turnWasInboxDigest });
                 errorOutputWritten = true;
+                // Digest read-safety: the digest drained (marked read) these results
+                // before the turn ran; if the digest turn errored, re-queue each ONCE
+                // so the result isn't silently lost — the Set caps re-digest loops.
+                if (turnWasInboxDigest && drainedDigestJobIds.length > 0) {
+                    const requeue = drainedDigestJobIds.filter(id => !digestRequeuedOnce.has(id));
+                    for (const id of requeue) { digestRequeuedOnce.add(id); inbox.markUnread(id); }
+                    if (requeue.length > 0) log(`[inbox] digest turn errored — re-queued ${requeue.length} result(s) for one re-digest`);
+                }
                 break; // exit the tool loop — fall through to end-of-turn flow (waitForIpc) so the persistent child stays alive for the next message
             }
         }
@@ -2956,16 +5637,21 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             log(`Tool cap hit with no final answer — forcing a no-tools round`);
             appendStatus({ phase: 'tool', label: 'Tool cap reached — forcing final answer...' });
             try {
-                const forcedMessages = trimMessagesToBudget(messages, ORCHESTRATOR_MSG_BUDGET_CHARS);
+                const forcedMessages = trimMessagesToBudget(messages, orchestratorMsgBudgetChars(
+                    model,
+                    estimateMessagesChars(messages[1]?.role === 'system' ? messages.slice(0, 3) : messages.slice(0, 2)),
+                    JSON.stringify(mergeSkillTools()).length,
+                ));
                 const forcedBody: any = {
                     model,
                     messages: forcedMessages,
                     stream: true,
                     keep_alive: orchestratorKeepAlive(),
-                    options: { num_predict: 8192, temperature: 1, num_ctx: getNumCtx(model, orchestratorCtxOverride()) },
+                    options: { num_predict: maxOutput('oneshot'), temperature: 0.3, num_ctx: getNumCtx(model, seatCtxOverride(model)), ...graniteSampling(model) },
                 };
                 // No `tools` key — model cannot emit tool_calls, must produce text.
                 if (modelRequiresThink(model)) forcedBody.think = true; else forcedBody.think = false;
+                Object.assign(forcedBody.options, qwenSampling(model, !!forcedBody.think));
                 const forcedController = new AbortController();
                 const forcedResp = await fetch(CHAT_URL, {
                     method: 'POST',
@@ -3035,21 +5721,21 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             return '';
         }).replace(/<\/?(?:think|reasoning)>/g, '').trim();
         // If the model gave no text response (only thinking, or thinking + tools), generate a fallback.
-        // Skip the fallback on monitor-tick supervision turns: a silent tick means
-        // "work is going fine, nothing to report" — fabricating a reply from
-        // thinking would spam the user with a non-update. Let it stay empty so the
-        // send_message routing below sends nothing.
-        if (!outputContent && !turnWasMonitorTick) {
+        if (!outputContent) {
             if (toolIteration > 1 && modifiedFiles.size > 0) {
                 outputContent = `Done — modified ${[...modifiedFiles].join(', ')}.`;
             }
             else if (finalThinking.trim()) {
-                // Model only produced thinking with no content or tools — extract a summary
-                const lines = finalThinking.trim().split('\n').filter(l => l.trim());
-                const last = lines[lines.length - 1] || '';
-                outputContent = last.length > 200 ? last.slice(0, 197) + '...' : last;
-                if (!outputContent)
-                    outputContent = 'I processed your request but had nothing to add.';
+                // Thinking-only turn that survived the think-budget retry — the
+                // model never produced an answer. NEVER ship the monologue: the
+                // old fallback sliced its last line ("Neither creates") into the
+                // chat as if it were a reply (2026-09-26). State the fact and
+                // end the turn; per the error-text rule this must not read as an
+                // instruction.
+                log(`[output] empty reply on a thinking-only turn — internal monologue withheld (model=${ATLAS_MODEL}, thinking ${finalThinking.length} chars)`);
+                outputContent = lastToolSummary
+                    ? `I couldn't produce a clean reply this turn — the model ended its turn without an answer. Last action: ${lastToolSummary}.`
+                    : `I couldn't produce a reply this turn — the model ended its turn without an answer.`;
             }
         }
         // Thinking stripped from output — not shown to user
@@ -3059,7 +5745,26 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
         if (outputContent && /<unk>|<pad>|<\|[a-z_]+\|>/i.test(outputContent)) {
             const before = outputContent.length;
             outputContent = outputContent.replace(/(?:<unk>|<pad>|<\|[a-z_]+\|>)+/gi, ' ').replace(/\s{2,}/g, ' ').trim();
-            log(`WARNING: control-token garbage stripped from final output (${before} -> ${outputContent.length} chars, model=${ORCHESTRATOR_MODEL}). Degenerate generation — capture this prompt if it recurs.`);
+            log(`WARNING: control-token garbage stripped from final output (${before} -> ${outputContent.length} chars, model=${ATLAS_MODEL}). Degenerate generation — capture this prompt if it recurs.`);
+        }
+        // Raw tool-call markup must never reach the reply channel. The
+        // pasted-call recovery strips the <function=…> block it inspects, but
+        // the surrounding <tool_call> wrapper survived and shipped as the last
+        // lines of the chat reply (2026-10-18). Strip the whole shape here too
+        // and log when it fires.
+        if (outputContent && /<\/?tool_call>|<function=[\w.-]+>/i.test(outputContent)) {
+            const before = outputContent.length;
+            outputContent = outputContent
+                .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+                .replace(/<function=[\w.-]+>[\s\S]*?(?:<\/function>|$)/gi, '')
+                .replace(/<\/?tool_call>/gi, '')
+                .trim();
+            log(`[output] raw tool-call markup stripped from reply (${before} -> ${outputContent.length} chars)`);
+            if (!outputContent) {
+                outputContent = lastToolSummary
+                    ? `I couldn't produce a clean reply this turn. Last action: ${lastToolSummary}.`
+                    : `I couldn't produce a clean reply this turn.`;
+            }
         }
         // Second net: BPE word-mash garbage carries no control tokens (observed
         // 2026-07-03 under kimi: "inistcapebene autwebkitOraCurve LumpDotLAB ...").
@@ -3075,52 +5780,27 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             return mashed / words.length >= 0.25;
         };
         if (outputContent && looksDegenerate(outputContent)) {
-            log(`WARNING: degenerate word-mash output suppressed (${outputContent.length} chars, model=${ORCHESTRATOR_MODEL}). First 200 chars: ${outputContent.slice(0, 200)}`);
+            log(`WARNING: degenerate word-mash output suppressed (${outputContent.length} chars, model=${ATLAS_MODEL}). First 200 chars: ${outputContent.slice(0, 200)}`);
             outputContent = 'Something went wrong generating my answer on this turn — the model produced garbled output. Please send that request again.';
-        }
-        // Placeholder/no-op detector: the model sometimes emits markers like
-        // "<empty></empty>" or "Empty response." when told to reply with nothing.
-        // On monitor ticks, replace that with a simple, human status note so the
-        // supervisor actually says something instead of looking broken.
-        const isPlaceholderOutput = (text: string): boolean => {
-            const t = (text || '').trim().toLowerCase().replace(/\s+/g, ' ');
-            if (!t) return true;
-            const placeholders = [
-                '<empty></empty>',
-                'empty response.',
-                'empty response requested by system for on-track jobs.',
-                'no response.',
-                'nothing to report.',
-                '---',
-                '...',
-                '–',
-            ];
-            return placeholders.includes(t) || /^[.\-_\s–]+$/.test(t);
-        };
-        if (turnWasMonitorTick && isPlaceholderOutput(outputContent)) {
-            const running = [...backgroundJobs.values()].filter(j => j.status === 'running');
-            outputContent = running.length > 0
-                ? `Supervisor check — everything is looking good (${running.length} job${running.length > 1 ? 's' : ''} running).`
-                : '';
-            if (outputContent) log(`[orchestrator-monitor] placeholder replaced with default status note`);
         }
         log(`About to writeOutput. outputContent: "${(outputContent || '').slice(0, 100)}"`)
         if (!errorOutputWritten) {
-            writeOutput({ status: 'success', result: outputContent || null });
+            // `spontaneous:true` tells the host this OUTPUT came from an
+            // inbox-digest turn (no user message triggered it). The host
+            // suppresses channel delivery of spontaneous OUTPUT to avoid
+            // double-reporting: the send_message block below is the single
+            // delivery path for digest replies, and a concurrent user message
+            // can otherwise leave a host turn-resolve pending that also
+            // delivers the OUTPUT via deliverReply (race observed 2026-08-24).
+            writeOutput({ status: 'success', result: outputContent || null, spontaneous: turnWasInboxDigest });
             log('writeOutput completed');
         } else {
             log('skipping success writeOutput — error output already written this turn');
         }
-        // Spontaneous turns (inbox digest of a finished job, or a monitor-tick
-        // supervision check) have no host turn pending when they emit OUTPUT, so
-        // the reply above is dropped by the host. Route them so they reach the
-        // user/dashboard:
-        //  - Inbox digest  → send_message to the CHAT (this is the completed-task
-        //    report the user actually wants to hear).
-        //  - Monitor tick   → progress_event to the DASHBOARD progress panel.
-        //    The tick's supervision prose ("Atlas is on track…") is canned filler;
-        //    it belongs in the dashboard's collapsible activity panel, NOT the
-        //    chat. The chat only carries completed-task reports and interventions.
+        // A digest turn (inbox draining a finished job) has no host turn pending
+        // when it emits OUTPUT, so the reply above is dropped by the host. Route
+        // it through send_message so it reaches the user — this is the
+        // completed-task report the user actually wants to hear.
         // Skip when the orchestrator chose to say nothing (empty reply — work is
         // going fine, or media playback success), and skip errored turns (the
         // error path already spoke). A reply that is only punctuation/whitespace
@@ -3141,33 +5821,20 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
             } catch (err: any) {
                 log(`[spontaneous-turn] failed to deliver digest reply via send_message: ${err?.message ?? err}`);
             }
-        } else if (turnWasMonitorTick && !errorOutputWritten && substantiveReply) {
-            try {
-                writeCallback('progress_event', {
-                    chatJid: toolContext.chatJid,
-                    groupFolder: toolContext.groupFolder,
-                    text: outputContent,
-                    timestamp: new Date().toISOString(),
-                });
-                log(`[spontaneous-turn] monitor-tick report routed to dashboard progress panel (${outputContent.length} chars)`);
-            } catch (err: any) {
-                log(`[spontaneous-turn] failed to route monitor-tick report: ${err?.message ?? err}`);
-            }
-        } else if ((turnWasInboxDigest || turnWasMonitorTick) && !errorOutputWritten) {
-            log(`[spontaneous-turn] ${turnWasMonitorTick ? 'monitor tick' : 'inbox digest'} produced no substantive reply — staying silent`);
+        } else if (turnWasInboxDigest && !errorOutputWritten) {
+            log(`[spontaneous-turn] inbox digest produced no substantive reply — staying silent`);
         }
         // Auto-send any files that were modified during tool execution but not attached
         const unsent = [...modifiedFiles].filter(f => !attachedFiles.has(f));
         for (const filePath of unsent) {
             const cleaned = cleanFilePath(filePath);
             const resolved = safeResolve(cleaned);
-            if (resolved.ok === false) {
-                log(`Auto-attach skipped ${filePath}: ${resolved.error}`);
-                continue;
-            }
             if (fs.existsSync(resolved.path)) {
                 const isImage = /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(filePath);
-                const tag = isImage ? `[Image: ${filePath}]` : `[File: ${filePath}]`;
+                // Tag with the RESOLVED absolute path — the host (telegram
+                // sendPhoto/sendDocument) can't expand ~ or runner-relative
+                // paths itself.
+                const tag = isImage ? `[Image: ${resolved.path}]` : `[File: ${resolved.path}]`;
                 writeCallback('send_message', {
                     type: 'message',
                     chatJid: toolContext.chatJid,
@@ -3187,213 +5854,120 @@ ${input.memoryContext ? `\nLoaded memory:\n${input.memoryContext}\n` : ''}
         // (Without this there's a dead zone between turn-end and the job's first
         // tool call where the dashboard reads "idle" while Atlas is working.)
         emitJobsStatus();
+        // Roll an autonomous background turn back out of the conversation — its
+        // prompt and output must not become the seat's memory (a following chat
+        // turn would otherwise answer a real question with the sweep's "QUIET").
+        if (sideTurnMarker) {
+            const si = messages.indexOf(sideTurnMarker);
+            if (si >= 0) messages.length = si;
+            else log('side-turn rollback: marker already trimmed away');
+        }
         // Turn done — context retention. We deliberately do NOT collapse to
         // chat-history-only here. collapseToChatHistory dropped every dispatch
         // turn (assistant messages with tool_calls) and every tool result,
         // leaving the orchestrator with amnesia between turns: it forgot it had
         // dispatched a sub-agent (→ double-dispatch) and lost the job result it
         // had just read (→ holding replies instead of relaying facts). Instead
-        // we rely on trimMessagesToBudget(ORCHESTRATOR_MSG_BUDGET_CHARS), which
+        // we rely on trimMessagesToBudget(orchestratorMsgBudgetChars(...)), which
         // runs before each chat call and trims oldest WHOLE groups (dispatch +
         // its result paired) to keep the window under budget — so recent
-        // dispatches and their results survive across turns. The budget is sized
-        // for the 60k num_ctx the orchestrator now runs at.
+        // dispatches and their results survive across turns. The budget is
+        // scaled to the orchestrator's real num_ctx (never less than the pinned
+        // head + working room); older turns the tail drops are carried by
+        // the mercury summary merged into the system prompt (messages[0],
+        // refreshed each turn), so the thread survives past the verbatim window
+        // without raising num_ctx.
         // const collapsed = collapseToChatHistory(messages);
         // messages.length = 0;
         // messages.push(...collapsed);
         // Persistent mode: wait for the next message via IPC instead of exiting.
-        // While Atlas background jobs are running, race the IPC wait against a
-        // recurring monitor tick. On each tick the orchestrator gets a synthetic
-        // user message summarizing running jobs so it can stop, redirect, or
-        // let them continue — without any user input.
+        // This loop just waits for the next user message or an inbox item (a
+        // finished job triggering a digest turn).
         log('Query complete — waiting for next message via IPC...');
-        const MONITOR_TICK_MS = 30_000;
-        let monitorTimer: ReturnType<typeof setTimeout> | null = null;
-        let monitorTickNumber = 0;
         let nextInput: string | null = null;
         while (nextInput === null) {
             turnWasInboxDigest = false;
-            turnWasMonitorTick = false;
             // Direct Atlas passthrough: while active, route the user's messages
             // straight to Atlas until they exit or say go. Handled in the idle
             // loop (not the orchestrator turn) so the orchestrator is untouched.
             // Replies go via send_message because no host turn is pending here.
-            if (atlasDirect && atlasDirect.active) {
-                const atlasDirectSend = (text: string) => {
-                    try {
-                        writeCallback('send_message', {
-                            type: 'message',
-                            chatJid: toolContext.chatJid,
-                            text,
-                            groupFolder: toolContext.groupFolder,
-                            timestamp: new Date().toISOString(),
-                        });
-                    } catch (err: any) {
-                        log(`[atlas-direct] send_message failed: ${err?.message ?? err}`);
-                    }
-                };
-                while (atlasDirect && atlasDirect.active) {
-                    const ptCancel = { cancelled: false };
-                    const userMsg = await waitForIpcMessageWithTimeout(IDLE_TIMEOUT_MS, ptCancel);
-                    if (!userMsg) {
-                        log('[atlas-direct] idle timeout — exiting passthrough');
-                        atlasDirect = null;
-                        atlasDirectSend('Direct Atlas mode ended (idle timeout).');
-                        break;
-                    }
-                    const text = String(userMsg).trim();
-                    const exitMatch = /^(back to warden|exit|stop|nevermind|cancel|quit)\b/i.test(text)
-                        || /\b(back to warden|exit direct|leave atlas|back to normal)\b/i.test(text);
-                    const goMatch = /^(go|start|begin|do it|run it|that'?s? it|go ahead|kick it off|execute)\b/i.test(text);
-                    if (exitMatch) {
-                        atlasDirect = null;
-                        atlasDirectSend("Back to Warden — you're out of direct Atlas mode.");
-                        continue; // back to the idle loop's normal path
-                    }
-                    if (goMatch) {
-                        const transcript = atlasDirect.messages
-                            .map(m => `${m.role === 'user' ? 'User' : 'Atlas'}: ${m.content}`)
-                            .join('\n\n');
-                        const kickoffTask = `The user worked through this task with you one-on-one to get it right. Here is the full conversation:\n\n${transcript}\n\nNow execute the agreed task — the user has confirmed the details above. Proceed with your tools and report when done.`;
-                        const jobId = spawnBackgroundJob('atlas', kickoffTask, toolContext, false);
-                        atlasDirect = null;
-                        atlasDirectSend(`Atlas is starting on that now — I'll report back when it's done. (job ${jobId.slice('atlas-'.length)})`);
-                        continue; // back to the idle loop; Atlas runs in the background
-                    }
-                    // Chat turn: send the user's message to Atlas and speak its reply.
-                    atlasDirect.messages.push({ role: 'user', content: text });
-                    let reply = '';
-                    try {
-                        const atlasSys = SUBAGENT_BY_DELEGATE.get('atlas')!.systemPrompt;
-                        const ptMessages = [
-                            { role: 'system', content: atlasSys + '\n\nYou are in DIRECT MODE: talking to the user one-on-one, not via the orchestrator. Ask whatever questions you need to nail down exactly what they want — the goal, the specifics (paths, names, values), the constraints. Be concise and conversational, one or two short questions at a time. When the task is fully specified, tell the user to say "go" to start. Do NOT execute anything yet — this turn is only to get the task perfect.' },
-                            ...atlasDirect.messages,
-                        ];
-                        const resp = await fetch(CHAT_URL, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                model: ATLAS_MODEL,
-                                messages: ptMessages,
-                                stream: false,
-                                keep_alive: keepAliveEnv('ATLAS_KEEP_ALIVE', -1),
-                                options: { num_predict: 1024, temperature: 0.4, num_ctx: getNumCtx(ATLAS_MODEL, process.env.ATLAS_NUM_CTX || '') },
-                            }),
-                        });
-                        if (resp.ok) {
-                            const data = await resp.json();
-                            reply = (((data.message?.content || '') + '').trim()) || "I didn't catch that — can you say more about what you need?";
-                        } else {
-                            reply = `(Atlas chat error: HTTP ${resp.status})`;
-                        }
-                    } catch (err: any) {
-                        reply = `(Atlas chat error: ${err?.message ?? err})`;
-                    }
-                    atlasDirect.messages.push({ role: 'assistant', content: reply });
-                    atlasDirectSend(reply);
-                    // loop: wait for the next passthrough message
-                }
-                continue; // passthrough ended — back to the idle loop's normal path
-            }
             // Drain the inbox first: finished background jobs start an internal
             // digest turn immediately, before any waiting.
             const unreadItems = inbox.unread();
             if (unreadItems.length > 0) {
                 turnWasInboxDigest = true;
+                // Spontaneous digest turn: no host runAgent wrapper wraps it, so
+                // agent:processing stays false — this fg status is what tells the
+                // host a turn is in flight, making the report-back reply visible
+                // in the Oversight panel instead of "nothing running".
+                writeStatus({ phase: 'thinking', label: 'Reporting back on finished work…', fg: 1, ts: Date.now() });
                 for (const item of unreadItems) inbox.markRead(item.jobId);
-                const lines = unreadItems.map(i => inbox.summaryLine(i)).join('\n');
-                const hasFailures = unreadItems.some(i => i.status === 'errored' || i.status === 'aborted');
-                const failureInstr = hasFailures
-                    ? `\n\nOne or more jobs are marked [ERRORED] or [ABORTED]. For each: read its full output with read_job_result, work out why it failed, and retry it yourself by calling atlas with a reworked task prompt that addresses the failure (different approach, missing detail, corrected URL/path — whatever the output shows was wrong). Do not ask me first. EXCEPTION: if your recent context shows the same task has already failed twice, stop retrying and tell me what failed and why.`
+                drainedDigestJobIds = unreadItems.map(i => i.jobId); // for one-shot requeue if this digest turn errors out
+                // Inline each result body (capped) — the orchestrator cannot
+                // confirm what it cannot see. Longer results stay reachable via
+                // read_job_result. Each item carries the supervisor's completion
+                // verdict (confirmed/failed/unverifiable) — a FAILED verdict is
+                // PROVEN-FAILED automatically: report_task_failure + one corrected
+                // re-delegate, no re-reading required.
+                const body = unreadItems.map(i => {
+                    const v = i.verdict ? `Supervisor verdict: ${i.verdict.toUpperCase()} — ${i.verdictReason || ''}\n` : '';
+                    return `- ${i.jobId} (${i.agent}, ${i.status}) — task: "${i.task.slice(0, 160)}"\n${v}Result:\n${i.fullResult.slice(0, 2000)}${i.fullResult.length > 2000 ? `\n(result truncated — read_job_result {job_id: "${i.jobId}"} has the full text)` : ''}`;
+                }).join('\n\n');
+                // Still-running jobs: their results have NOT landed, so the
+                // orchestrator must not report their work as done or call the
+                // overall request complete until each lands.
+                const stillRunning = [...backgroundJobs.values()].filter(j => j.status === 'running');
+                const stillRunningBlock = stillRunning.length > 0
+                    ? `\n\nSTILL RUNNING — result not landed yet. Report: still working, then end your turn:\n` +
+                      stillRunning.map(j => `- ${j.agent}-${j.shortId}: ${Math.round((Date.now() - j.startedAt) / 1000)}s elapsed, ${j.toolCallCount} call(s) — "${j.task.slice(0, 120)}"`).join('\n')
                     : '';
-                nextInput = `[Inbox] ${unreadItems.length} background job result${unreadItems.length > 1 ? 's' : ''} arrived:\n${lines}\n\nFull outputs are available via read_job_result {job_id}. Digest these in your own voice: tell the user what matters (or nothing, if it only feeds later work), and start any follow-up tasks the results call for. Do not paste raw output verbatim.${failureInstr}\n\nCONTINUING A CHAINED TASK: if this result is one step of a larger task the user asked for, DO NOT stop and wait for the user to prompt you. Immediately take the next step yourself — delegate the next sub-task to the right agent, or read_job_result for the full output if you need more detail first. The user should not have to say "and?" or "continue" to keep work moving. Only stop when the whole task is actually done or you are genuinely blocked.`;
+                const resultsBlock = unreadItems.length > 0
+                    ? `REPORT-BACK TURN — jobs below are FINISHED. Report each result.\n\n` +
+                      `[Inbox] ${unreadItems.length} background job result${unreadItems.length > 1 ? 's' : ''} completed:\n\n${body}\n\n` +
+                      `For each result, run the CONFIRM step before anything else: compare it against what the user originally asked for — that ask is in your context.\n` +
+                      `1. CONFIRMED — deliverable present and right. Media or window the user can already see or hear: stay silent. Else relay in one or two sentences.\n` +
+                      `2. PROVEN-FAILED — the result itself shows the deliverable is wrong or missing (the path it claims to have written doesn't match the request, the answer contradicts the ask, the job errored or was aborted), OR the supervisor verdict above is FAILED. A browser job whose result narrates actions ("navigated, typed, clicked") without naming what it found, opened, or bought has NOT delivered — that is PROVEN-FAILED, and you can see the truth yourself: if the browser state decides success, call chrome_read_page on the task tab and judge the actual page before you say a word. Call report_task_failure with the task and the reason, then re-delegate ONCE to the right specialist, naming the GAP — what was wanted versus what came back — never the fix. If the runner refuses the re-delegation, that refusal is final: tell the user plainly what failed and why, and stop.\n` +
+                      `3. UNVERIFIABLE FROM TEXT — whether it worked depends on screen or system state you cannot see from this result (a page rendered, an app launched, a button pressed) and the result names a concrete outcome. Trust it and move on. "I did the steps" is not a concrete outcome — when in doubt, check the state (chrome_read_page) or treat it as PROVEN-FAILED.\n` +
+                      `CHAIN: if a result is one step of a larger request, take the next step yourself now — delegate it — without waiting for the user. Stop only when the whole task is done or you are genuinely blocked. Do not paste raw output verbatim; speak the outcome.\n` +
+                      `FORMAT: the reply is chat to the user, not a report. One or two plain sentences per result, carrying the outcome itself. No headers, no bullets, no restating the ask or the job id, no verdict words, no next-steps offers.` +
+                      stillRunningBlock
+                    : '';
+                nextInput = resultsBlock;
                 log(`[inbox] draining ${unreadItems.length} item(s) into a digest turn`);
                 break;
             }
-            const runningJobs = [...backgroundJobs.values()].filter(j => j.status === 'running');
-            if (runningJobs.length === 0) {
-                // No running jobs — wait for IPC, but wake if an inbox item lands
-                // (e.g. a job finished right at the turn boundary).
-                const idleIpcCancel = { cancelled: false };
-                const winner = await Promise.race([
-                    waitForIpcMessageWithTimeout(IDLE_TIMEOUT_MS, idleIpcCancel).then(v => v as string | null),
-                    inbox.waitForItem().then(() => '__INBOX_ITEM__' as const),
-                ]);
-                if (winner === '__INBOX_ITEM__') {
-                    // Cancel the losing IPC poller — otherwise it stays alive and
-                    // drains (deletes) the next user message into the void.
-                    idleIpcCancel.cancelled = true;
-                    continue; // loop back to the drain check
-                }
-                nextInput = winner;
-                if (!nextInput) {
-                    log('Idle timeout or close signal — exiting.');
-                    await disconnectMcpClients();
-                    if (monitorTimer) clearTimeout(monitorTimer);
-                    return;
-                }
-                break;
-            }
-            // Race IPC wait against a monitor tick.
-            monitorTickNumber++;
-            const tickNum = monitorTickNumber;
-            const tickPromise = new Promise<'__MONITOR_TICK__'>((resolve) => {
-                monitorTimer = setTimeout(() => resolve('__MONITOR_TICK__'), MONITOR_TICK_MS);
-            });
-            const ipcCancel = { cancelled: false };
-            const ipcPromise = waitForIpcMessageWithTimeout(IDLE_TIMEOUT_MS, ipcCancel).then(v => v as string | null);
-            const inboxPromise = inbox.waitForItem().then(() => '__INBOX_ITEM__' as const);
-            const winner = await Promise.race([ipcPromise, tickPromise, inboxPromise]);
+            // Wait for the next user message via IPC, waking early if a
+            // background job finishes (inbox).
+            const idleIpcCancel = { cancelled: false };
+            const winner = await Promise.race([
+                waitForIpcMessageWithTimeout(IDLE_TIMEOUT_MS, idleIpcCancel),
+                inbox.waitForItem().then(() => '__INBOX_ITEM__' as const),
+            ]);
             if (winner === '__INBOX_ITEM__') {
-                // A job just finished — loop back so the drain check picks it up
-                // without waiting for the next monitor tick. Cancel the losing IPC
-                // poller so it can't swallow the next user message.
-                ipcCancel.cancelled = true;
-                if (monitorTimer) { clearTimeout(monitorTimer); monitorTimer = null; }
-                continue;
+                // Cancel the losing IPC poller — otherwise it stays alive and
+                // drains (deletes) the next user message into the void.
+                idleIpcCancel.cancelled = true;
+                continue; // loop back to the drain check
             }
-            if (winner === '__MONITOR_TICK__') {
-                ipcCancel.cancelled = true;
-                monitorTimer = null;
-                const stillRunning = [...backgroundJobs.values()].filter(j => j.status === 'running');
-                if (stillRunning.length === 0) {
-                    // Jobs finished during the tick window — fall through to IPC wait.
-                    continue;
-                }
-                const jobLines = stillRunning.map(j => {
-                    const elapsed = Math.round((Date.now() - j.startedAt) / 1000);
-                    const sinceLast = Math.round((Date.now() - j.lastActionAt) / 1000);
-                    return `- ${j.agent}-${j.shortId}: ${elapsed}s elapsed, ${j.toolCallCount} tool call(s), last action ${sinceLast}s ago (${j.lastAction}). Task: "${j.task.slice(0, 160)}"`;
-                }).join('\n');
-                const synthetic = `[Orchestrator supervision check #${tickNum}] Your job is to ORCHESTRATE — actively supervise the background work and steer it, do not just wait for it to finish. ${stillRunning.length} background job(s) running:\n${jobLines}\n\nCheck up on the work. The summary above shows each job's last action; call \`agent_logs {job_id}\` for any job whose progress you can't judge from the summary, and \`read_job_result\` only for finished jobs. Then decide:\n` +
-                    `1. COMPLETE? If the user's overall request is fully achieved by what has run so far, stop calling tools and reply with nothing (empty) — say no more.\n` +
-                    `2. ON TRACK? If a job is making real progress toward the user's request — reading files, trying approaches, recovering from errors, iterating on a search is PROGRESS — leave it alone. Reply with nothing, OR give the user a one-line progress report. Do not interfere with work that is going well, and do not stop a job just because a path looks strange or a step seems roundabout.\n` +
-                    `3. VEERING / WRONG / STALLED? If a job is going in the wrong direction, doing the wrong thing, repeating the same call with no change, or making no tool calls for a long stretch — intervene: call \`stop_agent\` for that job and re-delegate to the right agent with a corrected task that spells out what was wrong and what you actually want. Do not let work veer off just because it is still running.\n` +
-                    `4. CHAIN NEXT STEP? If a job has finished and the user's request has a next step that has not been taken (e.g. a plan exists but the council has not deliberated, a verdict is in but the work has not revised), take that next step YOURSELF now — do not wait for the user to say "continue".\n` +
-                    `When there is nothing to report or do, reply with a completely EMPTY response — no text at all, no placeholders like "<empty></empty>", "Empty response.", "---", "...", "ok", or any other token. Placeholders look like a broken supervisor to the user. Any reply that contains actual words is delivered to the user as a short message, so only speak when you have a real update, a needed course-correction, or a next step to announce.`;
-                log(`[orchestrator-monitor] tick #${tickNum} fired with ${stillRunning.length} running job(s)`);
-                turnWasMonitorTick = true;
-                nextInput = synthetic;
-                break;
-            } else {
-                // IPC won the race (or returned null on timeout/close).
-                monitorTimer && clearTimeout(monitorTimer);
-                monitorTimer = null;
-                nextInput = winner as string | null;
-                if (!nextInput) {
-                    log('Idle timeout or close signal — exiting.');
-                    await disconnectMcpClients();
-                    return;
-                }
-                break;
+            nextInput = winner ? winner.text : null;
+            sideTurnPending = winner ? winner.sideTurn : false;
+            if (!nextInput) {
+                log('Idle timeout or close signal — exiting.');
+                await disconnectMcpClients();
+                return;
             }
+            break;
         }
         prompt = nextInput as string;
+        // Capture the genuine user ask for the completion verdict (Step 2).
+        // Tag-stripped, never set from digest
+        // compositions or urgent injections — those would poison the verdict.
+        lastUserAsk = extractAsk(nextInput) || lastUserAsk;
     }
 }
 /**
  * Execute a tool call via the tool registry.
- * Sub-agent delegates (byte, dexter, atlas, artemis, iris) are
+ * Sub-agent delegates (atlas, artemis, iris) are
  * handled here because they need access to runSubAgent and local state.
  * All regular tools dispatch to the registry.
  */
@@ -3414,7 +5988,7 @@ function handleSkillMetaTool(name: string, args: any, opts?: { orchestrator?: bo
         }
         const skill = skillState.skills.find((s) => s.name === target)!;
         if (opts?.orchestrator && skill.source === 'mcp') {
-            return `Error: the "${target}" tools run inside sub-agents, not the orchestrator. Delegate to atlas with a {task} describing what you need — atlas has these tools loaded.`;
+            return `Error: the "${target}" tools run inside a sub-agent, not here. Use your own tools for this, or hand it to the specialist that owns it (iris for email and scheduling, vulkan for code).`;
         }
         skillState.active.add(target);
         const header = `Activated skill "${target}" — ${skill.tools.length} tool(s) now visible: ${skill.tools.map((t) => t.function.name).join(', ') || '(none)'}`;
@@ -3441,7 +6015,6 @@ function handleBasicFileOp(name: string, args: any): string {
     const rawPath = (args?.path as string) || '';
     if (name === 'list_file') {
         const resolved = safeResolve(rawPath || '.');
-        if (resolved.ok === false) return `Error: ${resolved.error}`;
         try {
             const entries = fs.readdirSync(resolved.path, { withFileTypes: true });
             return entries.map((e) => (e.isDirectory() ? e.name + '/' : e.name)).join('\n');
@@ -3451,7 +6024,6 @@ function handleBasicFileOp(name: string, args: any): string {
     }
     if (name === 'read_file') {
         const resolved = safeResolve(rawPath);
-        if (resolved.ok === false) return `Error: ${resolved.error}`;
         try {
             return fs.readFileSync(resolved.path, 'utf8');
         } catch (err: any) {
@@ -3460,12 +6032,14 @@ function handleBasicFileOp(name: string, args: any): string {
     }
     if (name === 'write_file') {
         const resolved = safeResolve(rawPath);
-        if (resolved.ok === false) return `Error: ${resolved.error}`;
         const content = (args?.content as string) ?? '';
         try {
             fs.mkdirSync(path.dirname(resolved.path), { recursive: true });
             fs.writeFileSync(resolved.path, content, 'utf8');
-            return `Wrote ${content.length} bytes to ${rawPath}`;
+            // Report the RESOLVED path, not what was typed: echoing the raw
+            // path is how "saved to ~/Desktop" got reported for a file that
+            // was written somewhere else entirely.
+            return `Wrote ${content.length} bytes to ${resolved.path}`;
         } catch (err: any) {
             return `Error: ${err.message}`;
         }
@@ -3473,12 +6047,66 @@ function handleBasicFileOp(name: string, args: any): string {
     return `Error: unknown file op ${name}`;
 }
 
+/** Register a lazily-connected optional server into the live skill state:
+ *  its tools join listTools and the schema from the next turn onward, so a
+ *  provider that IS running gets used, not just tolerated. */
+async function attachLazyServer(server: string, client: import('./mcp-client.js').ExternalMcpClient): Promise<void> {
+    if (!skillState) return;
+    skillState.clients.set(server, client);
+    if (skillState.skills.some(s => s.source === 'mcp' && s.name === server)) return;
+    try {
+        const live = await client.listTools();
+        if (!live.length) return;
+        skillState.skills.push({
+            name: server,
+            description: `MCP server ${server} (on-demand)`,
+            source: 'mcp',
+            tools: live.map(t => ({
+                type: 'function' as const,
+                function: {
+                    name: `mcp__${server}__${t.name}`,
+                    description: t.description ?? `MCP tool ${t.name} from ${server}`,
+                    parameters: (t.inputSchema ?? { type: 'object', properties: {} }) as Record<string, any>,
+                },
+            })),
+        } as any);
+        skillState.active.add(server);
+    } catch { /* advisory — the client itself still works for calls */ }
+}
+
 /** Dispatch an mcp__<server>__<tool> call to the owning ExternalMcpClient. */
 async function handleMcpToolCall(fullName: string, args: any): Promise<string> {
-    const resolved = resolveMcpTool(fullName);
+    let resolved = resolveMcpTool(fullName);
+    if (!resolved) {
+        // Lazy server (optional component, e.g. browser-driving): not connected
+        // at boot by design. Dial it NOW — this call IS the ask. A server that
+        // isn't there fails this one tool, never the turn.
+        const parts = fullName.split('__');
+        if (parts.length >= 3) {
+            try {
+                const { getOrCreateMcpClient } = await import('./mcp-client.js');
+                const client = await getOrCreateMcpClient(parts[1]);
+                await attachLazyServer(parts[1], client);
+                resolved = resolveMcpTool(fullName);
+            } catch (err: any) {
+                return `Error: optional MCP server "${parts[1]}" unavailable (${err?.message || err}) — tool "${fullName}" not run.`;
+            }
+        }
+    }
     if (!resolved) return `Error: no MCP client owns tool "${fullName}"`;
+    // MARM activity → the host's brain-scan ring, so the memory galaxy lights
+    // up the regions being read from (smart/concept recall) or written to
+    // (log entry). Best-effort only — the flare must never gate the call.
+    const marmAct =
+        fullName.startsWith('mcp__marm__marm_smart_recall') || fullName.startsWith('mcp__marm__marm_concept_recall') ? 'recall'
+        : fullName.startsWith('mcp__marm__marm_log_entry') ? 'write'
+        : null;
     try {
         const result = await resolved.client.callTool(resolved.tool, args ?? {});
+        if (marmAct) {
+            noteMarmActivity(marmAct as 'write' | 'recall',
+                String(args?.query ?? args?.entry ?? args?.content ?? ''));
+        }
         // MCP results come back as { content: [{ type: 'text', text }, ...] } — flatten to a string.
         // Image blocks are routed into the vision queue instead of being JSON-stringified.
         if (result && Array.isArray(result.content)) {
@@ -3504,17 +6132,21 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
     const startTime = Date.now();
     const sessionId = context.chatJid || '';
 
-    // The def-level filter hides Bash/mcp__ schemas from the orchestrator, but
-    // the model can still call them blind (activate_skill lists tool names).
-    // Enforce the block at execution time too, with a redirect that teaches
-    // the correct path.
-    if (opts?.orchestrator && (toolName.startsWith('mcp__') || toolName === 'Bash' || toolName === 'ping_user')) {
-        return `Error: ${toolName} is not available to the orchestrator. Delegate the work instead: atlas for shell, browser, web, files, and databases; iris for email; dexter for scheduling. Call the delegate tool with a {task} argument.`;
+    // Bare MCP name (prompt spelling) → the real prefixed tool. Native tools
+    // and delegates never match here, so this only rescues the MCP case.
+    if (!toolName.startsWith('mcp__') && registry.getDefinitions([toolName]).length === 0) {
+        const full = resolveBareMcpName(toolName);
+        if (full) {
+            log(`[tools] resolved bare MCP name "${toolName}" → ${full}`);
+            toolName = full;
+        }
     }
+
+    // Retired CDP tools are unregistered — unknown names die in dispatch.
 
     // Pre-tool hooks — can block execution
     const preResults = await hooks.invoke('pre_tool_call', {
-        toolName, toolArgs: args, sessionId, model: ORCHESTRATOR_MODEL,
+        toolName, toolArgs: args, sessionId, model: ATLAS_MODEL,
     });
     const block = preResults.find(r => r.block);
     if (block) return JSON.stringify({ error: block.block });
@@ -3525,7 +6157,7 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
     // delegate task, bounce it back instead of dispatching (and before the
     // task is spoken to the user). The task is English intent, not a command
     // line — see looksLikeCommandPrescription above.
-    const DELEGATE_TOOL_NAMES = new Set(['atlas', 'atlas_background', 'vulkan', 'iris', 'dexter', 'byte', 'artemis', 'council']);
+    const DELEGATE_TOOL_NAMES = new Set(['atlas', 'atlas_background', 'vulkan', 'iris', 'artemis', 'council']);
     if (DELEGATE_TOOL_NAMES.has(toolName) && args.task && looksLikeCommandPrescription(String(args.task))) {
         log(`[guard] blocked over-prompted ${toolName} task (contains shell command): ${String(args.task).slice(0, 120)}`);
         return `STOP — you put a shell command in the task. That is over-prompting and the user has told you repeatedly to stop. A delegate task is plain-English INTENT for the specialist, not a command line. Do NOT include \`grep\`, \`curl\`, \`ollama list\`, \`systemctl\`, \`npx\`, \`npm\`, or any other shell command — those are the specialist's calls to make, not yours. State the GOAL and the facts (paths, URLs, names, what's wrong) in normal English and let ${toolName} decide how to investigate. Re-call ${toolName} now with intent only.`;
@@ -3543,28 +6175,50 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
     // }
 
     // Sub-agent delegates: dispatch to runSubAgent with their tool defs
-    if (toolName === 'artemis') {
+    if (toolName === 'artemis' && !opts?.orchestrator) {
+        // Blocking path — a sub-agent's own tool loop (opts.orchestrator is
+        // unset there). Same history-fetch + prompt shape as the async path,
+        // just awaited inline instead of wrapped in a BackgroundJob/inbox
+        // push — the caller has no inbox of its own.
+        const def = SUBAGENT_BY_DELEGATE.get('artemis')!;
+        const focus = ((args.task as string) || '').trim();
+        if (!focus) {
+            result = 'Error: task is required';
+        } else {
+            writeIpcFile(TASKS_DIR, { type: 'get_chat_history', chatJid: context.chatJid, limit: 20, timestamp: new Date().toISOString() });
+            const history = await waitForResult('chat-history-');
+            const transcript = history ? JSON.stringify(history, null, 2).slice(-12000) : '(conversation history unavailable)';
+            const fullAuditTask = `Focus your audit on: ${focus}\n\nAudit the following conversation (most recent messages last). Each entry has a sender_name and an is_bot_message flag — is_bot_message=1 is the AI assistant, otherwise it's the user.\n\n${transcript}`;
+            const artemisResult = await runSubAgent('artemis', ARTEMIS_MODEL, def.systemPrompt, ARTEMIS_TOOL_DEFS, fullAuditTask, context, def.maxIterations);
+            result = artemisResult.content || 'Artemis completed the audit (no text output).';
+        }
+    } else if (toolName === 'artemis') {
         // Async artemis: start the audit as a background job (same pattern as
         // atlas), return immediately, result lands in the inbox.
         const def = SUBAGENT_BY_DELEGATE.get('artemis')!;
         const focus = ((args.task as string) || '').trim();
+        const gateMsg = retryGate(focus || 'audit the conversation');
+        if (gateMsg) { result = gateMsg; } else {
         const jobShortId = Math.random().toString(36).slice(2, 6);
         const jobId = `artemis-${jobShortId}`;
         const urgent = args.urgent === true;
         writeStatus({ phase: 'artemis', label: `${def.label} ${jobShortId}: reviewing the conversation...`, ts: Date.now() });
-        const abortFlag = { aborted: false };
+        const abortFlag: { aborted: boolean; nudges: string[] } = { aborted: false, nudges: [] };
         const jobRecord: BackgroundJob = {
             promise: null as any,
             startedAt: Date.now(),
             agent: 'artemis',
             task: focus || 'audit the conversation',
             shortId: jobShortId,
+            urgent,
             toolCallCount: 0,
             lastAction: 'starting',
             lastActionAt: Date.now(),
             abortFlag,
             status: 'running',
             activityLog: [],
+            watchdogNudgedAt: 0, supervisorNudges: 0,
+            pendingFollowups: [],
         };
         const job = (async () => {
             writeIpcFile(TASKS_DIR, { type: 'get_chat_history', chatJid: context.chatJid, limit: 20, timestamp: new Date().toISOString() });
@@ -3601,6 +6255,7 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
                 status: jobRecord.abortFlag.aborted ? 'aborted' : 'done',
                 fullResult: savedTo ? `${content}\n\n(Artemis's notes saved to ${savedTo})` : content,
             });
+            drainJobFollowups(jobRecord, jobId, context);
         })()
             .catch(err => {
                 if (jobRecord.status === 'running') jobRecord.status = 'errored';
@@ -3609,15 +6264,22 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
                     status: 'errored',
                     fullResult: `Error: ${err?.message ?? err}`,
                 });
+                drainJobFollowups(jobRecord, jobId, context);
             })
             .finally(() => {
                 if (jobRecord.status === 'running') jobRecord.status = 'done';
+                // Clear the finished job off the dashboard's Oversight window —
+                // emitJobsStatus emits the zero-count clearing line on the
+                // transition to no running jobs. Without this the completed
+                // artemis row (and the "N job(s)" counter) stayed up forever.
+                emitJobsStatus();
                 setTimeout(() => { backgroundJobs.delete(jobId); }, 60000).unref?.();
             });
         jobRecord.promise = job;
         backgroundJobs.set(jobId, jobRecord);
         emitJobsStatus();
         result = `Artemis ${jobShortId} started${urgent ? ' (urgent — its result will interrupt you when ready)' : ''} — the audit result will arrive in your inbox. (job id: ${jobId})`;
+        } // retryGate else
     } else if (toolName === 'council') {
         const task = ((args.task as string) || '').trim();
         const maxRounds = Math.min(Math.max(Number(args.max_rounds ?? 4), 1), 15);
@@ -3654,7 +6316,7 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
                                 const labeled = answers.map((a, idx) => `--- Seat ${COUNCIL_SEAT_NAMES[idx]} (previous round) ---\n${a}`).join('\n\n');
                                 taskForInstance = `Question: ${task}\n\nThree proposed answers from the previous round (yours and the two other seats, including any disagreements they raised):\n\n${labeled}\n\nHave it out. Re-read the other seats' answers; argue, agree, disagree, and present another point where you genuinely differ — name the seat, quote the point. For each real disagreement: concede (say why they're right) or hold (one concrete reason, only if it would make the answer wrong). You may raise a new point the others haven't considered. But do not argue for the sake of arguing — your destination is ONE answer all three seats can endorse. If another seat's answer already covers your concern, endorse it. Then output your refined final answer in 2-4 sentences, written so all three seats could sign it.`;
                             }
-                            roundPromises.push(runSubAgent(`council-${COUNCIL_SEAT_NAMES[i].toLowerCase()}`, COUNCIL_SEAT_MODELS[i](), COUNCIL_SEAT_PROMPTS[i], ARTEMIS_TOOL_DEFS, taskForInstance, context, 30));
+                            roundPromises.push(runSubAgent(`council-${COUNCIL_SEAT_NAMES[i].toLowerCase()}`, COUNCIL_SEAT_MODELS[i](), COUNCIL_SEAT_PROMPTS[i], COUNCIL_TOOL_DEFS, taskForInstance, context, 30));
                         }
                         const roundResults = await Promise.all(roundPromises);
                         answers = roundResults.map(r => (r.content || '').trim());
@@ -3731,7 +6393,13 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
             // Immediate tool result for the orchestrator — tell it to end its
             // turn silently. The final verdict will be pushed as the only
             // assistant message when the background Council loop completes.
-            result = `The Council is now deliberating in the background on this question. Do NOT write any message to the user now — end your turn immediately. The final verdict will be delivered to the user automatically when The Council completes (a few minutes — they argue up to 15 rounds before converging). If the user asks about its progress in the meantime, call council_status.`;
+            // One short line, then end the turn. The old contract was "write NO
+            // message at all", which left the user staring at silence for the
+            // several minutes a deliberation takes — and gave the fine-tune no
+            // reply shape to learn for this tool. The verdict still arrives on
+            // its own, so the line must not promise a summary or restate the
+            // question; it says the Council has it and stops.
+            result = `The Council is now deliberating in the background on this question. Reply with ONE short line saying the Council has it, then end your turn — do not answer the question yourself and do not promise a summary. The final verdict will be delivered to the user automatically when The Council completes (a few minutes — they argue up to 15 rounds before converging). If the user asks about its progress in the meantime, call council_status.`;
         }
     } else if (toolName === 'council_status') {
         if (!councilLive) {
@@ -3760,9 +6428,57 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
         if (!task) {
             result = 'Error: task is required';
         } else {
-            const jobId = spawnBackgroundJob('atlas', task, context, urgent);
-            const jobShortId = jobId.slice('atlas-'.length);
-            result = `Atlas ${jobShortId} started${urgent ? ' (urgent — its result will interrupt you when ready)' : ''} — the result will arrive in your inbox. (job id: ${jobId})`;
+            const dup = findDuplicateRunningJob('atlas', task);
+            if (dup) {
+                const elapsed = Math.round((Date.now() - dup.startedAt) / 1000);
+                result = `Atlas ${dup.shortId} is already running this task (started ${elapsed}s ago). Result arrives when it finishes. Reply: still working. End your turn. To change it, stop_agent("atlas-${dup.shortId}") first.`;
+            } else if (findRunningJobTargetingSameFiles(task)) {
+                // Same-file follow-up: queue it behind the running writer job
+                // instead of racing it. Checked BEFORE the consuming retryGate —
+                // a follow-up is new work and must not consume a credit. But a
+                // queued follow-up spawns later via drainFollowups, gate-free,
+                // so refuse HERE (read-only) when the goal's retry is spent —
+                // a re-worded retry of a failed goal must not skip the rail by
+                // arriving while a same-file job is running (observed 2026-08-24).
+                if (goalRetryExhausted(task)) {
+                    log(`[dedup] target-overlap: refusing queue — goal's retry credit already spent (${taskSig(task)})`);
+                    result = `STOP — this goal already ran and its one automatic retry has been used, and a job touching the same file(s) is still running. Do not queue or re-dispatch it. Report to the user what was tried and what happened instead.`;
+                } else {
+                    const ov = findRunningJobTargetingSameFiles(task)!;
+                    ov.pendingFollowups.push({ delegate: 'atlas', task, urgent });
+                    log(`[dedup] target-overlap: queued atlas follow-up behind ${ov.agent}-${ov.shortId} (same file(s)); will spawn when it finishes.`);
+                    result = `${ov.agent === 'atlas' ? 'Atlas' : 'Vulkan'} ${ov.shortId} is already editing one of the same file(s) as this request. Queued this follow-up to run when it finishes — it will start then and its result will arrive in your inbox. Do not re-dispatch. (running job id: ${ov.agent}-${ov.shortId})`;
+                }
+            } else if (retryGate(task)) {
+                result = retryGate(task); // second call never consumes — refusal text is stable
+            } else {
+                const sp = spawnBackgroundJob('atlas', task, context, urgent);
+                result = describeSpawn('Atlas', sp, urgent);
+            }
+        }
+    } else if (toolName === 'vulkan' && !opts?.orchestrator) {
+        // Blocking path — a sub-agent's own tool loop (opts.orchestrator is
+        // unset there, and it is never the seat). The caller has no inbox of
+        // its own to deliver an async result into, so it calls vulkan the way
+        // iris has always been called: await the sub-agent run directly and
+        // hand back its content inline.
+        const def = SUBAGENT_BY_DELEGATE.get('vulkan')!;
+        const task = args.task as string;
+        if (!task) {
+            result = 'Error: task is required';
+        } else {
+            // Vulkan carries mcpServers ['*'], and default apps are global —
+            // merge the connected servers' tools and apply the substitution
+            // here exactly as the background path does.
+            let vkTools = SUBAGENT_TOOL_DEFS.get('vulkan')!;
+            const vkMcp = mcpToolDefsForServers(['*']);
+            if (vkMcp.length > 0) {
+                const seenNames = new Set(vkTools.map((t: any) => t.function?.name));
+                vkTools = applyDefaultApps([...vkTools, ...vkMcp.filter((t: any) => !seenNames.has(t.function?.name))], vkMcp);
+            }
+            const saResult = await runSubAgent('vulkan', VULKAN_MODEL, def.systemPrompt, vkTools, task, context, def.maxIterations, undefined, undefined, def.temperature);
+            result = `[vulkan · model ${VULKAN_MODEL}]\n${saResult.content}`;
+            if (saResult.modifiedFiles.length > 0) log(`[vulkan] Tracked ${saResult.modifiedFiles.length} modified file(s): ${saResult.modifiedFiles.join(', ')}`);
         }
     } else if (toolName === 'vulkan') {
         // Async coding specialist: start the job, return immediately, result
@@ -3772,31 +6488,70 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
         if (!task) {
             result = 'Error: task is required';
         } else {
-            const jobId = spawnBackgroundJob('vulkan', task, context, urgent);
-            const jobShortId = jobId.slice('vulkan-'.length);
-            result = `Vulkan ${jobShortId} started${urgent ? ' (urgent — its result will interrupt you when ready)' : ''} — the result will arrive in your inbox. (job id: ${jobId})`;
+            const dup = findDuplicateRunningJob('vulkan', task);
+            if (dup) {
+                const elapsed = Math.round((Date.now() - dup.startedAt) / 1000);
+                result = `Vulkan ${dup.shortId} is already running this task (started ${elapsed}s ago). Result arrives when it finishes. Reply: still working. End your turn. To change it, stop_agent("vulkan-${dup.shortId}") first.`;
+            } else if (findRunningJobTargetingSameFiles(task)) {
+                if (goalRetryExhausted(task)) {
+                    log(`[dedup] target-overlap: refusing queue — goal's retry credit already spent (${taskSig(task)})`);
+                    result = `STOP — this goal already ran and its one automatic retry has been used, and a job touching the same file(s) is still running. Do not queue or re-dispatch it. Report to the user what was tried and what happened instead.`;
+                } else {
+                    const ov = findRunningJobTargetingSameFiles(task)!;
+                    ov.pendingFollowups.push({ delegate: 'vulkan', task, urgent });
+                    log(`[dedup] target-overlap: queued vulkan follow-up behind ${ov.agent}-${ov.shortId} (same file(s)); will spawn when it finishes.`);
+                    result = `${ov.agent === 'atlas' ? 'Atlas' : 'Vulkan'} ${ov.shortId} is already editing one of the same file(s) as this request. Queued this follow-up to run when it finishes — it will start then and its result will arrive in your inbox. Do not re-dispatch. (running job id: ${ov.agent}-${ov.shortId})`;
+                }
+            } else if (retryGate(task)) {
+                result = retryGate(task);
+            } else {
+                const sp = spawnBackgroundJob('vulkan', task, context, urgent);
+                result = describeSpawn('Vulkan', sp, urgent);
+            }
         }
-    } else if (toolName === 'atlas_direct') {
-        // Enter direct Atlas passthrough mode. The orchestrator speaks a short
-        // "you're now talking to Atlas directly" line and ends its turn. After
-        // that, the idle loop routes the user's messages straight to Atlas
-        // until the user exits or says go.
-        if (atlasDirect && atlasDirect.active) {
-            result = 'Already in direct Atlas mode. End your turn and let the user talk to Atlas.';
+    } else if (toolName === 'sentry' && !opts?.orchestrator) {
+        // Blocking path — a sub-agent's own tool loop (see the vulkan
+        // blocking branch above).
+        const def = SUBAGENT_BY_DELEGATE.get('sentry')!;
+        const task = args.task as string;
+        if (!SENTRY_ENABLED) {
+            result = 'Sentry is offline — its model fabricates scan inventories and no real scan would run. Security scan requests do not happen in this state; report that sentry is disabled.';
+        } else if (!task) {
+            result = 'Error: task is required';
         } else {
-            atlasDirect = { active: true, messages: [] };
-            result = `Direct Atlas mode is on. Tell the user, in one short sentence, that they're now talking to Atlas directly — they can describe what they need and Atlas will ask questions to get it right, then say "go" to start or "back to Warden" to exit. Then end your turn immediately and do nothing else.`;
+            const saResult = await runSubAgent('sentry', SENTRY_MODEL, def.systemPrompt, SUBAGENT_TOOL_DEFS.get('sentry')!, task, context, def.maxIterations, undefined, undefined, def.temperature);
+            result = `[sentry · model ${SENTRY_MODEL}]\n${saResult.content}`;
         }
-    } else if (toolName === 'byte' || toolName === 'dexter' || toolName === 'iris') {
+    } else if (toolName === 'sentry') {
+        // Async sentry: an on-demand scan requested by the user ("scan the pc").
+        // The scheduled scans run through the host-spawned child branch; this
+        // path is the orchestrator's delegate tool. spawnBackgroundJob resolves
+        // SENTRY_MODEL + the isolated sentry toolset; the sentry_report host
+        // callback logs the scan, and the verdict text lands in the inbox.
+        const task = args.task as string;
+        const urgent = args.urgent === true;
+        if (!SENTRY_ENABLED) {
+            result = 'Sentry is offline — its model fabricates scan inventories and no real scan would run. Security scan requests do not happen in this state; report that sentry is disabled.';
+        } else if (!task) {
+            result = 'Error: task is required';
+        } else {
+            const sp = spawnBackgroundJob('sentry', task, context, urgent);
+            result = describeSpawn('Sentry', sp, urgent);
+        }
+    } else if (toolName === 'iris') {
         const def = SUBAGENT_BY_DELEGATE.get(toolName)!;
         let task = args.task as string;
         if (!task) result = 'Error: task is required';
+        else if (retryGate(task)) result = retryGate(task);
         else {
-            if (toolName === 'dexter') {
-                // Resolve the real local timezone, not UTC. The dockbox service
+            {
+                // Resolve the real local timezone, not UTC. The service
                 // runs without TZ in its env, so the old `process.env.TZ || 'UTC'`
-                // fallback made dexter schedule everything 7h off (in UTC). Node
+                // fallback made scheduling land 7h off (in UTC). Node
                 // reads /etc/localtime via Intl, which gives America/Vancouver here.
+                // Every iris dispatch gets the anchor — scheduling needs it for
+                // clock math, and work-management calls ignore it harmlessly
+                // (training data carries the anchor on every example to match).
                 const tz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
                 const localNow = new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T');
                 task = `Current local time is ${localNow} (timezone ${tz}). Compute every absolute timestamp from this.\n\n${task}`;
@@ -3804,20 +6559,24 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
             writeStatus({ phase: toolName, label: `${def.label}: ${task}`, ts: Date.now() });
             let tools = SUBAGENT_TOOL_DEFS.get(toolName)!;
             // Merge in this sub-agent's allow-listed MCP server tools (e.g.
-            // iris → kmail, dexter → tasks). Execution routes through the
+            // iris → kmail + tasks). Execution routes through the
             // shared executeXmlTool mcp__ dispatch, so schemas are all it needs.
-            const mcpExtra = mcpToolDefsForServers(def.mcpServers);
+            // Iris is EXEMPT (2026-09-09): the toolcall-ft fine-tune was trained
+            // on exactly the iris-core 41 tools — mcp__ extras are off-distribution.
+            const mcpExtra = toolName === 'iris' ? [] : mcpToolDefsForServers(def.mcpServers);
             if (mcpExtra.length > 0) {
+                // Default apps: a capability handed to an MCP server stands the
+                // built-in tools down, so only one provider can do each job.
+                tools = applyDefaultApps(tools, mcpExtra);
                 const existing = new Set(tools.map((t: any) => t.function?.name));
                 tools = [...tools, ...mcpExtra.filter((t: any) => !existing.has(t.function?.name))];
                 log(`[${toolName}] Merged ${mcpExtra.length} MCP tool(s) from servers: ${def.mcpServers!.join(', ')}`);
             }
-            // Each tool caller runs on its OWN per-agent model (byte/dexter/iris
-            // are no longer shared). No fallback: an empty model errors inside
-            // runSubAgent rather than swapping in another model.
-            const PER_AGENT_MODEL: Record<string, string> = { byte: BYTE_MODEL, dexter: DEXTER_MODEL, iris: IRIS_MODEL };
-            const subModel = PER_AGENT_MODEL[toolName] || '';
-            // Pass def.temperature (10th arg) so byte/dexter/iris honor their
+            // The toolcall agent runs on its OWN per-agent model. No fallback:
+            // an empty model errors inside runSubAgent rather than swapping in
+            // another model.
+            const subModel = IRIS_MODEL;
+            // Pass def.temperature (10th arg) so iris honors its
             // SubAgentDef temperature override — without it the default `1`
             // applies and e.g. Iris's temperature:0 was inert. abortFlag +
             // onToolCall slots are unused on the synchronous path (undefined).
@@ -3828,6 +6587,13 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
         }
     } else if (toolName === 'activate_skill' || toolName === 'deactivate_skill' || toolName === 'list_skills') {
         result = handleSkillMetaTool(toolName, args, opts);
+    } else if (toolName === 'report_task_failure') {
+        const task = String(args.task || '').trim();
+        const reason = String(args.reason || '').trim();
+        recordConfirmedFailure(task, reason);
+        result = reason
+            ? `Noted — this task's failure is on record. You may delegate it once more, and only with a corrected approach that addresses the reason: ${reason.slice(0, 300)}`
+            : `Noted — this task's failure is on record. You may delegate it once more, and only with a corrected approach.`;
     } else if (toolName === 'read_job_result') {
         const jobId = String(args.job_id || '').trim();
         if (!jobId) {
@@ -3880,7 +6646,7 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
     } else if (toolName === 'stop_agent') {
         const targetId = String(args?.job_id || '');
         if (!targetId) {
-            result = 'Error: job_id is required (e.g. atlas-abcd from list_running_agents).';
+            result = 'Error: job_id is required — the id exactly as list_running_agents printed it for that job.';
         } else {
             const job = backgroundJobs.get(targetId);
             if (!job) {
@@ -3894,6 +6660,35 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
                 result = `Stop signal sent to ${targetId}. It will return its partial result on the next iteration check.`;
             }
         }
+    } else if (toolName === 'nudge_agent') {
+        // The seat's steering lever for a running job. It decides what
+        // to do about a job it judges off-track and, if steering is right,
+        // calls this. The message is pushed into the
+        // job's abortFlag.nudges, which runSubAgent drains into the job's next
+        // turn. supervisorNudges counts THESE nudges —
+        // informational only (how many times the seat has steered this
+        // job), so the seat can see its own nudge count when deciding
+        // whether to stop_agent. There is NO ceiling: the runner never
+        // auto-stops on a nudge count. watchdogNudgedAt timestamps the latest
+        // nudge so Oversight shows when steering last happened.
+        const targetId = String(args?.job_id || '');
+        const message = String(args?.message || '').trim();
+        if (!targetId || !message) {
+            result = 'Error: job_id and message are both required.';
+        } else {
+            const job = backgroundJobs.get(targetId);
+            if (!job) {
+                result = `Error: no running job with id "${targetId}". Call list_running_agents for the current list.`;
+            } else if (job.status !== 'running') {
+                result = `Job ${targetId} is already in status "${job.status}" — no action taken.`;
+            } else {
+                (job.abortFlag.nudges ||= []).push(message);
+                job.supervisorNudges++;
+                job.watchdogNudgedAt = Date.now();
+                log(`[supervisor] nudge_agent → ${targetId} (supervisor nudge #${job.supervisorNudges}): ${message.slice(0, 160)}`);
+                result = `Steering message queued for ${targetId}. It will see this on its next turn: "${message.slice(0, 200)}". The job keeps running. (Supervisor nudge #${job.supervisorNudges}; the runner never auto-stops on a nudge count — call stop_agent yourself when you decide the job is not recovering.)`;
+            }
+        }
     } else if (toolName === 'schedule_task' || toolName === 'cancel_task' || toolName === 'pause_task' || toolName === 'resume_task' || toolName === 'update_task') {
         // Scheduling tools are parent-routed and must report the parent's REAL
         // result: the parent creates/updates the DB record and returns
@@ -3903,8 +6698,8 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
             const cbResult = await writeCallbackAsync(toolName, args, 15000);
             if (cbResult?.ok) {
                 result = JSON.stringify(toolName === 'schedule_task'
-                    ? { ok: true, taskId: cbResult.taskId, message: `Task scheduled (id: ${cbResult.taskId}). It will run at the specified time.` }
-                    : { ok: true, message: `${toolName} completed.` });
+                    ? { ok: true, taskId: cbResult.taskId, message: `Task scheduled (id: ${cbResult.taskId}, type: ${args.schedule_type}, value: ${args.schedule_value}, prompt: "${String(args.prompt || '').slice(0, 200)}"). It will run at the specified time.` }
+                    : { ok: true, message: `${toolName} completed (task_id: ${args.task_id || 'n/a'}).` });
             } else {
                 result = JSON.stringify({ ok: false, error: cbResult?.error || `${toolName} failed in the parent process` });
             }
@@ -3917,9 +6712,20 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
         result = JSON.stringify({ ok: true, message: 'Task list requested from parent.' });
     } else if (toolName === 'install_mcp_server' || toolName === 'uninstall_mcp_server') {
         // Parent-routed callback tools: write to disk via the parent's mcp-registry
-        // handlers. The agent-runner emits a CALLBACK block; the parent persists.
-        writeCallback(toolName, args);
-        result = JSON.stringify({ ok: true, message: `${toolName} request emitted to parent. The change takes effect next turn. Do NOT stop and ask the user what to do next — continue routing their original request. If they asked for a task (open a URL, play a video, edit a file, etc.), delegate to atlas NOW. The MCP install is a side effect, not a stopping point.` });
+        // handlers. Async so the parent's REAL result comes back — installs are
+        // smoke-tested parent-side (the server must answer initialize before it
+        // is saved), and the agent must see a rejected install as a failure, not
+        // a fabricated success. 20s covers the parent's 10s smoke-test bound.
+        try {
+            const cbResult = await writeCallbackAsync(toolName, args, 20000);
+            if (cbResult?.ok) {
+                result = JSON.stringify({ ok: true, message: `${toolName} succeeded. The change takes effect next turn. Do NOT stop and ask the user what to do next — continue routing their original request. If they asked for a task (open a URL, play a video, edit a file, etc.), delegate to atlas NOW. The MCP install is a side effect, not a stopping point.` });
+            } else {
+                result = JSON.stringify({ ok: false, error: cbResult?.error || `${toolName} failed in the parent process` });
+            }
+        } catch (err: any) {
+            result = JSON.stringify({ ok: false, error: `${toolName} callback failed: ${err?.message ?? err}` });
+        }
     } else if (toolName === 'create_skill') {
         // Use writeCallbackAsync so we get the parent's actual result back —
         // the parent writes data/skills/<name>/SKILL.md and returns { ok, path }
@@ -3956,7 +6762,7 @@ async function executeXmlTool(toolName: string, args: any, context: any, modifie
 /**
  * Wait for IPC message or _close sentinel with timeout
  */
-function waitForIpcMessageWithTimeout(timeoutMs, cancelToken?: { cancelled: boolean }) {
+function waitForIpcMessageWithTimeout(timeoutMs, cancelToken?: { cancelled: boolean }): Promise<{ text: string; sideTurn: boolean } | null> {
     return new Promise((resolve) => {
         let start = Date.now();
         const poll = () => {
@@ -3977,9 +6783,9 @@ function waitForIpcMessageWithTimeout(timeoutMs, cancelToken?: { cancelled: bool
                 return;
             }
             // Check for messages
-            const messages = drainIpcInput();
-            if (messages.length > 0) {
-                resolve(messages.join('\n'));
+            const drained = drainIpcInput();
+            if (drained.length > 0) {
+                resolve({ text: drained.map(d => d.text).join('\n'), sideTurn: drained.some(d => d.sideTurn) });
                 return;
             }
             // Check keepalive — if touched recently, reset idle timer
@@ -4025,60 +6831,43 @@ async function main() {
         process.exit(1);
     }
 
-    // Oculus run-mode: the host spawns this
-    // process with agent:'oculus' (AWARENESS event from the detector's presence
-    // tracker, or a tell_oculus note) to run the background security/awareness
-    // agent directly — NOT the orchestrator loop. Tool calls (send_message,
-    // open_security_alert, security_log, etc.) route to the host via CALLBACK stdio.
-    if (containerInput.agent === 'oculus') {
+    // Sentry run-mode: the host spawns this process with agent:'sentry' (the
+    // hourly peek / daily deep scheduled scans, fired by the host's sentry
+    // scheduler exactly like the iris-digest rows) to run the software-security
+    // scanner directly — NOT the orchestrator loop. The agent collects the
+    // inventory with Bash and submits once via sentry_report; that host
+    // callback logs the scan row and relays the model's findings
+    // to chat when something's wrong. The child's own output is just the
+    // verdict text, for the log.
+    if (containerInput.agent === 'sentry') {
         try {
-            const def = SUBAGENT_BY_DELEGATE.get('oculus');
-            if (!def) throw new Error('oculus sub-agent not defined');
-            const tools = SUBAGENT_TOOL_DEFS.get('oculus') || [];
+            const def = SUBAGENT_BY_DELEGATE.get('sentry');
+            if (!def) throw new Error('sentry sub-agent not defined');
+            const tools = SUBAGENT_TOOL_DEFS.get('sentry') || [];
             const ctx = {
                 chatJid: containerInput.chatJid || 'owner@local',
                 groupFolder: containerInput.groupFolder || 'owner',
                 isMain: containerInput.isMain ?? true,
                 userId: process.env.WARDEN_USER_ID || '',
             };
-            // The host resolves the model (oculus:model router key, seeded from
-            // the orchestrator model on first boot) and passes it in
-            // containerInput.model. No hardcoded fallback: an empty model errors
-            // out instead of silently running on a baked-in model.
+            // The host resolves the model (sentry:model router key, seeded on
+            // first boot) and passes it in containerInput.model. No hardcoded
+            // fallback: an empty model errors out instead of silently running
+            // on a baked-in model.
             const model = (containerInput.model || '').replace(/^local:/, '');
             if (!model) {
-                writeOutput({ status: 'error', result: null, error: 'No oculus model configured (set oculus:model in the Agents panel). Refusing to fall back to a hardcoded default.' });
+                writeOutput({ status: 'error', result: null, error: 'No sentry model configured (set sentryModel in the Agents panel). Refusing to fall back to a hardcoded default.' });
                 if ((globalThis as any)._keepAlive) clearInterval((globalThis as any)._keepAlive);
                 process.exit(0);
             }
-            // Track the oculus model so unloadModel keeps it consistent.
-            ORCHESTRATOR_MODEL = model;
-            // Oculus's num_ctx comes from its own setting (local:oculus_ctx, seeded
-            // to 8192 on first boot so granite4.1:8b's 9 tool schemas + system
-            // prompt don't overflow the 2048 default). getNumCtx picks it up via
-            // the AGENT_CTX_OVERRIDE['oculus'] entry — no hardcoded bake here.
-            // Load the user-editable rules from security/oculus.md and inject them
-            // as trusted instructions. The user writes freeform notes like "I will
-            // be out all day, anyone is an alert". Treat those notes as the primary
-            // behavior guide; they are NOT untrusted tool output.
-            let systemPrompt = def.systemPrompt;
-            try {
-                const oculusMdPath = path.join(containerInput.workspaceRoot || '', 'security', 'oculus.md');
-                const oculusMd = fs.existsSync(oculusMdPath) ? fs.readFileSync(oculusMdPath, 'utf8') : '';
-                if (oculusMd) {
-                    systemPrompt = `${systemPrompt}\n\n# YOUR USER'S OCULUS NOTES — FOLLOW THESE\n${oculusMd}`;
-                }
-            } catch (e: any) {
-                log(`[oculus] could not read oculus.md: ${e.message}`);
-            }
-            log(`[oculus] starting background awareness agent: model=${model || '(none)'}, tools=${tools.length}, task="${(containerInput.prompt || '').slice(0, 80)}"`);
-            setOculusTaskPrompt(containerInput.prompt || '');
-            (globalThis as any).__oculusQueryMode = (containerInput.prompt || '').startsWith('[ORCHESTRATOR_QUERY]');
-            const sa = await runSubAgent('oculus', model, systemPrompt, tools, containerInput.prompt || '', ctx, (containerInput.prompt || '').startsWith('[ORCHESTRATOR_QUERY]') ? 2 : def.maxIterations);
-            writeOutput({ status: 'success', result: sa.content || 'Oculus: done (silent).', error: null });
+            ATLAS_MODEL = model;
+            log(`[sentry] starting security scan: model=${model}, tools=${tools.length}, task="${(containerInput.prompt || '').slice(0, 80)}"`);
+            // temperature 0 — structured inventory collection on a tool-calling model.
+            const sa = await runSubAgent('sentry', model, def.systemPrompt, tools, containerInput.prompt || '', ctx, def.maxIterations, undefined, undefined, 0);
+            writeOutput({ status: 'success', result: sa.content || 'Sentry: scan complete.', error: null });
         } catch (err: any) {
-            log(`[oculus] error: ${err.message}`);
-            writeOutput({ status: 'error', result: null, error: `Oculus error: ${err.message}` });
+            log(`[sentry] error: ${err.message}`);
+            writeOutput({ status: 'error', result: null, error: `Sentry error: ${err.message}` });
         }
         if ((globalThis as any)._keepAlive) clearInterval((globalThis as any)._keepAlive);
         process.exit(0);
@@ -4090,19 +6879,22 @@ async function main() {
     // grounded hourly/daily/weekly digest and publish it to the dashboard. This
     // is a direct one-shot Iris sub-agent run — NOT the orchestrator loop, NOT the
     // chat pipeline. Iris compiles from INPUT (buildDigestContext, handed in the
-    // prompt) + read_emails and outputs the digest as its FINAL TEXT; this branch
-    // then publishes that text directly to /api/summaries (keyless loopback). We
-    // do NOT rely on the model calling a publish tool — a small model often stops
-    // after one tool call, so the runner publishing the final text is the 100%
-    // path. Iris sees only the read_emails tool here; nothing is written to chat.
+    // prompt) + the email tool and outputs the digest as its FINAL TEXT; this
+    // branch then publishes that text directly to /api/summaries (keyless loopback).
+    // We do NOT rely on the model calling a publish tool — a small model often
+    // stops after one tool call, so the runner publishing the final text is the
+    // 100% path. Iris sees only the email tool here; nothing is written to chat.
     if (containerInput.agent && containerInput.agent.startsWith('iris-digest-')) {
         const span = containerInput.agent.slice('iris-digest-'.length);
         try {
             const def = SUBAGENT_BY_DELEGATE.get('iris');
             if (!def) throw new Error('iris sub-agent not defined');
-            // Only read_emails — Iris compiles + outputs text; it does not publish.
+            // Only email — Iris compiles + outputs text; it does not publish.
+            // Iris's registered tool is named 'email' (it wraps the host's
+            // read_emails handler internally) — filtering on the host handler
+            // name here yields zero tools and the digest compiles blind.
             const tools = (SUBAGENT_TOOL_DEFS.get('iris') || []).filter(
-                (t: any) => t?.function?.name === 'read_emails',
+                (t: any) => t?.function?.name === 'email',
             );
             const ctx = {
                 chatJid: containerInput.chatJid || 'owner@local',
@@ -4116,21 +6908,36 @@ async function main() {
                 if ((globalThis as any)._keepAlive) clearInterval((globalThis as any)._keepAlive);
                 process.exit(0);
             }
-            ORCHESTRATOR_MODEL = model;
-            const digestSystemPrompt = `Scan the INPUT block (current time, user bio, calendar events, work tasks, weather — pulled from the local DB) and, optionally, recent emails from the read_emails tool. Output the structured JSON object the task specifies.
+            ATLAS_MODEL = model;
+            const digestSystemPrompt = `Scan the INPUT block (current time, user bio, calendar events, work tasks, weather — pulled from the local DB) and, optionally, recent emails from the email tool. Output the structured JSON object the task specifies.
 
-GROUNDING: Use only facts that appear in INPUT or read_emails output. If a section has no data, use the empty-state value the task shows. Something not in INPUT or read_emails is a bug — do not add it.
+GROUNDING: Use only facts that appear in INPUT or email tool output. If a section has no data, use the empty-state value the task shows. Something not in INPUT or email output is a bug — do not add it.
 
-Call read_emails once if the task needs recent inbox activity, then output the JSON object as your final message. No commentary, no markdown, just the JSON.`;
+Call email(action="read") once if the task needs recent inbox activity, then output the JSON object as your final message. No commentary, no markdown, just the JSON.`;
             log(`[iris-digest] starting digest compiler: span=${span}, model=${model}, tools=${tools.length}, prompt=${(containerInput.prompt || '').slice(0, 80)}…`);
-            const sa = await runSubAgent('iris', model, digestSystemPrompt, tools, containerInput.prompt || '', ctx, def.maxIterations, undefined, undefined, 0);
+            // NOT def.maxIterations: the digest is a 2-step job regardless of
+            // the iris delegate cap (now 3) — email(action="read") once with
+            // the INPUT window, then the JSON object as final text. With a
+            // tight cap the run returns right after the email call and the
+            // raw email listing gets published to /api/summaries as the
+            // "digest" (the prompts below instruct the model to call email
+            // FIRST, so a cap of 1 made that failure the steady state).
+            // Small explicit cap: read once (maybe retry once), then final
+            // text.
+            const sa = await runSubAgent('iris', model, digestSystemPrompt, tools, containerInput.prompt || '', ctx, 4, undefined, undefined, 0);
             // Publish the structured JSON directly to the dashboard. This is the
             // 100% path — we do not depend on the model calling a publish tool.
             // Iris outputs a JSON object; the dashboard panel does all formatting.
             // Extract the JSON (the model may wrap it in prose/code fences); if
             // extraction fails, post the raw text and the UI falls back to
-            // markdown rendering.
+            // markdown rendering. But never publish an error string (e.g. the
+            // silent-turn guard's "Error: … produced no output") as a digest —
+            // that's a run failure, not digest content.
             let publishedText = (sa.content || '').trim();
+            if (publishedText.startsWith('Error:')) {
+                log(`[iris-digest] ${span} digest run failed (no valid output): ${publishedText.slice(0, 120)}`);
+                publishedText = '';
+            }
             const jsonMatch = publishedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
             if (jsonMatch) publishedText = jsonMatch[1].trim();
             else {
@@ -4141,6 +6948,52 @@ Call read_emails once if the task needs recent inbox activity, then output the J
                     try { JSON.parse(slice); publishedText = slice; } catch { /* not JSON; post raw */ }
                 }
             }
+            // The digest UI renders every list item as a plain string, but models
+            // occasionally emit objects instead (the 2026-08-31 weekly digest had
+            // {"from","subject","date"} email items, which rendered as literal
+            // "[object Object]" lines). Normalize before publishing: coerce any
+            // object item into a readable string built from its own fields, in
+            // the shape the prompts ask for ("From: <sender>: <subject> (<date>)
+            // — <what the email says>"). Non-JSON or string-only digests pass
+            // through untouched.
+            publishedText = ((text: string): string => {
+                try {
+                    const obj = JSON.parse(text);
+                    if (!obj || typeof obj !== 'object' || !Array.isArray(obj.blocks)) return text;
+                    let coerced = 0;
+                    for (const b of obj.blocks) {
+                        if (!b || typeof b !== 'object' || !Array.isArray(b.items)) continue;
+                        b.items = b.items.map((it: any) => {
+                            if (typeof it === 'string') return it;
+                            if (it && typeof it === 'object') {
+                                // Key lookup is case-insensitive: models emit
+                                // "From"/"Subject"/"Time" as often as lowercase.
+                                const pick = (...names: string[]): string => {
+                                    const keys = Object.keys(it);
+                                    for (const n of names) {
+                                        const k = keys.find((kk) => kk.toLowerCase() === n);
+                                        const v = k ? it[k] : undefined;
+                                        if (typeof v === 'string' && v.trim()) return v.trim();
+                                    }
+                                    return '';
+                                };
+                                const from = pick('from', 'sender');
+                                const subject = pick('subject', 'title');
+                                const when = pick('date', 'time', 'when');
+                                const gist = pick('snippet', 'body', 'summary', 'text', 'content').replace(/\s+/g, ' ').slice(0, 200);
+                                let out = `${from ? from + ': ' : ''}${subject}`;
+                                if (when) out += ` (${when})`;
+                                if (gist) out += ` — ${gist}`;
+                                if (out.trim()) { coerced++; return out; }
+                                try { coerced++; return JSON.stringify(it); } catch { coerced++; return String(it); }
+                            }
+                            return it == null ? '' : String(it);
+                        });
+                    }
+                    if (coerced) log(`[iris-digest] normalized ${coerced} object list item(s) to strings before publishing`);
+                    return coerced ? JSON.stringify(obj) : text;
+                } catch { return text; }
+            })(publishedText);
             if (publishedText) {
                 let published = false;
                 try {
@@ -4179,8 +7032,27 @@ Call read_emails once if the task needs recent inbox activity, then output the J
         process.exit(0);
     }
 
+    // Settings arrive with the payload. Every dropdown holds a real value, so a
+    // MISSING ctx here is a plumbing failure, not the user picking "default" —
+    // say so out loud instead of quietly letting the backend choose a window.
+    if (containerInput.agent) {
+        const mo = parseInt(String((containerInput as any).maxOutputTokens || ''), 10);
+        if (Number.isFinite(mo) && mo > 0) MAX_OUTPUT_SETTING = mo;
+        const pc = String((containerInput as any).agentCtx || '').trim();
+        if (pc) {
+            PAYLOAD_AGENT_CTX.set(containerInput.agent, pc);
+            log(`[${containerInput.agent}] ctx from settings: ${pc}`);
+        } else {
+            log(`[${containerInput.agent}] WARNING: no ctx in the spawn payload — settings did not reach this agent`);
+        }
+    }
     log(`Using Ollama runner for model: ${containerInput.model || 'default'}`);
     try {
+        // Reconcile any job orphaned by a prior hard-kill ("stop") before the
+        // first turn drains the inbox — otherwise the orchestrator sees its own
+        // earlier "atlas-XXXX is posting" next to an empty jobs list and
+        // re-dispatches the same task as "didn't stick".
+        rehydrateOrphanedJobs();
         await runNativeOllama(containerInput);
     }
     catch (err) {
